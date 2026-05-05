@@ -1,5 +1,5 @@
 import { and, eq, lt } from "drizzle-orm";
-import { db, schema } from "../db/index.js";
+import { db, runtimeDbDialect, schema } from "../db/index.js";
 import type {
   PersistedSnapshotRecord,
   SnapshotPersistenceAdapter,
@@ -80,6 +80,32 @@ export async function writeAdminSnapshot<T>(
     staleUntil: record.staleUntil,
     updatedAt: new Date().toISOString(),
   };
+
+  if (runtimeDbDialect === "mysql") {
+    const existing = await db
+      .select({ id: schema.adminSnapshots.id })
+      .from(schema.adminSnapshots)
+      .where(buildSnapshotWhere(identity))
+      .get();
+
+    if (existing) {
+      await db
+        .update(schema.adminSnapshots)
+        .set({
+          payload: values.payload,
+          generatedAt: values.generatedAt,
+          expiresAt: values.expiresAt,
+          staleUntil: values.staleUntil,
+          updatedAt: values.updatedAt,
+        })
+        .where(eq(schema.adminSnapshots.id, existing.id))
+        .run();
+      return;
+    }
+
+    await db.insert(schema.adminSnapshots).values(values).run();
+    return;
+  }
 
   await (db
     .insert(schema.adminSnapshots)

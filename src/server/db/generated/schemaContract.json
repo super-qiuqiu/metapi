@@ -370,6 +370,94 @@
         }
       }
     },
+    "channel_routing_state": {
+      "columns": {
+        "channel_id": {
+          "logicalType": "integer",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKey": true
+        },
+        "success_alpha": {
+          "logicalType": "real",
+          "notNull": true,
+          "defaultValue": "2",
+          "primaryKey": false
+        },
+        "success_beta": {
+          "logicalType": "real",
+          "notNull": true,
+          "defaultValue": "2",
+          "primaryKey": false
+        },
+        "latency_log_mu": {
+          "logicalType": "real",
+          "notNull": true,
+          "defaultValue": "0",
+          "primaryKey": false
+        },
+        "latency_log_sigma2": {
+          "logicalType": "real",
+          "notNull": true,
+          "defaultValue": "0.8",
+          "primaryKey": false
+        },
+        "latency_n": {
+          "logicalType": "integer",
+          "notNull": true,
+          "defaultValue": "0",
+          "primaryKey": false
+        },
+        "prompt_ewma": {
+          "logicalType": "real",
+          "notNull": true,
+          "defaultValue": "0",
+          "primaryKey": false
+        },
+        "completion_ewma": {
+          "logicalType": "real",
+          "notNull": true,
+          "defaultValue": "0",
+          "primaryKey": false
+        },
+        "cache_read_ewma": {
+          "logicalType": "real",
+          "notNull": true,
+          "defaultValue": "0",
+          "primaryKey": false
+        },
+        "cache_creation_ewma": {
+          "logicalType": "real",
+          "notNull": true,
+          "defaultValue": "0",
+          "primaryKey": false
+        },
+        "pricing_snapshot": {
+          "logicalType": "json",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "manual_weight": {
+          "logicalType": "real",
+          "notNull": true,
+          "defaultValue": "1",
+          "primaryKey": false
+        },
+        "version": {
+          "logicalType": "integer",
+          "notNull": true,
+          "defaultValue": "1",
+          "primaryKey": false
+        },
+        "updated_at": {
+          "logicalType": "datetime",
+          "notNull": false,
+          "defaultValue": "datetime('now')",
+          "primaryKey": false
+        }
+      }
+    },
     "checkin_logs": {
       "columns": {
         "id": {
@@ -2320,6 +2408,14 @@
       "unique": false
     },
     {
+      "name": "channel_routing_state_updated_at_idx",
+      "table": "channel_routing_state",
+      "columns": [
+        "updated_at"
+      ],
+      "unique": false
+    },
+    {
       "name": "checkin_logs_account_created_at_idx",
       "table": "checkin_logs",
       "columns": [
@@ -3080,6 +3176,17 @@
         "site_id"
       ],
       "referencedTable": "sites",
+      "referencedColumns": [
+        "id"
+      ],
+      "onDelete": "CASCADE"
+    },
+    {
+      "table": "channel_routing_state",
+      "columns": [
+        "channel_id"
+      ],
+      "referencedTable": "route_channels",
       "referencedColumns": [
         "id"
       ],
