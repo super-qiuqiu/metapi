@@ -48,7 +48,8 @@ type NormalizedCodexQuotaHeaders = {
   };
 };
 
-const CODEX_QUOTA_PROBE_MODEL = 'gpt-5.1-codex';
+const CODEX_QUOTA_PROBE_MODELS = ['gpt-5.1-codex', 'gpt-5.3-codex'] as const;
+const CODEX_UNSUPPORTED_MODEL_PATTERN = /is not supported when using Codex/i;
 const CODEX_QUOTA_PROBE_VERSION = '0.101.0';
 const CODEX_QUOTA_PROBE_USER_AGENT = 'codex_cli_rs/0.101.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464';
 const CODEX_QUOTA_PROBE_BETA = 'responses-2025-03-11';
@@ -532,9 +533,9 @@ export async function recordOauthQuotaHeadersSnapshot(input: {
   }
 }
 
-function buildCodexQuotaProbePayload(): Record<string, unknown> {
+function buildCodexQuotaProbePayload(model: string): Record<string, unknown> {
   return {
-    model: CODEX_QUOTA_PROBE_MODEL,
+    model,
     input: [
       {
         role: 'user',
@@ -591,56 +592,73 @@ async function probeCodexQuotaSnapshot(input: {
     siteId: input.account.siteId,
     extraConfig: input.account.extraConfig,
   });
-  const requestBody = JSON.stringify(buildCodexQuotaProbePayload());
+  const probeHeaders = buildCodexQuotaProbeHeaders({
+    accessToken,
+    accountId: input.oauth.accountId || input.oauth.accountKey,
+  });
 
   return runWithSiteApiEndpointPool(site, async (target) => {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), CODEX_QUOTA_PROBE_TIMEOUT_MS);
-    let response: Awaited<ReturnType<typeof fetch>>;
-    try {
-      response = await fetch(
-        buildCodexQuotaProbeUrl(target.baseUrl),
-        withExplicitProxyRequestInit(proxyUrl, {
-          method: 'POST',
-          headers: buildCodexQuotaProbeHeaders({
-            accessToken,
-            accountId: input.oauth.accountId || input.oauth.accountKey,
+    let lastErrorText = '';
+
+    for (const model of CODEX_QUOTA_PROBE_MODELS) {
+      const requestBody = JSON.stringify(buildCodexQuotaProbePayload(model));
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), CODEX_QUOTA_PROBE_TIMEOUT_MS);
+      let response: Awaited<ReturnType<typeof fetch>>;
+      try {
+        response = await fetch(
+          buildCodexQuotaProbeUrl(target.baseUrl),
+          withExplicitProxyRequestInit(proxyUrl, {
+            method: 'POST',
+            headers: probeHeaders,
+            body: requestBody,
+            signal: controller.signal,
           }),
-          body: requestBody,
-          signal: controller.signal,
-        }),
-      );
-    } catch (error) {
-      if (controller.signal.aborted) {
-        throw new Error(`codex quota probe timeout (${Math.round(CODEX_QUOTA_PROBE_TIMEOUT_MS / 1000)}s)`);
+        );
+      } catch (error) {
+        if (controller.signal.aborted) {
+          throw new Error(`codex quota probe timeout (${Math.round(CODEX_QUOTA_PROBE_TIMEOUT_MS / 1000)}s)`);
+        }
+        throw error;
+      } finally {
+        clearTimeout(timeout);
       }
-      throw error;
-    } finally {
-      clearTimeout(timeout);
-    }
 
-    const snapshot = buildCodexQuotaSnapshotFromHeaders(input.oauth, response.headers, input.syncedAt);
-    if (snapshot) {
-      const responseBody = response as { body?: { cancel?: () => Promise<void> | void } };
-      void Promise.resolve(responseBody.body?.cancel?.()).catch(() => {});
-      return snapshot;
-    }
+      const snapshot = buildCodexQuotaSnapshotFromHeaders(input.oauth, response.headers, input.syncedAt);
+      if (snapshot) {
+        const responseBody = response as { body?: { cancel?: () => Promise<void> | void } };
+        void Promise.resolve(responseBody.body?.cancel?.()).catch(() => {});
+        return snapshot;
+      }
 
-    const errorText = await response.text().catch(() => '');
-    if (!response.ok) {
-      const resetHint = parseCodexQuotaResetHint(response.status, errorText, Date.now());
+      const errorText = await response.text().catch(() => '');
+      if (!response.ok) {
+        lastErrorText = errorText;
+        if (CODEX_UNSUPPORTED_MODEL_PATTERN.test(errorText)) {
+          continue;
+        }
+        const resetHint = parseCodexQuotaResetHint(response.status, errorText, Date.now());
+        return buildQuotaErrorSnapshot({
+          oauth: input.oauth,
+          message: errorText || `codex quota probe failed with status ${response.status}`,
+          syncedAt: input.syncedAt,
+          ...(resetHint ? { lastLimitResetAt: resetHint.resetAt } : {}),
+        });
+      }
+
       return buildQuotaErrorSnapshot({
         oauth: input.oauth,
-        message: errorText || `codex quota probe failed with status ${response.status}`,
+        message: 'codex quota probe response did not expose x-codex rate limit headers',
         syncedAt: input.syncedAt,
-        ...(resetHint ? { lastLimitResetAt: resetHint.resetAt } : {}),
       });
     }
 
+    const resetHint = parseCodexQuotaResetHint(400, lastErrorText, Date.now());
     return buildQuotaErrorSnapshot({
       oauth: input.oauth,
-      message: 'codex quota probe response did not expose x-codex rate limit headers',
+      message: lastErrorText || 'codex quota probe failed: no supported model found for this account',
       syncedAt: input.syncedAt,
+      ...(resetHint ? { lastLimitResetAt: resetHint.resetAt } : {}),
     });
   });
 }
