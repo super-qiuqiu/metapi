@@ -28,6 +28,7 @@ import {
   type OAuthQuotaInfo,
   type OAuthQuotaWindowInfo,
   type OAuthStartInstructions,
+  type AntigravityQuotaGroupInfo,
 } from '../api.js';
 
 const POLL_INTERVAL_MS = 1500;
@@ -151,11 +152,17 @@ function normalizeOauthMessage(value: string | null | undefined): string {
   if (!text) return '';
 
   return text
+    .replace(/5h quota window does not apply to codex free tier/ig, '免费层级无 5h 限额')
+    .replace(/codex \d+m window from official wham\/usage API/ig, '额度数据来自官方 wham/usage API')
+    .replace(/codex usage windows from official wham\/usage API/ig, '额度数据来自官方 wham/usage API')
     .replace(/codex usage windows inferred from rate limit response headers/ig, '额度窗口已从响应头推断')
     .replace(/official 5h quota window is not exposed by current codex oauth artifacts/ig, '当前 Codex OAuth 未暴露官方 5h 窗口')
     .replace(/official 7d quota window is not exposed by current codex oauth artifacts/ig, '当前 Codex OAuth 未暴露官方 7d 窗口')
     .replace(/official 5h quota window is unavailable for this provider/ig, '当前 Provider 不提供官方 5h 窗口')
     .replace(/official 7d quota window is unavailable for this provider/ig, '当前 Provider 不提供官方 7d 窗口')
+    .replace(/antigravity uses model-group remainingFraction, not \d+h window/ig, 'Antigravity 按模型组显示配额')
+    .replace(/antigravity quota via fetchAvailableModels API/ig, '额度数据来自 fetchAvailableModels API')
+    .replace(/antigravity quota has not been synced yet/ig, 'Antigravity 配额尚未同步')
     .replace(/\bfetch failed\b/ig, '网络请求失败');
 }
 
@@ -430,24 +437,25 @@ function formatResetLabel(value?: string | null): string {
   return `${Math.max(1, diffMinutes)}m`;
 }
 
-function resolveQuotaWindowPercent(window?: OAuthQuotaWindowInfo | null): number | null {
+function resolveQuotaWindowRemainingPercent(window?: OAuthQuotaWindowInfo | null): number | null {
   if (!window?.supported) return null;
-  if (typeof window.used === 'number' && typeof window.limit === 'number' && window.limit > 0) {
-    return Math.max(0, Math.min(100, Math.round((window.used / window.limit) * 100)));
-  }
   if (typeof window.remaining === 'number' && typeof window.limit === 'number' && window.limit > 0) {
-    return Math.max(0, Math.min(100, Math.round(((window.limit - window.remaining) / window.limit) * 100)));
+    return Math.max(0, Math.min(100, Math.round((window.remaining / window.limit) * 100)));
+  }
+  if (typeof window.used === 'number' && typeof window.limit === 'number' && window.limit > 0) {
+    return Math.max(0, Math.min(100, Math.round(((window.limit - window.used) / window.limit) * 100)));
   }
   return null;
 }
 
 function resolveQuotaWindowSummary(window?: OAuthQuotaWindowInfo | null): string {
   if (!window || !window.supported) return '';
-  if (typeof window.used === 'number' && typeof window.limit === 'number') {
-    return `${window.used} / ${window.limit}`;
-  }
   if (typeof window.remaining === 'number' && typeof window.limit === 'number') {
     return `剩余 ${window.remaining} / ${window.limit}`;
+  }
+  if (typeof window.used === 'number' && typeof window.limit === 'number') {
+    const remaining = Math.max(0, window.limit - window.used);
+    return `剩余 ${remaining} / ${window.limit}`;
   }
   if (typeof window.limit === 'number') return `总量 ${window.limit}`;
   return window.message || '官方未提供';
@@ -537,11 +545,11 @@ function QuotaWindowRow({
   label: string;
   window?: OAuthQuotaWindowInfo | null;
 }) {
-  const percent = resolveQuotaWindowPercent(window);
+  const remainingPercent = resolveQuotaWindowRemainingPercent(window);
   const summary = resolveQuotaWindowSummary(window);
-  const tone = percent != null && percent >= 90
+  const tone = remainingPercent != null && remainingPercent <= 10
     ? 'var(--color-danger)'
-    : percent != null && percent >= 70
+    : remainingPercent != null && remainingPercent <= 30
       ? 'var(--color-warning)'
       : 'var(--color-primary)';
 
@@ -553,15 +561,50 @@ function QuotaWindowRow({
           <div
             className="oauth-window-meter-fill"
             style={{
-              width: `${percent ?? 0}%`,
-              background: percent == null ? 'var(--color-border)' : tone,
+              width: `${remainingPercent ?? 0}%`,
+              background: remainingPercent == null ? 'var(--color-border)' : tone,
             }}
           />
         </div>
-        <span className="oauth-window-value">{percent == null ? 'N/A' : `${percent}%`}</span>
-        {summary && percent == null ? <span className="oauth-window-summary">{summary}</span> : null}
+        <span className="oauth-window-value">{remainingPercent == null ? 'N/A' : `${remainingPercent}%`}</span>
+        {summary && remainingPercent == null ? <span className="oauth-window-summary">{summary}</span> : null}
         {window?.resetAt ? (
           <span className="oauth-window-reset">重置 {formatResetLabel(window.resetAt)}</span>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function AntigravityQuotaGroupRow({
+  group,
+}: {
+  group: AntigravityQuotaGroupInfo;
+}) {
+  const fraction = Math.max(0, Math.min(1, group.remainingFraction));
+  const percent = Math.round(fraction * 100);
+  const tone = percent <= 10
+    ? 'var(--color-danger)'
+    : percent <= 30
+      ? 'var(--color-warning)'
+      : 'var(--color-primary)';
+
+  return (
+    <div className="oauth-window-row">
+      <div className="oauth-window-row-header">
+        <span className="oauth-window-pill" title={group.models.join(', ')}>{group.label}</span>
+        <div className="oauth-window-meter">
+          <div
+            className="oauth-window-meter-fill"
+            style={{
+              width: `${percent}%`,
+              background: tone,
+            }}
+          />
+        </div>
+        <span className="oauth-window-value">{percent}%</span>
+        {group.resetTime ? (
+          <span className="oauth-window-reset">重置 {formatResetLabel(group.resetTime)}</span>
         ) : null}
       </div>
     </div>
@@ -1842,8 +1885,13 @@ export default function OAuthManagement() {
                         </span>
                         <span className="oauth-cell-tertiary">{resolveQuotaSourceLabel(quota.source)}</span>
                       </div>
-                      {quota.windows?.fiveHour?.supported !== false ? <QuotaWindowRow label="5h" window={quota.windows?.fiveHour} /> : null}
-                      {quota.windows?.sevenDay?.supported !== false ? <QuotaWindowRow label="7d" window={quota.windows?.sevenDay} /> : null}
+                      {quota.antigravityGroups && quota.antigravityGroups.length > 0
+                        ? quota.antigravityGroups.map((group) => <AntigravityQuotaGroupRow key={group.id} group={group} />)
+                        : <>
+                            {quota.windows?.fiveHour?.supported !== false ? <QuotaWindowRow label="5h" window={quota.windows?.fiveHour} /> : null}
+                            {quota.windows?.sevenDay?.supported !== false ? <QuotaWindowRow label="7d" window={quota.windows?.sevenDay} /> : null}
+                          </>
+                      }
                     </div>
                   ) : (
                     <span className="oauth-cell-secondary">--</span>
@@ -1985,8 +2033,13 @@ export default function OAuthManagement() {
                     </span>
                     <span className="oauth-cell-tertiary">{resolveQuotaSourceLabel(quota.source)}</span>
                   </div>
-                  {quota.windows?.fiveHour?.supported !== false ? <QuotaWindowRow label="5h" window={quota.windows?.fiveHour} /> : null}
-                  {quota.windows?.sevenDay?.supported !== false ? <QuotaWindowRow label="7d" window={quota.windows?.sevenDay} /> : null}
+                  {quota.antigravityGroups && quota.antigravityGroups.length > 0
+                    ? quota.antigravityGroups.map((group) => <AntigravityQuotaGroupRow key={group.id} group={group} />)
+                    : <>
+                        {quota.windows?.fiveHour?.supported !== false ? <QuotaWindowRow label="5h" window={quota.windows?.fiveHour} /> : null}
+                        {quota.windows?.sevenDay?.supported !== false ? <QuotaWindowRow label="7d" window={quota.windows?.sevenDay} /> : null}
+                      </>
+                  }
                 </>
               ) : (
                 <div className="oauth-cell-secondary">--</div>

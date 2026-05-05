@@ -652,6 +652,14 @@ export type OAuthSessionInfo = {
   error?: string;
 };
 
+export type AntigravityQuotaGroupInfo = {
+  id: string;
+  label: string;
+  models: string[];
+  remainingFraction: number;
+  resetTime?: string | null;
+};
+
 export type OAuthQuotaWindowInfo = {
   supported: boolean;
   limit?: number | null;
@@ -676,6 +684,7 @@ export type OAuthQuotaInfo = {
     fiveHour: OAuthQuotaWindowInfo;
     sevenDay: OAuthQuotaWindowInfo;
   };
+  antigravityGroups?: AntigravityQuotaGroupInfo[] | null;
   lastLimitResetAt?: string | null;
 };
 

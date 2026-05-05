@@ -1,3 +1,11 @@
+export type AntigravityQuotaGroupSnapshot = {
+  id: string;
+  label: string;
+  models: string[];
+  remainingFraction: number;
+  resetTime?: string | null;
+};
+
 export type OauthQuotaWindowSnapshot = {
   supported: boolean;
   limit?: number | null;
@@ -22,5 +30,6 @@ export type OauthQuotaSnapshot = {
     fiveHour: OauthQuotaWindowSnapshot;
     sevenDay: OauthQuotaWindowSnapshot;
   };
+  antigravityGroups?: AntigravityQuotaGroupSnapshot[];
   lastLimitResetAt?: string;
 };
