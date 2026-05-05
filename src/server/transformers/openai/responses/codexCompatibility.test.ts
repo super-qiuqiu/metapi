@@ -110,6 +110,22 @@ describe('normalizeCodexResponsesBodyForProxy', () => {
     });
   });
 
+  it('preserves previous_response_id only when explicitly requested', () => {
+    const source = {
+      model: 'gpt-5.4',
+      input: [],
+      previous_response_id: 'resp_prev_1',
+    };
+
+    const defaultBody = normalizeCodexResponsesBodyForProxy(source, 'codex');
+    expect(defaultBody.previous_response_id).toBeUndefined();
+
+    const preservedBody = normalizeCodexResponsesBodyForProxy(source, 'codex', {
+      preservePreviousResponseId: true,
+    });
+    expect(preservedBody.previous_response_id).toBe('resp_prev_1');
+  });
+
   it('leaves non-codex bodies untouched', () => {
     const source = {
       input: 'hello',

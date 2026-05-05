@@ -27,6 +27,10 @@ import { detectProxyFailure } from '../../services/proxyFailureJudge.js';
 import { openAiChatTransformer } from '../../transformers/openai/chat/index.js';
 import { anthropicMessagesTransformer } from '../../transformers/anthropic/messages/index.js';
 import { shouldPreferResponsesForAnthropicContinuation } from '../../transformers/anthropic/messages/compatibility.js';
+import {
+  isResponsesPreviousResponseNotFoundError,
+  stripResponsesPreviousResponseId,
+} from '../../transformers/openai/responses/continuation.js';
 import { getProxyAuthContext, getProxyResourceOwner } from '../../middleware/auth.js';
 import {
   ProxyInputFileResolutionError,
@@ -83,6 +87,11 @@ import {
   canRetryChannelSelection,
   getTesterForcedChannelId,
 } from '../channelSelection.js';
+import {
+  buildResponsesContinuationRecoveryError,
+  hasReplayableResponsesContinuationContext,
+  isResponsesContinuationRecoveryError,
+} from '../responsesContinuationRecovery.js';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
@@ -382,6 +391,46 @@ export async function handleChatSurfaceRequest(
           });
           if (recovered?.upstream?.ok) {
             return recovered;
+          }
+        }
+        if (
+          ctx.request.endpoint === 'responses'
+          && isResponsesPreviousResponseNotFoundError({
+            rawErrText: ctx.rawErrText,
+          })
+        ) {
+          const previousResponseRecovery = stripResponsesPreviousResponseId(ctx.request.body);
+          if (
+            config.responsesStrictPreviousResponseRecovery
+            && !previousResponseRecovery.removed
+          ) {
+            throw buildResponsesContinuationRecoveryError({
+              reason: 'missing_previous_response_id_on_recovery',
+            });
+          }
+          if (previousResponseRecovery.removed) {
+            const hasReplayableContext = hasReplayableResponsesContinuationContext(previousResponseRecovery.body);
+            if (config.responsesStrictPreviousResponseRecovery && !hasReplayableContext) {
+              throw buildResponsesContinuationRecoveryError({
+                reason: 'tool_output_only_without_replay_context',
+              });
+            }
+            const recoveredRequest = {
+              ...ctx.request,
+              body: previousResponseRecovery.body,
+            };
+            const recoveredResponse = await dispatchRequest(recoveredRequest, ctx.targetUrl);
+            if (recoveredResponse.ok) {
+              return {
+                upstream: recoveredResponse,
+                upstreamPath: recoveredRequest.path,
+                request: recoveredRequest,
+                targetUrl: ctx.targetUrl,
+              };
+            }
+            ctx.request = recoveredRequest;
+            ctx.response = recoveredResponse;
+            ctx.rawErrText = await readRuntimeResponseText(recoveredResponse).catch(() => 'unknown error');
           }
         }
         return endpointStrategy.tryRecover(ctx);
@@ -949,14 +998,31 @@ export async function handleChatSurfaceRequest(
       });
 
       return reply.send(downstreamResponse);
-    } catch (err: any) {
-      clearSurfaceStickyChannel({
-        stickySessionKey,
-        selected,
-      });
-      const endpointFailureStatus = typeof err?.status === 'number' ? err.status : null;
-      const isSiteApiEndpointFailure = (
-        err instanceof SiteApiEndpointRequestError
+      } catch (err: any) {
+        clearSurfaceStickyChannel({
+          stickySessionKey,
+          selected,
+        });
+        if (isResponsesContinuationRecoveryError(err)) {
+          await failureToolkit.log({
+            selected,
+            modelRequested: requestedModel,
+            status: 'failed',
+            httpStatus: err.status,
+            latencyMs: Date.now() - startTime,
+            errorMessage: err.message,
+            retryCount,
+          });
+          await finalizeDebugFailure(
+            err.status,
+            err.payload,
+            null,
+          );
+          return reply.code(err.status).send(err.payload);
+        }
+        const endpointFailureStatus = typeof err?.status === 'number' ? err.status : null;
+        const isSiteApiEndpointFailure = (
+          err instanceof SiteApiEndpointRequestError
         || err?.name === 'SiteApiEndpointRequestError'
         || err?.siteApiEndpointUpstreamFailure === true
         || (endpointFailureStatus !== null && endpointFailureStatus >= 500)
@@ -1358,7 +1424,13 @@ export async function handleClaudeCountTokensSurfaceRequest(
         latency,
       } = countTokensResult;
 
-      tokenRouter.recordSuccess(selected.channel.id, latency, 0, modelName);
+      tokenRouter.recordSuccess(selected.channel.id, latency, 0, modelName, undefined, {
+        promptTokens: 0,
+        completionTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        promptTokensIncludeCache: null,
+      });
       recordDownstreamCostUsage(request, 0);
       await failureToolkit.log({
         selected,

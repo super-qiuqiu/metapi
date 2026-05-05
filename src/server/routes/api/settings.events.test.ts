@@ -53,6 +53,8 @@ describe('settings and auth events', () => {
     config.logCleanupProgramLogsEnabled = false;
     config.logCleanupRetentionDays = 30;
     config.codexUpstreamWebsocketEnabled = false;
+    config.responsesRequireContinuitySession = false;
+    config.responsesStrictPreviousResponseRecovery = false;
     config.proxySessionChannelConcurrencyLimit = 2;
     config.proxySessionChannelQueueWaitMs = 1500;
     (config as any).proxyDebugTraceEnabled = false;
@@ -67,6 +69,10 @@ describe('settings and auth events', () => {
     config.routingFallbackUnitCost = 1;
     (config as any).proxyFirstByteTimeoutSec = 0;
     (config as any).tokenRouterFailureCooldownMaxSec = 30 * 24 * 60 * 60;
+    (config as any).routingBanditGuardrailBaselineEnabled = true;
+    (config as any).routingBanditGuardrailBaselineMinSamples = 120;
+    (config as any).routingBanditGuardrailMaxRetryableFailureRateDelta = 0.02;
+    (config as any).routingBanditGuardrailMaxP95LatencyMultiplier = 1.2;
     (config as any).disableCrossProtocolFallback = false;
     (config as any).payloadRules = {
       default: [],
@@ -589,6 +595,69 @@ describe('settings and auth events', () => {
     expect(getResponse.statusCode).toBe(200);
     const runtime = getResponse.json() as { tokenRouterFailureCooldownMaxSec?: number };
     expect(runtime.tokenRouterFailureCooldownMaxSec).toBe(2 * 24 * 60 * 60);
+  });
+
+  it('persists responses continuity guard settings from runtime settings', async () => {
+    const updateResponse = await app.inject({
+      method: 'PUT',
+      url: '/api/settings/runtime',
+      payload: {
+        responsesRequireContinuitySession: true,
+        responsesStrictPreviousResponseRecovery: true,
+      },
+    });
+
+    expect(updateResponse.statusCode).toBe(200);
+    const updated = updateResponse.json() as {
+      responsesRequireContinuitySession?: boolean;
+      responsesStrictPreviousResponseRecovery?: boolean;
+    };
+    expect(updated.responsesRequireContinuitySession).toBe(true);
+    expect(updated.responsesStrictPreviousResponseRecovery).toBe(true);
+    expect(config.responsesRequireContinuitySession).toBe(true);
+    expect(config.responsesStrictPreviousResponseRecovery).toBe(true);
+
+    const savedRequireSession = await db.select().from(schema.settings).where(eq(schema.settings.key, 'responses_require_continuity_session')).get();
+    const savedStrictRecovery = await db.select().from(schema.settings).where(eq(schema.settings.key, 'responses_strict_previous_response_recovery')).get();
+    expect(savedRequireSession?.value).toBe(JSON.stringify(true));
+    expect(savedStrictRecovery?.value).toBe(JSON.stringify(true));
+  });
+
+  it('persists and returns bandit baseline guardrail settings from runtime settings', async () => {
+    const updateResponse = await app.inject({
+      method: 'PUT',
+      url: '/api/settings/runtime',
+      payload: {
+        routingBanditGuardrailBaselineEnabled: true,
+        routingBanditGuardrailBaselineMinSamples: 240,
+        routingBanditGuardrailMaxRetryableFailureRateDelta: 0.08,
+        routingBanditGuardrailMaxP95LatencyMultiplier: 1.5,
+      },
+    });
+
+    expect(updateResponse.statusCode).toBe(200);
+    const updated = updateResponse.json() as {
+      routingBanditGuardrailBaselineEnabled?: boolean;
+      routingBanditGuardrailBaselineMinSamples?: number;
+      routingBanditGuardrailMaxRetryableFailureRateDelta?: number;
+      routingBanditGuardrailMaxP95LatencyMultiplier?: number;
+    };
+    expect(updated.routingBanditGuardrailBaselineEnabled).toBe(true);
+    expect(updated.routingBanditGuardrailBaselineMinSamples).toBe(240);
+    expect(updated.routingBanditGuardrailMaxRetryableFailureRateDelta).toBe(0.08);
+    expect(updated.routingBanditGuardrailMaxP95LatencyMultiplier).toBe(1.5);
+
+    expect((config as any).routingBanditGuardrailBaselineEnabled).toBe(true);
+    expect((config as any).routingBanditGuardrailBaselineMinSamples).toBe(240);
+    expect((config as any).routingBanditGuardrailMaxRetryableFailureRateDelta).toBe(0.08);
+    expect((config as any).routingBanditGuardrailMaxP95LatencyMultiplier).toBe(1.5);
+
+    const rows = await db.select().from(schema.settings).all();
+    const settingsMap = new Map(rows.map((row) => [row.key, row.value]));
+    expect(settingsMap.get('routing_bandit_guardrail_baseline_enabled')).toBe(JSON.stringify(true));
+    expect(settingsMap.get('routing_bandit_guardrail_baseline_min_samples')).toBe(JSON.stringify(240));
+    expect(settingsMap.get('routing_bandit_guardrail_max_retryable_failure_rate_delta')).toBe(JSON.stringify(0.08));
+    expect(settingsMap.get('routing_bandit_guardrail_max_p95_latency_multiplier')).toBe(JSON.stringify(1.5));
   });
 
   it('clamps token router failure cooldown cap to the supported ceiling', async () => {

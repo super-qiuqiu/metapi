@@ -31,6 +31,7 @@ const SOCKS_PROXY_PROTOCOLS = new Set([
 ]);
 const DEFAULT_PROXY_CONNECT_TIMEOUT_MS = 10_000;
 const DEFAULT_PROXY_KEEPALIVE_INITIAL_DELAY_MS = 60_000;
+const ROUTING_PROXY_KEEPALIVE_TIMEOUT_MS = 30_000;
 
 type SiteProxyRow = {
   siteUrl: string;
@@ -171,7 +172,10 @@ function getDispatcherByProxyUrl(proxyUrl: string, skipCache = false): Dispatche
     const parsedProxyUrl = new URL(normalized);
     const dispatcher = SOCKS_PROXY_PROTOCOLS.has(parsedProxyUrl.protocol.toLowerCase())
       ? createSocksDispatcher(parsedProxyUrl)
-      : new ProxyAgent(normalized);
+      : new ProxyAgent({
+        uri: normalized,
+        keepAliveTimeout: ROUTING_PROXY_KEEPALIVE_TIMEOUT_MS,
+      });
     if (!skipCache) {
       dispatcherCache.set(normalized, dispatcher);
     }
@@ -296,6 +300,7 @@ async function createSocksSocket(
 function createSocksDispatcher(proxyUrl: URL): Dispatcher {
   const socksProxy = parseSocksProxyUrl(proxyUrl);
   return new UndiciAgent({
+    keepAliveTimeout: ROUTING_PROXY_KEEPALIVE_TIMEOUT_MS,
     connect: (connectOptions, callback) => {
       void createSocksSocket(connectOptions, socksProxy)
         .then((socket) => callback(null, socket))

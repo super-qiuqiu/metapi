@@ -304,6 +304,8 @@ function createClientSocketForPath(path: string, headers: Record<string, string>
 describe('responses websocket transport', () => {
   const originalCodexResponsesWebsocketBeta = config.codexResponsesWebsocketBeta;
   const originalCodexUpstreamWebsocketEnabled = config.codexUpstreamWebsocketEnabled;
+  const originalResponsesRequireContinuitySession = config.responsesRequireContinuitySession;
+  const originalResponsesStrictPreviousResponseRecovery = config.responsesStrictPreviousResponseRecovery;
   let app: FastifyInstance;
   let baseUrl: string;
   let upstreamServer: WebSocketServer;
@@ -395,6 +397,8 @@ describe('responses websocket transport', () => {
     upstreamRequests = [];
     (config as any).codexResponsesWebsocketBeta = originalCodexResponsesWebsocketBeta;
     (config as any).codexUpstreamWebsocketEnabled = true;
+    (config as any).responsesRequireContinuitySession = false;
+    (config as any).responsesStrictPreviousResponseRecovery = false;
     rejectedUpgradeStatus = 426;
     rejectedUpgradeStatusText = 'Upgrade Required';
     rejectedUpgradeBody = 'Upgrade Required';
@@ -440,6 +444,8 @@ describe('responses websocket transport', () => {
 
   afterAll(async () => {
     (config as any).codexUpstreamWebsocketEnabled = originalCodexUpstreamWebsocketEnabled;
+    (config as any).responsesRequireContinuitySession = originalResponsesRequireContinuitySession;
+    (config as any).responsesStrictPreviousResponseRecovery = originalResponsesStrictPreviousResponseRecovery;
     for (const socket of trackedClientSockets) {
       try {
         socket.terminate();
@@ -547,6 +553,16 @@ describe('responses websocket transport', () => {
     expect(messages[3]?.response?.output?.[0]?.content?.[0]?.text).toBe('pong');
     expect(fetchMock).toHaveBeenCalledTimes(0);
     expect(upstreamConnectionCount).toBe(1);
+  });
+
+  it('rejects websocket turns without continuity markers when continuity guard is enabled', async () => {
+    (config as any).responsesRequireContinuitySession = true;
+
+    const socket = createClientSocket(baseUrl);
+    await waitForSocketOpen(socket);
+    await waitForSocketClose(socket);
+
+    expect(fetchMock).toHaveBeenCalledTimes(0);
   });
 
   it('uses the configured site api endpoint pool for codex websocket transport', async () => {
@@ -994,6 +1010,55 @@ describe('responses websocket transport', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(message?.type).toBe('response.completed');
     expect(message?.response?.id).toBe('resp_http_fallback');
+  });
+
+  it('returns recoverable continuation error instead of blind retry on strict previous_response recovery', async () => {
+    (config as any).responsesStrictPreviousResponseRecovery = true;
+    const selectedChannel = createSelectedChannel({
+      siteUrl: rejectedUpgradeSiteUrl,
+    });
+    selectChannelMock.mockReturnValue(selectedChannel);
+    previewSelectedChannelMock.mockResolvedValue(selectedChannel);
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      error: {
+        message: 'previous_response_not_found',
+        code: 'previous_response_not_found',
+        type: 'invalid_request_error',
+      },
+    }), {
+      status: 400,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    const socket = createClientSocket(baseUrl, {
+      session_id: 'ws-session-prev-strict',
+    });
+    await waitForSocketOpen(socket);
+    const messagePromise = waitForSocketMessageMatching(
+      socket,
+      (message) => message?.type === 'error' && message?.error?.code === 'previous_response_recovery_required',
+    );
+
+    socket.send(JSON.stringify({
+      type: 'response.create',
+      model: 'gpt-5.4',
+      previous_response_id: 'resp_stale_strict',
+      input: [
+        {
+          id: 'tool_out_ws_strict_1',
+          type: 'function_call_output',
+          call_id: 'call_ws_strict_1',
+          output: '{"retry":true}',
+        },
+      ],
+    }));
+
+    const message = await messagePromise;
+    socket.close();
+
+    expect(message?.status).toBe(409);
+    expect(message?.error?.recoverable).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it('treats response.incomplete as a terminal HTTP fallback payload without appending websocket error', async () => {

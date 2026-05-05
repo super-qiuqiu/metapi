@@ -156,6 +156,7 @@ describe('chat proxy stream behavior', () => {
       filter: [],
     };
     (config as any).disableCrossProtocolFallback = false;
+    (config as any).responsesStrictPreviousResponseRecovery = false;
     config.proxyEmptyContentFailEnabled = false;
     config.proxyErrorKeywords = [];
   });
@@ -936,6 +937,63 @@ describe('chat proxy stream behavior', () => {
       type: 'function_call_output',
       call_id: 'toolu_missing',
       output: '{"matches":1}',
+    });
+  });
+
+  it('returns recoverable continuation error for tool-output-only bridge turns in strict recovery mode', async () => {
+    (config as any).responsesStrictPreviousResponseRecovery = true;
+    selectChannelMock.mockReturnValue({
+      channel: { id: 11, routeId: 22 },
+      site: {
+        name: 'openai-site',
+        url: 'https://upstream.example.com',
+        platform: 'openai',
+      },
+      account: { id: 33, username: 'demo-user' },
+      tokenName: 'default',
+      tokenValue: 'sk-demo',
+      actualModel: 'gpt-5.4',
+    });
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({
+      error: {
+        message: 'previous_response_not_found',
+        code: 'previous_response_not_found',
+        type: 'invalid_request_error',
+      },
+    }), {
+      status: 400,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/messages',
+      payload: {
+        model: 'claude-opus-4-6',
+        max_tokens: 256,
+        previous_response_id: 'resp_prev_missing',
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'toolu_only',
+                content: [{ type: 'text', text: '{"matches":1}' }],
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(response.json()).toMatchObject({
+      error: {
+        code: 'previous_response_recovery_required',
+        recoverable: true,
+      },
     });
   });
 
@@ -4695,6 +4753,56 @@ describe('chat proxy stream behavior', () => {
     expect(forwardedBody.input.some((item: any) => item?.type === 'function_call_output')).toBe(true);
     expect(forwardedBody.tools?.[0]?.name).toBe('Glob');
     expect(forwardedBody.tool_choice).toEqual({ type: 'function', name: 'Glob' });
+  });
+
+  it('returns recoverable continuation error for tool-output-only /v1/chat/completions bridge turns in strict recovery mode', async () => {
+    (config as any).responsesStrictPreviousResponseRecovery = true;
+    fetchModelPricingCatalogMock.mockResolvedValue({
+      models: [
+        {
+          modelName: 'upstream-gpt',
+          supportedEndpointTypes: ['/v1/responses'],
+        },
+      ],
+      groupRatio: {},
+    });
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({
+      error: {
+        message: 'previous_response_not_found',
+        code: 'previous_response_not_found',
+        type: 'invalid_request_error',
+      },
+    }), {
+      status: 400,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'gpt-4o-mini',
+        stream: false,
+        previous_response_id: 'resp_prev_missing',
+        messages: [
+          {
+            role: 'tool',
+            tool_call_id: 'call_only',
+            content: '{"matches":1}',
+          },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain('/v1/responses');
+    expect(response.json()).toMatchObject({
+      error: {
+        code: 'previous_response_recovery_required',
+        recoverable: true,
+      },
+    });
   });
 
   it('routes gemini platform to OpenAI-compatible upstream endpoint path', async () => {

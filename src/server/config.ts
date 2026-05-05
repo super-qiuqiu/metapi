@@ -59,6 +59,11 @@ export function normalizeTokenRouterFailureCooldownMaxSec(value: unknown): numbe
   );
 }
 
+export function normalizeRoutingAlgorithm(value: unknown): 'legacy' | 'bandit' {
+  const normalized = String(value || 'legacy').trim().toLowerCase();
+  return normalized === 'bandit' ? 'bandit' : 'legacy';
+}
+
 function parseListenHost(env: NodeJS.ProcessEnv): string {
   return (env.HOST || '0.0.0.0').trim() || '0.0.0.0';
 }
@@ -132,6 +137,8 @@ export function buildConfig(env: NodeJS.ProcessEnv) {
     proxySessionChannelLeaseKeepaliveMs: Math.max(1_000, Math.trunc(parseNumber(env.PROXY_SESSION_CHANNEL_LEASE_KEEPALIVE_MS, 15_000))),
     codexUpstreamWebsocketEnabled: parseBoolean(env.CODEX_UPSTREAM_WEBSOCKET_ENABLED, false),
     responsesCompactFallbackToResponsesEnabled: parseBoolean(env.RESPONSES_COMPACT_FALLBACK_TO_RESPONSES_ENABLED, false),
+    responsesRequireContinuitySession: parseBoolean(env.RESPONSES_REQUIRE_CONTINUITY_SESSION, false),
+    responsesStrictPreviousResponseRecovery: parseBoolean(env.RESPONSES_STRICT_PREVIOUS_RESPONSE_RECOVERY, false),
     disableCrossProtocolFallback: parseBoolean(env.DISABLE_CROSS_PROTOCOL_FALLBACK, false),
     proxyDebugTraceEnabled: parseBoolean(env.PROXY_DEBUG_TRACE_ENABLED, false),
     proxyDebugCaptureHeaders: parseBoolean(env.PROXY_DEBUG_CAPTURE_HEADERS, true),
@@ -167,6 +174,29 @@ export function buildConfig(env: NodeJS.ProcessEnv) {
       balanceWeight: parseNumber(env.BALANCE_WEIGHT, 0.3),
       usageWeight: parseNumber(env.USAGE_WEIGHT, 0.3),
     },
+    routingAlgorithm: normalizeRoutingAlgorithm(env.ROUTING_ALGORITHM),
+    routingBanditFeatures: {
+      ewmaHealth: parseBoolean(env.ROUTING_BANDIT_EWMA_HEALTH, true),
+      expectedCost: parseBoolean(env.ROUTING_BANDIT_EXPECTED_COST, true),
+      tsSampling: parseBoolean(env.ROUTING_BANDIT_TS_SAMPLING, true),
+      p2c: parseBoolean(env.ROUTING_BANDIT_P2C, true),
+    },
+    routingBanditWeights: {
+      theta: parseNumber(env.ROUTING_BANDIT_WEIGHT_THETA, 1.0),
+      latency: parseNumber(env.ROUTING_BANDIT_WEIGHT_LATENCY, 0.25),
+      cost: parseNumber(env.ROUTING_BANDIT_WEIGHT_COST, 0.45),
+      manual: parseNumber(env.ROUTING_BANDIT_WEIGHT_MANUAL, 0.15),
+    },
+    routingBanditFlushIntervalMs: Math.max(5_000, Math.trunc(parseNumber(env.ROUTING_BANDIT_FLUSH_INTERVAL_MS, 30_000))),
+    routingBanditDecisionLogSampleRate: Math.max(0, Math.min(1, parseNumber(env.ROUTING_BANDIT_DECISION_LOG_SAMPLE_RATE, 0.03))),
+    routingBanditGuardrailEnabled: parseBoolean(env.ROUTING_BANDIT_GUARDRAIL_ENABLED, true),
+    routingBanditGuardrailMinSamples: Math.max(10, Math.trunc(parseNumber(env.ROUTING_BANDIT_GUARDRAIL_MIN_SAMPLES, 60))),
+    routingBanditGuardrailMaxRetryableFailureRate: Math.max(0.01, Math.min(1, parseNumber(env.ROUTING_BANDIT_GUARDRAIL_MAX_RETRYABLE_FAILURE_RATE, 0.08))),
+    routingBanditGuardrailMaxP95LatencyMs: Math.max(100, Math.trunc(parseNumber(env.ROUTING_BANDIT_GUARDRAIL_MAX_P95_LATENCY_MS, 15_000))),
+    routingBanditGuardrailBaselineEnabled: parseBoolean(env.ROUTING_BANDIT_GUARDRAIL_BASELINE_ENABLED, true),
+    routingBanditGuardrailBaselineMinSamples: Math.max(10, Math.trunc(parseNumber(env.ROUTING_BANDIT_GUARDRAIL_BASELINE_MIN_SAMPLES, 120))),
+    routingBanditGuardrailMaxRetryableFailureRateDelta: Math.max(0, Math.min(1, parseNumber(env.ROUTING_BANDIT_GUARDRAIL_MAX_RETRYABLE_FAILURE_RATE_DELTA, 0.02))),
+    routingBanditGuardrailMaxP95LatencyMultiplier: Math.max(1, parseNumber(env.ROUTING_BANDIT_GUARDRAIL_MAX_P95_LATENCY_MULTIPLIER, 1.2)),
   };
 }
 

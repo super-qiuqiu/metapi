@@ -1,5 +1,6 @@
 import {
   config,
+  normalizeRoutingAlgorithm,
   normalizeTokenRouterFailureCooldownMaxSec,
 } from './config.js';
 import { normalizePayloadRulesConfig } from './services/payloadRules.js';
@@ -53,6 +54,16 @@ export function applyRuntimeSettings(settingsMap: Map<string, string>) {
   const responsesCompactFallbackToResponsesEnabled = parseSettingFromMap<boolean>(settingsMap, 'responses_compact_fallback_to_responses_enabled');
   if (typeof responsesCompactFallbackToResponsesEnabled === 'boolean') {
     config.responsesCompactFallbackToResponsesEnabled = responsesCompactFallbackToResponsesEnabled;
+  }
+
+  const responsesRequireContinuitySession = parseSettingFromMap<boolean>(settingsMap, 'responses_require_continuity_session');
+  if (typeof responsesRequireContinuitySession === 'boolean') {
+    config.responsesRequireContinuitySession = responsesRequireContinuitySession;
+  }
+
+  const responsesStrictPreviousResponseRecovery = parseSettingFromMap<boolean>(settingsMap, 'responses_strict_previous_response_recovery');
+  if (typeof responsesStrictPreviousResponseRecovery === 'boolean') {
+    config.responsesStrictPreviousResponseRecovery = responsesStrictPreviousResponseRecovery;
   }
 
   const disableCrossProtocolFallback = parseSettingFromMap<boolean>(settingsMap, 'disable_cross_protocol_fallback');
@@ -200,6 +211,106 @@ export function applyRuntimeSettings(settingsMap: Map<string, string>) {
       ...config.routingWeights,
       ...routingWeights,
     };
+  }
+
+  const routingAlgorithm = parseSettingFromMap<string>(settingsMap, 'routing_algorithm');
+  if (routingAlgorithm !== undefined) {
+    config.routingAlgorithm = normalizeRoutingAlgorithm(routingAlgorithm);
+  }
+
+  const routingBanditFeatures = parseSettingFromMap<Partial<typeof config.routingBanditFeatures>>(settingsMap, 'routing_bandit_features');
+  if (routingBanditFeatures && typeof routingBanditFeatures === 'object') {
+    config.routingBanditFeatures = {
+      ...config.routingBanditFeatures,
+      ...routingBanditFeatures,
+    };
+  }
+
+  const routingBanditWeights = parseSettingFromMap<Partial<typeof config.routingBanditWeights>>(settingsMap, 'routing_bandit_weights');
+  if (routingBanditWeights && typeof routingBanditWeights === 'object') {
+    config.routingBanditWeights = {
+      ...config.routingBanditWeights,
+      ...routingBanditWeights,
+    };
+  }
+
+  const routingBanditFlushIntervalMs = parseSettingFromMap<number>(settingsMap, 'routing_bandit_flush_interval_ms');
+  if (
+    typeof routingBanditFlushIntervalMs === 'number'
+    && Number.isFinite(routingBanditFlushIntervalMs)
+    && routingBanditFlushIntervalMs >= 5_000
+  ) {
+    config.routingBanditFlushIntervalMs = Math.trunc(routingBanditFlushIntervalMs);
+  }
+
+  const routingBanditDecisionLogSampleRate = parseSettingFromMap<number>(settingsMap, 'routing_bandit_decision_log_sample_rate');
+  if (
+    typeof routingBanditDecisionLogSampleRate === 'number'
+    && Number.isFinite(routingBanditDecisionLogSampleRate)
+  ) {
+    config.routingBanditDecisionLogSampleRate = Math.max(0, Math.min(1, routingBanditDecisionLogSampleRate));
+  }
+
+  const routingBanditGuardrailEnabled = parseSettingFromMap<boolean>(settingsMap, 'routing_bandit_guardrail_enabled');
+  if (typeof routingBanditGuardrailEnabled === 'boolean') {
+    config.routingBanditGuardrailEnabled = routingBanditGuardrailEnabled;
+  }
+
+  const routingBanditGuardrailMinSamples = parseSettingFromMap<number>(settingsMap, 'routing_bandit_guardrail_min_samples');
+  if (
+    typeof routingBanditGuardrailMinSamples === 'number'
+    && Number.isFinite(routingBanditGuardrailMinSamples)
+    && routingBanditGuardrailMinSamples >= 10
+  ) {
+    config.routingBanditGuardrailMinSamples = Math.trunc(routingBanditGuardrailMinSamples);
+  }
+
+  const routingBanditGuardrailMaxRetryableFailureRate = parseSettingFromMap<number>(settingsMap, 'routing_bandit_guardrail_max_retryable_failure_rate');
+  if (
+    typeof routingBanditGuardrailMaxRetryableFailureRate === 'number'
+    && Number.isFinite(routingBanditGuardrailMaxRetryableFailureRate)
+  ) {
+    config.routingBanditGuardrailMaxRetryableFailureRate = Math.max(0.01, Math.min(1, routingBanditGuardrailMaxRetryableFailureRate));
+  }
+
+  const routingBanditGuardrailMaxP95LatencyMs = parseSettingFromMap<number>(settingsMap, 'routing_bandit_guardrail_max_p95_latency_ms');
+  if (
+    typeof routingBanditGuardrailMaxP95LatencyMs === 'number'
+    && Number.isFinite(routingBanditGuardrailMaxP95LatencyMs)
+    && routingBanditGuardrailMaxP95LatencyMs >= 100
+  ) {
+    config.routingBanditGuardrailMaxP95LatencyMs = Math.trunc(routingBanditGuardrailMaxP95LatencyMs);
+  }
+
+  const routingBanditGuardrailBaselineEnabled = parseSettingFromMap<boolean>(settingsMap, 'routing_bandit_guardrail_baseline_enabled');
+  if (typeof routingBanditGuardrailBaselineEnabled === 'boolean') {
+    config.routingBanditGuardrailBaselineEnabled = routingBanditGuardrailBaselineEnabled;
+  }
+
+  const routingBanditGuardrailBaselineMinSamples = parseSettingFromMap<number>(settingsMap, 'routing_bandit_guardrail_baseline_min_samples');
+  if (
+    typeof routingBanditGuardrailBaselineMinSamples === 'number'
+    && Number.isFinite(routingBanditGuardrailBaselineMinSamples)
+    && routingBanditGuardrailBaselineMinSamples >= 10
+  ) {
+    config.routingBanditGuardrailBaselineMinSamples = Math.trunc(routingBanditGuardrailBaselineMinSamples);
+  }
+
+  const routingBanditGuardrailMaxRetryableFailureRateDelta = parseSettingFromMap<number>(settingsMap, 'routing_bandit_guardrail_max_retryable_failure_rate_delta');
+  if (
+    typeof routingBanditGuardrailMaxRetryableFailureRateDelta === 'number'
+    && Number.isFinite(routingBanditGuardrailMaxRetryableFailureRateDelta)
+  ) {
+    config.routingBanditGuardrailMaxRetryableFailureRateDelta = Math.max(0, Math.min(1, routingBanditGuardrailMaxRetryableFailureRateDelta));
+  }
+
+  const routingBanditGuardrailMaxP95LatencyMultiplier = parseSettingFromMap<number>(settingsMap, 'routing_bandit_guardrail_max_p95_latency_multiplier');
+  if (
+    typeof routingBanditGuardrailMaxP95LatencyMultiplier === 'number'
+    && Number.isFinite(routingBanditGuardrailMaxP95LatencyMultiplier)
+    && routingBanditGuardrailMaxP95LatencyMultiplier >= 1
+  ) {
+    config.routingBanditGuardrailMaxP95LatencyMultiplier = routingBanditGuardrailMaxP95LatencyMultiplier;
   }
 
   const routingFallbackUnitCost = parseSettingFromMap<number>(settingsMap, 'routing_fallback_unit_cost');

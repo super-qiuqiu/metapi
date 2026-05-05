@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   extractResponsesTerminalResponseId,
+  isResponsesToolOutputOnlyInput,
   isResponsesPreviousResponseNotFoundError,
   shouldInferResponsesPreviousResponseId,
   stripResponsesPreviousResponseId,
@@ -121,5 +122,32 @@ describe('responses continuation helpers', () => {
       object: 'response',
       status: 'in_progress',
     })).toBeNull();
+  });
+
+  it('detects tool-output-only continuation payloads', () => {
+    expect(isResponsesToolOutputOnlyInput({
+      input: [
+        {
+          type: 'function_call_output',
+          call_id: 'call_1',
+          output: '{"ok":true}',
+        },
+      ],
+    })).toBe(true);
+
+    expect(isResponsesToolOutputOnlyInput({
+      input: [
+        {
+          type: 'function_call_output',
+          call_id: 'call_1',
+          output: '{"ok":true}',
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'continue' }],
+        },
+      ],
+    })).toBe(false);
   });
 });

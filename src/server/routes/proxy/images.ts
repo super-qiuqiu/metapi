@@ -157,7 +157,13 @@ export async function imagesProxyRoute(app: FastifyInstance) {
           });
         });
         await recordTokenRouterEventBestEffort('record channel success', () => (
-          tokenRouter.recordSuccess(selected.channel.id, latency, estimatedCost, upstreamModel)
+          tokenRouter.recordSuccess(selected.channel.id, latency, estimatedCost, upstreamModel, undefined, {
+            promptTokens: 0,
+            completionTokens: 0,
+            cacheReadTokens: 0,
+            cacheCreationTokens: 0,
+            promptTokensIncludeCache: null,
+          })
         ));
         await recordTokenRouterEventBestEffort('record downstream cost usage', () => (
           recordDownstreamCostUsage(request, estimatedCost)
@@ -377,7 +383,13 @@ export async function imagesProxyRoute(app: FastifyInstance) {
           });
         });
         await recordTokenRouterEventBestEffort('record channel success', () => (
-          tokenRouter.recordSuccess(selected.channel.id, latency, estimatedCost, upstreamModel)
+          tokenRouter.recordSuccess(selected.channel.id, latency, estimatedCost, upstreamModel, undefined, {
+            promptTokens: 0,
+            completionTokens: 0,
+            cacheReadTokens: 0,
+            cacheCreationTokens: 0,
+            promptTokensIncludeCache: null,
+          })
         ));
         await recordTokenRouterEventBestEffort('record downstream cost usage', () => (
           recordDownstreamCostUsage(request, estimatedCost)

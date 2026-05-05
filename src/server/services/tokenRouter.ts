@@ -18,6 +18,14 @@ import { isUsableAccountToken } from './accountTokenService.js';
 import { getOauthInfoFromAccount } from './oauth/oauthAccount.js';
 import { parseCodexQuotaResetHint } from './oauth/quota.js';
 import {
+  incFailureClass,
+  incFallbackLegacy,
+  incSelectedChannel,
+  setExplorationRate,
+} from './routing/channelRoutingMetrics.js';
+import { channelBanditStore, type RoutingFailureClass } from './routing/channelBanditStore.js';
+import { startChannelBanditDecayScheduler } from './routing/channelBanditDecay.js';
+import {
   getOauthRouteUnitStrategyLabel,
   listOauthRouteUnitMembersByUnitIds,
   loadOauthRouteUnitSummariesByIds,
@@ -254,11 +262,26 @@ let siteRuntimeHealthLoadPromise: Promise<void> | null = null;
 let siteRuntimeHealthSaveTimer: ReturnType<typeof setTimeout> | null = null;
 let siteRuntimeHealthPersistInFlight: Promise<void> | null = null;
 
+startChannelBanditDecayScheduler();
+
 const STABLE_FIRST_PRIMARY_SUCCESS_RATE_RATIO = 0.92;
 const STABLE_FIRST_TRUSTED_RECENT_CONFIDENCE = 0.5;
 const STABLE_FIRST_TRUSTED_HISTORICAL_CALLS = 8;
 const STABLE_FIRST_OBSERVATION_REQUEST_INTERVAL = 24;
 const STABLE_FIRST_OBSERVATION_SITE_COOLDOWN_MS = 30 * 60 * 1000;
+const BANDIT_GUARDRAIL_MAX_SAMPLES = 400;
+const BANDIT_GUARDRAIL_EVAL_MIN_INTERVAL_MS = 10_000;
+
+type BanditGuardrailSample = {
+  tsMs: number;
+  latencyMs?: number;
+  failureClass?: RoutingFailureClass;
+  algorithm: 'legacy' | 'bandit';
+};
+
+const banditGuardrailSamples: BanditGuardrailSample[] = [];
+let banditGuardrailStage: 0 | 1 | 2 = 0;
+let banditGuardrailLastEvalMs = 0;
 
 function rememberStableFirstSiteSelectionForKey(rotationKey: string, siteId: number): void {
   if (!rotationKey || !Number.isFinite(siteId) || siteId <= 0) return;
@@ -363,6 +386,149 @@ function isUsageLimitRateLimitFailure(context: SiteRuntimeFailureContext = {}): 
   const status = typeof context.status === 'number' ? context.status : 0;
   if (status !== 429) return false;
   return matchesAnyPattern(USAGE_LIMIT_RATE_LIMIT_PATTERNS, context.errorText);
+}
+
+function classifyRoutingFailure(context: SiteRuntimeFailureContext = {}): RoutingFailureClass {
+  const status = typeof context.status === 'number' ? context.status : 0;
+  if (status === 429 || isUsageLimitRateLimitFailure(context)) {
+    return 'throttling';
+  }
+  if (status >= 500 || status === 408 || status === 0) {
+    return 'retryable_upstream';
+  }
+  if (matchesAnyPattern(SITE_TRANSIENT_FAILURE_PATTERNS, context.errorText)) {
+    return 'retryable_upstream';
+  }
+  return 'caller_fault';
+}
+
+function pushBanditGuardrailSample(sample: BanditGuardrailSample): void {
+  banditGuardrailSamples.push(sample);
+  while (banditGuardrailSamples.length > BANDIT_GUARDRAIL_MAX_SAMPLES) {
+    banditGuardrailSamples.shift();
+  }
+}
+
+function collectRecentGuardrailSamplesByAlgorithm(
+  algorithm: 'legacy' | 'bandit',
+  maxSamples: number,
+): BanditGuardrailSample[] {
+  const collected: BanditGuardrailSample[] = [];
+  if (maxSamples <= 0) return collected;
+  for (let i = banditGuardrailSamples.length - 1; i >= 0 && collected.length < maxSamples; i -= 1) {
+    const sample = banditGuardrailSamples[i];
+    if (!sample || sample.algorithm !== algorithm) continue;
+    collected.push(sample);
+  }
+  return collected.reverse();
+}
+
+function computePercentile(values: number[], percentile: number): number {
+  if (values.length <= 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil((percentile / 100) * sorted.length) - 1));
+  return sorted[index] ?? 0;
+}
+
+function summarizeGuardrailSamples(samples: BanditGuardrailSample[]): {
+  retryableFailureRate: number;
+  p95LatencyMs: number;
+  sampleCount: number;
+} {
+  if (samples.length <= 0) {
+    return {
+      retryableFailureRate: 0,
+      p95LatencyMs: 0,
+      sampleCount: 0,
+    };
+  }
+  const retryableFailures = samples.filter((sample) => sample.failureClass === 'retryable_upstream').length;
+  const retryableFailureRate = retryableFailures / samples.length;
+  const latencies = samples
+    .map((sample) => sample.latencyMs)
+    .filter((latency): latency is number => typeof latency === 'number' && Number.isFinite(latency) && latency > 0);
+  const p95LatencyMs = latencies.length > 0 ? computePercentile(latencies, 95) : 0;
+  return {
+    retryableFailureRate,
+    p95LatencyMs,
+    sampleCount: samples.length,
+  };
+}
+
+function evaluateBanditGuardrail(nowMs = Date.now()): void {
+  if (!config.routingBanditGuardrailEnabled) return;
+  if (config.routingAlgorithm !== 'bandit') {
+    banditGuardrailStage = 0;
+    return;
+  }
+  if (nowMs - banditGuardrailLastEvalMs < BANDIT_GUARDRAIL_EVAL_MIN_INTERVAL_MS) return;
+  banditGuardrailLastEvalMs = nowMs;
+
+  const minSamples = Math.max(10, config.routingBanditGuardrailMinSamples);
+  const recentBanditSamples = collectRecentGuardrailSamplesByAlgorithm('bandit', minSamples);
+  if (recentBanditSamples.length < minSamples) return;
+  const banditStats = summarizeGuardrailSamples(recentBanditSamples);
+
+  let failureRateThreshold = config.routingBanditGuardrailMaxRetryableFailureRate;
+  let p95LatencyThresholdMs = config.routingBanditGuardrailMaxP95LatencyMs;
+  let baselineStats: ReturnType<typeof summarizeGuardrailSamples> | null = null;
+  if (config.routingBanditGuardrailBaselineEnabled) {
+    const baselineMinSamples = Math.max(10, config.routingBanditGuardrailBaselineMinSamples);
+    const recentLegacySamples = collectRecentGuardrailSamplesByAlgorithm('legacy', baselineMinSamples);
+    if (recentLegacySamples.length >= baselineMinSamples) {
+      baselineStats = summarizeGuardrailSamples(recentLegacySamples);
+      failureRateThreshold = Math.max(
+        failureRateThreshold,
+        baselineStats.retryableFailureRate + config.routingBanditGuardrailMaxRetryableFailureRateDelta,
+      );
+      if (baselineStats.p95LatencyMs > 0) {
+        p95LatencyThresholdMs = Math.max(
+          p95LatencyThresholdMs,
+          baselineStats.p95LatencyMs * config.routingBanditGuardrailMaxP95LatencyMultiplier,
+        );
+      }
+    }
+  }
+
+  const breachFailureRate = banditStats.retryableFailureRate > failureRateThreshold;
+  const breachLatency = banditStats.p95LatencyMs > p95LatencyThresholdMs;
+  if (!breachFailureRate && !breachLatency) {
+    banditGuardrailStage = 0;
+    return;
+  }
+
+  if (banditGuardrailStage === 0 && (config.routingBanditFeatures.tsSampling || config.routingBanditFeatures.p2c)) {
+    config.routingBanditFeatures = {
+      ...config.routingBanditFeatures,
+      tsSampling: false,
+      p2c: false,
+    };
+    banditGuardrailStage = 1;
+    incFallbackLegacy('bandit_guardrail_disable_ts_p2c');
+    console.warn('[routing-bandit] guardrail triggered: disable ts_sampling+p2c', {
+      retryableFailureRate: banditStats.retryableFailureRate,
+      p95LatencyMs: banditStats.p95LatencyMs,
+      sampleCount: banditStats.sampleCount,
+      failureRateThreshold,
+      p95LatencyThresholdMs,
+      baselineSampleCount: baselineStats?.sampleCount ?? 0,
+    });
+    return;
+  }
+
+  if (banditGuardrailStage <= 1) {
+    config.routingAlgorithm = 'legacy';
+    banditGuardrailStage = 2;
+    incFallbackLegacy('bandit_guardrail_rollback_legacy');
+    console.warn('[routing-bandit] guardrail triggered: rollback to legacy', {
+      retryableFailureRate: banditStats.retryableFailureRate,
+      p95LatencyMs: banditStats.p95LatencyMs,
+      sampleCount: banditStats.sampleCount,
+      failureRateThreshold,
+      p95LatencyThresholdMs,
+      baselineSampleCount: baselineStats?.sampleCount ?? 0,
+    });
+  }
 }
 
 function isModelScopedRuntimeFailure(context: SiteRuntimeFailureContext = {}): boolean {
@@ -936,6 +1102,10 @@ export function resetSiteRuntimeHealthState(): void {
   siteModelRuntimeHealthStates.clear();
   stableFirstObservationProgressByKey.clear();
   stableFirstObservationSiteCooldownByKey.clear();
+  banditGuardrailSamples.length = 0;
+  banditGuardrailStage = 0;
+  banditGuardrailLastEvalMs = 0;
+  channelBanditStore.resetForTests();
   siteRuntimeHealthLoaded = false;
   siteRuntimeHealthLoadPromise = null;
   if (siteRuntimeHealthSaveTimer) {
@@ -955,6 +1125,10 @@ export async function flushSiteRuntimeHealthPersistence(): Promise<void> {
   if (siteRuntimeHealthPersistInFlight) {
     await siteRuntimeHealthPersistInFlight;
   }
+}
+
+export async function flushChannelRoutingStatePersistence(): Promise<void> {
+  await channelBanditStore.flushDirty();
 }
 
 function clearRuntimeHealthStatesForChannels(rows: Array<{
@@ -2453,6 +2627,13 @@ export class TokenRouter {
     cost: number,
     modelName?: string | null,
     actualAccountId?: number,
+    usage?: {
+      promptTokens?: number | null;
+      completionTokens?: number | null;
+      cacheReadTokens?: number | null;
+      cacheCreationTokens?: number | null;
+      promptTokensIncludeCache?: boolean | null;
+    } | null,
   ) {
     await ensureSiteRuntimeHealthStateLoaded();
     const row = await db.select()
@@ -2527,6 +2708,21 @@ export class TokenRouter {
       channel.consecutiveFailCount = 0;
       channel.cooldownLevel = 0;
     });
+
+    try {
+      await channelBanditStore.recordSuccess(channelId, latencyMs, cost, usage, {
+        model: modelName || null,
+        siteId: account.siteId,
+      });
+    } catch (error) {
+      console.warn('[routing-bandit] recordSuccess failed', error);
+    }
+    pushBanditGuardrailSample({
+      tsMs: Date.now(),
+      latencyMs,
+      algorithm: config.routingAlgorithm,
+    });
+    evaluateBanditGuardrail();
   }
 
   async recordProbeSuccess(
@@ -2717,6 +2913,8 @@ export class TokenRouter {
     const normalizedContext: SiteRuntimeFailureContext = typeof context === 'string'
       ? { modelName: context }
       : (context ?? {});
+    const routingFailureClass = classifyRoutingFailure(normalizedContext);
+    incFailureClass(routingFailureClass);
     if (typeof ch.oauthRouteUnitId === 'number' && ch.oauthRouteUnitId > 0) {
       const targetAccountId = Number.isFinite(actualAccountId) && (actualAccountId ?? 0) > 0
         ? Math.trunc(actualAccountId!)
@@ -2771,6 +2969,17 @@ export class TokenRouter {
           updatedAt: nowIso,
         }).where(eq(schema.oauthRouteUnitMembers.id, memberRow.member.id)).run();
         recordSiteRuntimeFailure(memberRow.account.siteId, normalizedContext, nowMs);
+        try {
+          await channelBanditStore.recordFailure(channelId, routingFailureClass);
+        } catch (error) {
+          console.warn('[routing-bandit] recordFailure failed', error);
+        }
+        pushBanditGuardrailSample({
+          tsMs: Date.now(),
+          failureClass: routingFailureClass,
+          algorithm: config.routingAlgorithm,
+        });
+        evaluateBanditGuardrail();
         invalidateRouteScopedCache(route.id);
         return;
       }
@@ -2824,6 +3033,17 @@ export class TokenRouter {
     }
 
     recordSiteRuntimeFailure(account.siteId, normalizedContext, nowMs);
+    try {
+      await channelBanditStore.recordFailure(channelId, routingFailureClass);
+    } catch (error) {
+      console.warn('[routing-bandit] recordFailure failed', error);
+    }
+    pushBanditGuardrailSample({
+      tsMs: Date.now(),
+      failureClass: routingFailureClass,
+      algorithm: config.routingAlgorithm,
+    });
+    evaluateBanditGuardrail();
   }
 
   /**
@@ -2946,12 +3166,19 @@ export class TokenRouter {
       const rawLayer = layers.get(priority) ?? [];
       const breakerFiltered = filterSiteRuntimeBrokenCandidatesByModel(rawLayer, runtimeModelResolver, nowMs);
       const candidates = filterRecentlyFailedCandidates(breakerFiltered.candidates, nowMs);
-      const selected = this.weightedRandomSelect(
-        candidates,
-        requestedByDisplayName ? runtimeModelResolver : mappedModel,
-        downstreamPolicy,
-        nowMs,
-      );
+      const selected = config.routingAlgorithm === 'bandit'
+        ? await this.banditSelect(
+          candidates,
+          requestedByDisplayName ? runtimeModelResolver : mappedModel,
+          downstreamPolicy,
+          nowMs,
+        )
+        : this.weightedRandomSelect(
+          candidates,
+          requestedByDisplayName ? runtimeModelResolver : mappedModel,
+          downstreamPolicy,
+          nowMs,
+        );
       if (!selected) continue;
       const resolved = await this.finalizeSelectedCandidateForDispatch(
         selected,
@@ -3507,6 +3734,79 @@ export class TokenRouter {
       tokenName: dispatchCandidate.token?.name || 'default',
       actualModel,
     };
+  }
+
+  private resolveBanditManualWeight(candidate: RouteChannelCandidate): number {
+    const rawWeight = Number.isFinite(candidate.channel.weight) ? (candidate.channel.weight as number) : 10;
+    return clampNumber(rawWeight / 10, 0.5, 2);
+  }
+
+  private async banditSelect(
+    candidates: RouteChannelCandidate[],
+    modelName: string | ((candidate: RouteChannelCandidate) => string),
+    downstreamPolicy: DownstreamRoutingPolicy,
+    nowMs = Date.now(),
+  ): Promise<RouteChannelCandidate | null> {
+    if (candidates.length <= 0) return null;
+
+    const resolveModelName = typeof modelName === 'function'
+      ? modelName
+      : (() => modelName);
+    const banditInputs = candidates.map((candidate) => ({
+      channelId: candidate.channel.id,
+      siteId: candidate.site.id,
+      priority: candidate.channel.priority ?? 0,
+      successCount: candidate.channel.successCount ?? 0,
+      failCount: candidate.channel.failCount ?? 0,
+      totalLatencyMs: candidate.channel.totalLatencyMs ?? 0,
+      accountUnitCost: candidate.account.unitCost ?? null,
+      fallbackUnitCost: Math.max(config.routingFallbackUnitCost || 1, MIN_EFFECTIVE_UNIT_COST),
+      manualWeight: this.resolveBanditManualWeight(candidate),
+    }));
+
+    const result = await channelBanditStore.selectCandidate(banditInputs);
+    if (!result) {
+      incFallbackLegacy('bandit_empty');
+      return this.weightedRandomSelect(candidates, modelName, downstreamPolicy, nowMs);
+    }
+
+    const selected = candidates[result.selectedIndex];
+    if (!selected) {
+      incFallbackLegacy('bandit_invalid_selected_index');
+      return this.weightedRandomSelect(candidates, modelName, downstreamPolicy, nowMs);
+    }
+
+    const selectedModel = resolveModelName(selected);
+    const sampleRate = Math.max(0, Math.min(1, config.routingBanditDecisionLogSampleRate));
+    if (sampleRate > 0 && Math.random() < sampleRate) {
+      const ranked = [...result.breakdown]
+        .sort((left, right) => right.logScore - left.logScore)
+        .slice(0, 2)
+        .map((item) => ({
+          channelId: candidates[item.index]?.channel.id ?? null,
+          siteId: candidates[item.index]?.site.id ?? null,
+          theta: Number(item.theta.toFixed(4)),
+          latencyMs: Math.round(item.latencyMs),
+          expectedCost: Number(item.expectedCost.toFixed(6)),
+          logScore: Number(item.logScore.toFixed(6)),
+        }));
+      console.info('[routing-bandit] sampled decision', {
+        selectedChannelId: selected.channel.id,
+        selectedSiteId: selected.site.id,
+        model: selectedModel || 'unknown',
+        explored: result.explored,
+        top2: ranked,
+        algorithm: config.routingAlgorithm,
+      });
+    }
+    incSelectedChannel({
+      model: selectedModel || 'unknown',
+      site: String(selected.site.id),
+      strategy: 'weighted',
+      algorithm: 'bandit',
+    });
+    setExplorationRate(selectedModel || 'unknown', result.explored ? 1 : 0);
+    return selected;
   }
 
   private weightedRandomSelect(

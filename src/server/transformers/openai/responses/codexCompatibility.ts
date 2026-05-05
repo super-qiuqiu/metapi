@@ -163,6 +163,9 @@ function ensureCodexResponsesStoreFalse(
 function stripCodexUnsupportedResponsesFields(
   body: Record<string, unknown>,
   sitePlatform: string,
+  options?: {
+    preservePreviousResponseId?: boolean;
+  },
 ): Record<string, unknown> {
   if (sitePlatform !== 'codex') return body;
   const next = { ...body };
@@ -170,12 +173,13 @@ function stripCodexUnsupportedResponsesFields(
   delete next.max_completion_tokens;
   delete next.max_tokens;
   delete next.stream_options;
-  // Codex backend (chatgpt.com/backend-api/codex) does not support
-  // previous_response_id — it returns HTTP 400 "Unsupported parameter".
-  // Session continuity must be achieved via input-array expansion
-  // (see responsesWebsocket.ts merge logic) rather than reference-based
-  // continuation.
-  delete next.previous_response_id;
+  if (!options?.preservePreviousResponseId) {
+    // Codex backend (chatgpt.com/backend-api/codex) does not support
+    // previous_response_id on regular responses HTTP paths. Keep removing
+    // it by default, but allow explicit preservation for websocket
+    // incremental transport fallback/bridge flows.
+    delete next.previous_response_id;
+  }
   return next;
 }
 
@@ -190,6 +194,9 @@ function applyCodexResponsesCompatibility(
 export function normalizeCodexResponsesBodyForProxy(
   body: Record<string, unknown>,
   sitePlatform: string,
+  options?: {
+    preservePreviousResponseId?: boolean;
+  },
 ): Record<string, unknown> {
   if (sitePlatform !== 'codex') return body;
   return ensureCodexResponsesStoreFalse(
@@ -199,6 +206,7 @@ export function normalizeCodexResponsesBodyForProxy(
         sitePlatform,
       ),
       sitePlatform,
+      options,
     ),
     sitePlatform,
   );

@@ -57,6 +57,10 @@ import {
   startUsageAggregationProjectorScheduler,
   stopUsageAggregationProjectorScheduler,
 } from './services/usageAggregationService.js';
+import {
+  startChannelBanditPricingSyncScheduler,
+  stopChannelBanditPricingSyncScheduler,
+} from './services/routing/channelBanditPricingSync.js';
 import { reloadBackupWebdavScheduler } from './services/backupService.js';
 import { ensureRuntimeDatabaseReady } from './runtimeDatabaseBootstrap.js';
 import { isPublicApiRoute, registerDesktopRoutes } from './desktop.js';
@@ -269,6 +273,7 @@ startChannelRecoveryProbeScheduler();
 startSub2ApiManagedRefreshScheduler();
 startUpdateCenterPolling();
 startUsageAggregationProjectorScheduler();
+startChannelBanditPricingSyncScheduler();
 startAdminSnapshotWarmScheduler();
 try {
   await startOAuthLoopbackCallbackServers();
@@ -285,6 +290,7 @@ app.addHook('onClose', async () => {
   stopModelAvailabilityProbeScheduler();
   stopChannelRecoveryProbeScheduler();
   await stopUsageAggregationProjectorScheduler();
+  await stopChannelBanditPricingSyncScheduler();
   await stopAdminSnapshotWarmScheduler();
   await stopSub2ApiManagedRefreshScheduler();
   await stopOAuthLoopbackCallbackServers();

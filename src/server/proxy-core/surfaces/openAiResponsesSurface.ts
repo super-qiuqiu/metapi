@@ -99,6 +99,12 @@ import {
   canRetryChannelSelection,
   getTesterForcedChannelId,
 } from '../channelSelection.js';
+import { resolveResponsesContinuityKey } from '../responsesContinuity.js';
+import {
+  buildResponsesContinuationRecoveryError,
+  hasReplayableResponsesContinuationContext,
+  isResponsesContinuationRecoveryError,
+} from '../responsesContinuationRecovery.js';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object';
@@ -259,6 +265,19 @@ export async function handleOpenAiResponsesSurfaceRequest(
       headers: request.headers as Record<string, unknown>,
       body,
     });
+    const continuitySessionId = resolveResponsesContinuityKey({
+      headers: request.headers as Record<string, unknown>,
+      body,
+      clientSessionId: clientContext.sessionId || null,
+    });
+    if (config.responsesRequireContinuitySession && !continuitySessionId) {
+      return reply.code(400).send({
+        error: {
+          message: 'responses requests require session_id or conversation_id when continuity guard is enabled',
+          type: 'invalid_request_error',
+        },
+      });
+    }
     const defaultEncryptedReasoningInclude = isCodexResponsesSurface(
       request.headers as Record<string, unknown>,
     );
@@ -608,7 +627,21 @@ export async function handleOpenAiResponsesSurfaceRequest(
               clearCodexSessionResponseId(codexSessionStoreKey);
             }
             const previousResponseRecovery = stripResponsesPreviousResponseId(ctx.request.body);
+            if (
+              config.responsesStrictPreviousResponseRecovery
+              && !previousResponseRecovery.removed
+            ) {
+              throw buildResponsesContinuationRecoveryError({
+                reason: 'missing_previous_response_id_on_recovery',
+              });
+            }
             if (previousResponseRecovery.removed) {
+              const hasReplayableContext = hasReplayableResponsesContinuationContext(previousResponseRecovery.body);
+              if (config.responsesStrictPreviousResponseRecovery && !hasReplayableContext) {
+                throw buildResponsesContinuationRecoveryError({
+                  reason: 'tool_output_only_without_replay_context',
+                });
+              }
               const recoveredRequest = {
                 ...ctx.request,
                 body: previousResponseRecovery.body,
@@ -1325,6 +1358,23 @@ export async function handleOpenAiResponsesSurfaceRequest(
 	          stickySessionKey,
 	          selected,
 	        });
+          if (isResponsesContinuationRecoveryError(err)) {
+            await failureToolkit.log({
+              selected,
+              modelRequested: requestedModel,
+              status: 'failed',
+              httpStatus: err.status,
+              latencyMs: Date.now() - startTime,
+              errorMessage: err.message,
+              retryCount,
+            });
+            await finalizeDebugFailure(
+              err.status,
+              err.payload,
+              null,
+            );
+            return reply.code(err.status).send(err.payload);
+          }
           const endpointFailureStatus = typeof err?.status === 'number' ? err.status : null;
           const isSiteApiEndpointFailure = (
             err instanceof SiteApiEndpointRequestError

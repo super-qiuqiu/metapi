@@ -56,6 +56,19 @@ function hasResponsesToolOutput(input: unknown): boolean {
   });
 }
 
+export function isResponsesToolOutputOnlyInput(
+  body: Record<string, unknown> | null | undefined,
+): boolean {
+  if (!body) return false;
+  const { input } = body;
+  if (!Array.isArray(input) || input.length <= 0) return false;
+  return input.every((item) => {
+    if (!isRecord(item)) return false;
+    const type = asTrimmedString(item.type).toLowerCase();
+    return RESPONSES_TOOL_OUTPUT_TYPES.has(type);
+  });
+}
+
 export function shouldInferResponsesPreviousResponseId(
   body: Record<string, unknown> | null | undefined,
   candidatePreviousResponseId: unknown,

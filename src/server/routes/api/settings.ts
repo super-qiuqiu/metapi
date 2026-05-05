@@ -1,7 +1,11 @@
 import { FastifyInstance } from 'fastify';
 import cron from 'node-cron';
 import { fetch } from 'undici';
-import { config, normalizeTokenRouterFailureCooldownMaxSec } from '../../config.js';
+import {
+  config,
+  normalizeRoutingAlgorithm,
+  normalizeTokenRouterFailureCooldownMaxSec,
+} from '../../config.js';
 import { db, runtimeDbDialect, schema } from '../../db/index.js';
 import { upsertSetting } from '../../db/upsertSetting.js';
 import * as routeRefreshWorkflow from '../../services/routeRefreshWorkflow.js';
@@ -47,6 +51,8 @@ import {
 import { parsePayloadRulesConfigInput } from '../../services/payloadRules.js';
 
 type RoutingWeights = typeof config.routingWeights;
+type RoutingBanditFeatures = typeof config.routingBanditFeatures;
+type RoutingBanditWeights = typeof config.routingBanditWeights;
 
 interface RuntimeSettingsBody {
   proxyToken?: string;
@@ -55,6 +61,8 @@ interface RuntimeSettingsBody {
   modelAvailabilityProbeEnabled?: boolean;
   codexUpstreamWebsocketEnabled?: boolean;
   responsesCompactFallbackToResponsesEnabled?: boolean;
+  responsesRequireContinuitySession?: boolean;
+  responsesStrictPreviousResponseRecovery?: boolean;
   disableCrossProtocolFallback?: boolean;
   proxySessionChannelConcurrencyLimit?: number;
   proxySessionChannelQueueWaitMs?: number;
@@ -101,6 +109,19 @@ interface RuntimeSettingsBody {
   proxyFirstByteTimeoutSec?: number;
   tokenRouterFailureCooldownMaxSec?: number;
   routingWeights?: Partial<RoutingWeights>;
+  routingAlgorithm?: 'legacy' | 'bandit';
+  routingBanditFeatures?: Partial<RoutingBanditFeatures>;
+  routingBanditWeights?: Partial<RoutingBanditWeights>;
+  routingBanditFlushIntervalMs?: number;
+  routingBanditDecisionLogSampleRate?: number;
+  routingBanditGuardrailEnabled?: boolean;
+  routingBanditGuardrailMinSamples?: number;
+  routingBanditGuardrailMaxRetryableFailureRate?: number;
+  routingBanditGuardrailMaxP95LatencyMs?: number;
+  routingBanditGuardrailBaselineEnabled?: boolean;
+  routingBanditGuardrailBaselineMinSamples?: number;
+  routingBanditGuardrailMaxRetryableFailureRateDelta?: number;
+  routingBanditGuardrailMaxP95LatencyMultiplier?: number;
   proxyErrorKeywords?: string[] | string;
   proxyEmptyContentFailEnabled?: boolean;
   globalBlockedBrands?: string[];
@@ -433,6 +454,16 @@ function applyImportedSettingToRuntime(key: string, value: unknown) {
       config.responsesCompactFallbackToResponsesEnabled = value;
       return;
     }
+    case 'responses_require_continuity_session': {
+      if (typeof value !== 'boolean') return;
+      config.responsesRequireContinuitySession = value;
+      return;
+    }
+    case 'responses_strict_previous_response_recovery': {
+      if (typeof value !== 'boolean') return;
+      config.responsesStrictPreviousResponseRecovery = value;
+      return;
+    }
     case 'disable_cross_protocol_fallback': {
       if (typeof value !== 'boolean') return;
       config.disableCrossProtocolFallback = value;
@@ -684,6 +715,98 @@ function applyImportedSettingToRuntime(key: string, value: unknown) {
       };
       return;
     }
+    case 'routing_algorithm': {
+      config.routingAlgorithm = normalizeRoutingAlgorithm(value);
+      return;
+    }
+    case 'routing_bandit_features': {
+      if (!value || typeof value !== 'object') return;
+      const features = value as Partial<RoutingBanditFeatures>;
+      config.routingBanditFeatures = {
+        ewmaHealth: typeof features.ewmaHealth === 'boolean'
+          ? features.ewmaHealth
+          : config.routingBanditFeatures.ewmaHealth,
+        expectedCost: typeof features.expectedCost === 'boolean'
+          ? features.expectedCost
+          : config.routingBanditFeatures.expectedCost,
+        tsSampling: typeof features.tsSampling === 'boolean'
+          ? features.tsSampling
+          : config.routingBanditFeatures.tsSampling,
+        p2c: typeof features.p2c === 'boolean'
+          ? features.p2c
+          : config.routingBanditFeatures.p2c,
+      };
+      return;
+    }
+    case 'routing_bandit_weights': {
+      if (!value || typeof value !== 'object') return;
+      const weights = value as Partial<RoutingBanditWeights>;
+      config.routingBanditWeights = {
+        theta: toPositiveNumberOrFallback(weights.theta, config.routingBanditWeights.theta),
+        latency: toPositiveNumberOrFallback(weights.latency, config.routingBanditWeights.latency),
+        cost: toPositiveNumberOrFallback(weights.cost, config.routingBanditWeights.cost),
+        manual: toPositiveNumberOrFallback(weights.manual, config.routingBanditWeights.manual),
+      };
+      return;
+    }
+    case 'routing_bandit_flush_interval_ms': {
+      const n = Number(value);
+      if (!Number.isFinite(n) || n < 5_000) return;
+      config.routingBanditFlushIntervalMs = Math.trunc(n);
+      return;
+    }
+    case 'routing_bandit_decision_log_sample_rate': {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return;
+      config.routingBanditDecisionLogSampleRate = Math.max(0, Math.min(1, n));
+      return;
+    }
+    case 'routing_bandit_guardrail_enabled': {
+      if (typeof value !== 'boolean') return;
+      config.routingBanditGuardrailEnabled = value;
+      return;
+    }
+    case 'routing_bandit_guardrail_min_samples': {
+      const n = Number(value);
+      if (!Number.isFinite(n) || n < 10) return;
+      config.routingBanditGuardrailMinSamples = Math.trunc(n);
+      return;
+    }
+    case 'routing_bandit_guardrail_max_retryable_failure_rate': {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return;
+      config.routingBanditGuardrailMaxRetryableFailureRate = Math.max(0.01, Math.min(1, n));
+      return;
+    }
+    case 'routing_bandit_guardrail_max_p95_latency_ms': {
+      const n = Number(value);
+      if (!Number.isFinite(n) || n < 100) return;
+      config.routingBanditGuardrailMaxP95LatencyMs = Math.trunc(n);
+      return;
+    }
+    case 'routing_bandit_guardrail_baseline_enabled': {
+      if (typeof value !== 'boolean') return;
+      config.routingBanditGuardrailBaselineEnabled = value;
+      return;
+    }
+    case 'routing_bandit_guardrail_baseline_min_samples': {
+      const n = Number(value);
+      if (!Number.isFinite(n) || n < 10) return;
+      config.routingBanditGuardrailBaselineMinSamples = Math.trunc(n);
+      return;
+    }
+    case 'routing_bandit_guardrail_max_retryable_failure_rate_delta': {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return;
+      config.routingBanditGuardrailMaxRetryableFailureRateDelta = Math.max(0, Math.min(1, n));
+      return;
+    }
+    case 'routing_bandit_guardrail_max_p95_latency_multiplier': {
+      const n = Number(value);
+      if (!Number.isFinite(n) || n < 1) return;
+      config.routingBanditGuardrailMaxP95LatencyMultiplier = n;
+      return;
+    }
     case 'routing_fallback_unit_cost': {
       const n = Number(value);
       if (!Number.isFinite(n) || n <= 0) return;
@@ -720,6 +843,8 @@ function getRuntimeSettingsResponse(currentAdminIp = '') {
     modelAvailabilityProbeEnabled: config.modelAvailabilityProbeEnabled,
     codexUpstreamWebsocketEnabled: config.codexUpstreamWebsocketEnabled,
     responsesCompactFallbackToResponsesEnabled: config.responsesCompactFallbackToResponsesEnabled,
+    responsesRequireContinuitySession: config.responsesRequireContinuitySession,
+    responsesStrictPreviousResponseRecovery: config.responsesStrictPreviousResponseRecovery,
     disableCrossProtocolFallback: config.disableCrossProtocolFallback,
     proxySessionChannelConcurrencyLimit: config.proxySessionChannelConcurrencyLimit,
     proxySessionChannelQueueWaitMs: config.proxySessionChannelQueueWaitMs,
@@ -736,6 +861,19 @@ function getRuntimeSettingsResponse(currentAdminIp = '') {
     proxyFirstByteTimeoutSec: config.proxyFirstByteTimeoutSec,
     tokenRouterFailureCooldownMaxSec: config.tokenRouterFailureCooldownMaxSec,
     routingWeights: config.routingWeights,
+    routingAlgorithm: config.routingAlgorithm,
+    routingBanditFeatures: config.routingBanditFeatures,
+    routingBanditWeights: config.routingBanditWeights,
+    routingBanditFlushIntervalMs: config.routingBanditFlushIntervalMs,
+    routingBanditDecisionLogSampleRate: config.routingBanditDecisionLogSampleRate,
+    routingBanditGuardrailEnabled: config.routingBanditGuardrailEnabled,
+    routingBanditGuardrailMinSamples: config.routingBanditGuardrailMinSamples,
+    routingBanditGuardrailMaxRetryableFailureRate: config.routingBanditGuardrailMaxRetryableFailureRate,
+    routingBanditGuardrailMaxP95LatencyMs: config.routingBanditGuardrailMaxP95LatencyMs,
+    routingBanditGuardrailBaselineEnabled: config.routingBanditGuardrailBaselineEnabled,
+    routingBanditGuardrailBaselineMinSamples: config.routingBanditGuardrailBaselineMinSamples,
+    routingBanditGuardrailMaxRetryableFailureRateDelta: config.routingBanditGuardrailMaxRetryableFailureRateDelta,
+    routingBanditGuardrailMaxP95LatencyMultiplier: config.routingBanditGuardrailMaxP95LatencyMultiplier,
     webhookUrl: config.webhookUrl,
     barkUrl: config.barkUrl,
     webhookEnabled: config.webhookEnabled,
@@ -1212,6 +1350,42 @@ export async function settingsRoutes(app: FastifyInstance) {
       upsertSetting('responses_compact_fallback_to_responses_enabled', config.responsesCompactFallbackToResponsesEnabled);
     }
 
+    if (body.responsesRequireContinuitySession !== undefined) {
+      let nextValue = false;
+      try {
+        nextValue = parseBooleanFlag(body.responsesRequireContinuitySession, 'Responses 连续会话强约束开关');
+      } catch (err: any) {
+        return reply.code(400).send({
+          success: false,
+          message: err?.message || 'Responses 连续会话强约束开关格式无效',
+        });
+      }
+
+      if (nextValue !== config.responsesRequireContinuitySession) {
+        changedLabels.push(nextValue ? '开启 Responses 会话标识强约束' : '关闭 Responses 会话标识强约束');
+      }
+      config.responsesRequireContinuitySession = nextValue;
+      upsertSetting('responses_require_continuity_session', config.responsesRequireContinuitySession);
+    }
+
+    if (body.responsesStrictPreviousResponseRecovery !== undefined) {
+      let nextValue = false;
+      try {
+        nextValue = parseBooleanFlag(body.responsesStrictPreviousResponseRecovery, 'Responses 严格 previous_response 恢复开关');
+      } catch (err: any) {
+        return reply.code(400).send({
+          success: false,
+          message: err?.message || 'Responses 严格 previous_response 恢复开关格式无效',
+        });
+      }
+
+      if (nextValue !== config.responsesStrictPreviousResponseRecovery) {
+        changedLabels.push(nextValue ? '开启 Responses 严格 previous_response 恢复' : '关闭 Responses 严格 previous_response 恢复');
+      }
+      config.responsesStrictPreviousResponseRecovery = nextValue;
+      upsertSetting('responses_strict_previous_response_recovery', config.responsesStrictPreviousResponseRecovery);
+    }
+
     if (body.disableCrossProtocolFallback !== undefined) {
       let nextValue = false;
       try {
@@ -1678,6 +1852,173 @@ export async function settingsRoutes(app: FastifyInstance) {
       }
       config.routingWeights = nextWeights;
       upsertSetting('routing_weights', nextWeights);
+    }
+
+    if (body.routingAlgorithm !== undefined) {
+      const nextAlgorithm = normalizeRoutingAlgorithm(body.routingAlgorithm);
+      if (nextAlgorithm !== config.routingAlgorithm) {
+        changedLabels.push(`路由算法（${config.routingAlgorithm} -> ${nextAlgorithm}）`);
+      }
+      config.routingAlgorithm = nextAlgorithm;
+      upsertSetting('routing_algorithm', nextAlgorithm);
+    }
+
+    if (body.routingBanditFeatures !== undefined) {
+      const nextFeatures: RoutingBanditFeatures = {
+        ewmaHealth: typeof body.routingBanditFeatures.ewmaHealth === 'boolean'
+          ? body.routingBanditFeatures.ewmaHealth
+          : config.routingBanditFeatures.ewmaHealth,
+        expectedCost: typeof body.routingBanditFeatures.expectedCost === 'boolean'
+          ? body.routingBanditFeatures.expectedCost
+          : config.routingBanditFeatures.expectedCost,
+        tsSampling: typeof body.routingBanditFeatures.tsSampling === 'boolean'
+          ? body.routingBanditFeatures.tsSampling
+          : config.routingBanditFeatures.tsSampling,
+        p2c: typeof body.routingBanditFeatures.p2c === 'boolean'
+          ? body.routingBanditFeatures.p2c
+          : config.routingBanditFeatures.p2c,
+      };
+      if (JSON.stringify(nextFeatures) !== JSON.stringify(config.routingBanditFeatures)) {
+        changedLabels.push('Bandit 特性开关');
+      }
+      config.routingBanditFeatures = nextFeatures;
+      upsertSetting('routing_bandit_features', nextFeatures);
+    }
+
+    if (body.routingBanditWeights !== undefined) {
+      const nextWeights: RoutingBanditWeights = {
+        theta: toPositiveNumberOrFallback(body.routingBanditWeights.theta, config.routingBanditWeights.theta),
+        latency: toPositiveNumberOrFallback(body.routingBanditWeights.latency, config.routingBanditWeights.latency),
+        cost: toPositiveNumberOrFallback(body.routingBanditWeights.cost, config.routingBanditWeights.cost),
+        manual: toPositiveNumberOrFallback(body.routingBanditWeights.manual, config.routingBanditWeights.manual),
+      };
+      if (JSON.stringify(nextWeights) !== JSON.stringify(config.routingBanditWeights)) {
+        changedLabels.push('Bandit 打分权重');
+      }
+      config.routingBanditWeights = nextWeights;
+      upsertSetting('routing_bandit_weights', nextWeights);
+    }
+
+    if (body.routingBanditFlushIntervalMs !== undefined) {
+      const nextFlushIntervalMs = Number(body.routingBanditFlushIntervalMs);
+      if (!Number.isFinite(nextFlushIntervalMs) || nextFlushIntervalMs < 5_000) {
+        return reply.code(400).send({ success: false, message: 'Bandit 状态刷盘间隔必须是大于等于 5000 的数字（毫秒）' });
+      }
+      const normalized = Math.trunc(nextFlushIntervalMs);
+      if (normalized !== config.routingBanditFlushIntervalMs) {
+        changedLabels.push(`Bandit 状态刷盘间隔（${config.routingBanditFlushIntervalMs}ms -> ${normalized}ms）`);
+      }
+      config.routingBanditFlushIntervalMs = normalized;
+      upsertSetting('routing_bandit_flush_interval_ms', normalized);
+    }
+
+    if (body.routingBanditDecisionLogSampleRate !== undefined) {
+      const nextSampleRate = Number(body.routingBanditDecisionLogSampleRate);
+      if (!Number.isFinite(nextSampleRate)) {
+        return reply.code(400).send({ success: false, message: 'Bandit 决策采样率必须是数字' });
+      }
+      const normalized = Math.max(0, Math.min(1, nextSampleRate));
+      if (Math.abs(normalized - config.routingBanditDecisionLogSampleRate) > 1e-9) {
+        changedLabels.push(`Bandit 决策采样率（${config.routingBanditDecisionLogSampleRate} -> ${normalized}）`);
+      }
+      config.routingBanditDecisionLogSampleRate = normalized;
+      upsertSetting('routing_bandit_decision_log_sample_rate', normalized);
+    }
+
+    if (body.routingBanditGuardrailEnabled !== undefined) {
+      const nextEnabled = !!body.routingBanditGuardrailEnabled;
+      if (nextEnabled !== config.routingBanditGuardrailEnabled) {
+        changedLabels.push(nextEnabled ? '开启 Bandit 自动回退守门' : '关闭 Bandit 自动回退守门');
+      }
+      config.routingBanditGuardrailEnabled = nextEnabled;
+      upsertSetting('routing_bandit_guardrail_enabled', nextEnabled);
+    }
+
+    if (body.routingBanditGuardrailMinSamples !== undefined) {
+      const nextMinSamples = Number(body.routingBanditGuardrailMinSamples);
+      if (!Number.isFinite(nextMinSamples) || nextMinSamples < 10) {
+        return reply.code(400).send({ success: false, message: 'Bandit 守门最小样本数必须是大于等于 10 的数字' });
+      }
+      const normalized = Math.trunc(nextMinSamples);
+      if (normalized !== config.routingBanditGuardrailMinSamples) {
+        changedLabels.push(`Bandit 守门最小样本数（${config.routingBanditGuardrailMinSamples} -> ${normalized}）`);
+      }
+      config.routingBanditGuardrailMinSamples = normalized;
+      upsertSetting('routing_bandit_guardrail_min_samples', normalized);
+    }
+
+    if (body.routingBanditGuardrailMaxRetryableFailureRate !== undefined) {
+      const nextRate = Number(body.routingBanditGuardrailMaxRetryableFailureRate);
+      if (!Number.isFinite(nextRate)) {
+        return reply.code(400).send({ success: false, message: 'Bandit 守门可重试失败率阈值必须是数字' });
+      }
+      const normalized = Math.max(0.01, Math.min(1, nextRate));
+      if (Math.abs(normalized - config.routingBanditGuardrailMaxRetryableFailureRate) > 1e-9) {
+        changedLabels.push(`Bandit 守门可重试失败率阈值（${config.routingBanditGuardrailMaxRetryableFailureRate} -> ${normalized}）`);
+      }
+      config.routingBanditGuardrailMaxRetryableFailureRate = normalized;
+      upsertSetting('routing_bandit_guardrail_max_retryable_failure_rate', normalized);
+    }
+
+    if (body.routingBanditGuardrailMaxP95LatencyMs !== undefined) {
+      const nextLatencyMs = Number(body.routingBanditGuardrailMaxP95LatencyMs);
+      if (!Number.isFinite(nextLatencyMs) || nextLatencyMs < 100) {
+        return reply.code(400).send({ success: false, message: 'Bandit 守门 P95 延迟阈值必须是大于等于 100 的数字（毫秒）' });
+      }
+      const normalized = Math.trunc(nextLatencyMs);
+      if (normalized !== config.routingBanditGuardrailMaxP95LatencyMs) {
+        changedLabels.push(`Bandit 守门 P95 延迟阈值（${config.routingBanditGuardrailMaxP95LatencyMs}ms -> ${normalized}ms）`);
+      }
+      config.routingBanditGuardrailMaxP95LatencyMs = normalized;
+      upsertSetting('routing_bandit_guardrail_max_p95_latency_ms', normalized);
+    }
+
+    if (body.routingBanditGuardrailBaselineEnabled !== undefined) {
+      const nextEnabled = !!body.routingBanditGuardrailBaselineEnabled;
+      if (nextEnabled !== config.routingBanditGuardrailBaselineEnabled) {
+        changedLabels.push(nextEnabled ? '开启 Bandit 基线差分守门' : '关闭 Bandit 基线差分守门');
+      }
+      config.routingBanditGuardrailBaselineEnabled = nextEnabled;
+      upsertSetting('routing_bandit_guardrail_baseline_enabled', nextEnabled);
+    }
+
+    if (body.routingBanditGuardrailBaselineMinSamples !== undefined) {
+      const nextMinSamples = Number(body.routingBanditGuardrailBaselineMinSamples);
+      if (!Number.isFinite(nextMinSamples) || nextMinSamples < 10) {
+        return reply.code(400).send({ success: false, message: 'Bandit 基线守门最小样本数必须是大于等于 10 的数字' });
+      }
+      const normalized = Math.trunc(nextMinSamples);
+      if (normalized !== config.routingBanditGuardrailBaselineMinSamples) {
+        changedLabels.push(`Bandit 基线守门最小样本数（${config.routingBanditGuardrailBaselineMinSamples} -> ${normalized}）`);
+      }
+      config.routingBanditGuardrailBaselineMinSamples = normalized;
+      upsertSetting('routing_bandit_guardrail_baseline_min_samples', normalized);
+    }
+
+    if (body.routingBanditGuardrailMaxRetryableFailureRateDelta !== undefined) {
+      const nextDelta = Number(body.routingBanditGuardrailMaxRetryableFailureRateDelta);
+      if (!Number.isFinite(nextDelta)) {
+        return reply.code(400).send({ success: false, message: 'Bandit 基线守门可重试失败率增量阈值必须是数字' });
+      }
+      const normalized = Math.max(0, Math.min(1, nextDelta));
+      if (Math.abs(normalized - config.routingBanditGuardrailMaxRetryableFailureRateDelta) > 1e-9) {
+        changedLabels.push(`Bandit 基线守门可重试失败率增量阈值（${config.routingBanditGuardrailMaxRetryableFailureRateDelta} -> ${normalized}）`);
+      }
+      config.routingBanditGuardrailMaxRetryableFailureRateDelta = normalized;
+      upsertSetting('routing_bandit_guardrail_max_retryable_failure_rate_delta', normalized);
+    }
+
+    if (body.routingBanditGuardrailMaxP95LatencyMultiplier !== undefined) {
+      const nextMultiplier = Number(body.routingBanditGuardrailMaxP95LatencyMultiplier);
+      if (!Number.isFinite(nextMultiplier) || nextMultiplier < 1) {
+        return reply.code(400).send({ success: false, message: 'Bandit 基线守门 P95 延迟倍率阈值必须是大于等于 1 的数字' });
+      }
+      const normalized = nextMultiplier;
+      if (Math.abs(normalized - config.routingBanditGuardrailMaxP95LatencyMultiplier) > 1e-9) {
+        changedLabels.push(`Bandit 基线守门 P95 延迟倍率阈值（${config.routingBanditGuardrailMaxP95LatencyMultiplier} -> ${normalized}）`);
+      }
+      config.routingBanditGuardrailMaxP95LatencyMultiplier = normalized;
+      upsertSetting('routing_bandit_guardrail_max_p95_latency_multiplier', normalized);
     }
 
     if (body.routingFallbackUnitCost !== undefined) {

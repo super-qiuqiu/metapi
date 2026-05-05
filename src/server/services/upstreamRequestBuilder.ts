@@ -668,6 +668,7 @@ export function buildUpstreamEndpointRequest(input: {
     const body = normalizeCodexResponsesBodyForProxy(
       sanitizedResponsesBody,
       sitePlatform,
+      { preservePreviousResponseId: preserveWebsocketIncrementalMode },
     );
     const configuredResponsesBody = normalizeCodexResponsesBodyForProxy(
       normalizeSub2ApiResponsesBodyForProxy(
@@ -675,6 +676,7 @@ export function buildUpstreamEndpointRequest(input: {
         sitePlatform,
       ),
       sitePlatform,
+      { preservePreviousResponseId: preserveWebsocketIncrementalMode },
     );
 
     if (sitePlatform === 'codex') {

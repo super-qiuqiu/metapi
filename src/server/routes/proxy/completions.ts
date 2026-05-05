@@ -189,7 +189,13 @@ export async function completionsProxyRoute(app: FastifyInstance) {
             resolvedUsage,
           });
           await recordTokenRouterEventBestEffort('record channel success', () => (
-            tokenRouter.recordSuccess(selected.channel.id, latency, estimatedCost, upstreamModel)
+            tokenRouter.recordSuccess(selected.channel.id, latency, estimatedCost, upstreamModel, undefined, {
+              promptTokens: resolvedUsage.promptTokens,
+              completionTokens: resolvedUsage.completionTokens,
+              cacheReadTokens: parsedUsage.cacheReadTokens,
+              cacheCreationTokens: parsedUsage.cacheCreationTokens,
+              promptTokensIncludeCache: parsedUsage.promptTokensIncludeCache,
+            })
           ));
           recordDownstreamCostUsage(request, estimatedCost);
           logProxy(
@@ -292,7 +298,13 @@ export async function completionsProxyRoute(app: FastifyInstance) {
         });
 
         await recordTokenRouterEventBestEffort('record channel success', () => (
-          tokenRouter.recordSuccess(selected.channel.id, latency, estimatedCost, upstreamModel)
+          tokenRouter.recordSuccess(selected.channel.id, latency, estimatedCost, upstreamModel, undefined, {
+            promptTokens: resolvedUsage.promptTokens,
+            completionTokens: resolvedUsage.completionTokens,
+            cacheReadTokens: parsedUsage.cacheReadTokens,
+            cacheCreationTokens: parsedUsage.cacheCreationTokens,
+            promptTokensIncludeCache: parsedUsage.promptTokensIncludeCache,
+          })
         ));
         recordDownstreamCostUsage(request, estimatedCost);
         logProxy(

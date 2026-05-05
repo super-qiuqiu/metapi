@@ -5,6 +5,7 @@ import type { Duplex } from 'node:stream';
 import { WebSocketServer, type RawData, type WebSocket } from 'ws';
 import { createCodexWebsocketRuntime, CodexWebsocketRuntimeError } from '../../proxy-core/runtime/codexWebsocketRuntime.js';
 import { buildCodexSessionResponseStoreKey } from '../../proxy-core/runtime/codexSessionResponseStore.js';
+import { resolveResponsesContinuityKey } from '../../proxy-core/responsesContinuity.js';
 import {
   authorizeDownstreamToken,
   consumeManagedKeyRequest,
@@ -14,6 +15,8 @@ import {
 import { runWithSiteApiEndpointPool, SiteApiEndpointRequestError } from '../../services/siteApiEndpointService.js';
 import { tokenRouter } from '../../services/tokenRouter.js';
 import { buildOauthProviderHeaders } from '../../services/oauth/service.js';
+import { estimateProxyCost } from '../../services/modelPricingService.js';
+import { hasProxyUsagePayload, mergeProxyUsage, parseProxyUsage } from '../../services/proxyUsageParser.js';
 import { openAiResponsesTransformer } from '../../transformers/openai/responses/index.js';
 import { buildUpstreamEndpointRequest } from './upstreamEndpoint.js';
 import { config } from '../../config.js';
@@ -400,6 +403,120 @@ function collectResponsesOutput(payloads: unknown[]): unknown[] {
     .map(([, value]) => value);
 }
 
+function extractResponsesUsage(payloads: unknown[]): {
+  promptTokens: number;
+  completionTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  promptTokensIncludeCache: boolean | null;
+} | null {
+  let merged = parseProxyUsage({});
+  let sawUsage = false;
+
+  for (const payload of payloads) {
+    if (hasProxyUsagePayload(payload)) {
+      sawUsage = true;
+    }
+    merged = mergeProxyUsage(merged, parseProxyUsage(payload));
+  }
+
+  if (!sawUsage) return null;
+  return {
+    promptTokens: merged.promptTokens,
+    completionTokens: merged.completionTokens,
+    cacheReadTokens: merged.cacheReadTokens,
+    cacheCreationTokens: merged.cacheCreationTokens,
+    promptTokensIncludeCache: merged.promptTokensIncludeCache,
+  };
+}
+
+async function resolveResponsesWebsocketEstimatedCost(input: {
+  selectedChannel: SelectedChannel;
+  requestModel: string;
+  usage: {
+    promptTokens: number;
+    completionTokens: number;
+    cacheReadTokens: number;
+    cacheCreationTokens: number;
+    promptTokensIncludeCache: boolean | null;
+  } | null;
+}): Promise<number> {
+  const upstreamModel = asTrimmedString(input.selectedChannel.actualModel) || asTrimmedString(input.requestModel);
+  if (!upstreamModel) return 0;
+  const usage = input.usage;
+  const promptTokens = usage?.promptTokens ?? 0;
+  const completionTokens = usage?.completionTokens ?? 0;
+  const totalTokens = Math.max(0, promptTokens + completionTokens);
+
+  return await estimateProxyCost({
+    site: {
+      id: input.selectedChannel.site.id,
+      url: input.selectedChannel.site.url,
+      platform: input.selectedChannel.site.platform,
+      apiKey: input.selectedChannel.site.apiKey,
+    },
+    account: {
+      id: input.selectedChannel.account.id,
+      accessToken: input.selectedChannel.account.accessToken,
+      apiToken: input.selectedChannel.account.apiToken,
+    },
+    modelName: upstreamModel,
+    promptTokens,
+    completionTokens,
+    totalTokens,
+    cacheReadTokens: usage?.cacheReadTokens,
+    cacheCreationTokens: usage?.cacheCreationTokens,
+    promptTokensIncludeCache: usage?.promptTokensIncludeCache ?? null,
+  });
+}
+
+function recordResponsesWebsocketSuccessBestEffort(input: {
+  selectedChannel: SelectedChannel | null;
+  requestModel: string;
+  latencyMs: number;
+  usage: {
+    promptTokens: number;
+    completionTokens: number;
+    cacheReadTokens: number;
+    cacheCreationTokens: number;
+    promptTokensIncludeCache: boolean | null;
+  } | null;
+}) {
+  const selectedChannel = input.selectedChannel;
+  if (!selectedChannel) return;
+  void (async () => {
+    const upstreamModel = asTrimmedString(selectedChannel.actualModel) || asTrimmedString(input.requestModel) || undefined;
+    const estimatedCost = await resolveResponsesWebsocketEstimatedCost({
+      selectedChannel,
+      requestModel: input.requestModel,
+      usage: input.usage,
+    });
+    await tokenRouter.recordSuccess(
+      selectedChannel.channel.id,
+      Math.max(0, Math.trunc(input.latencyMs)),
+      estimatedCost,
+      upstreamModel,
+      undefined,
+      input.usage,
+    );
+  })().catch(() => undefined);
+}
+
+function recordResponsesWebsocketFailureBestEffort(input: {
+  selectedChannel: SelectedChannel | null;
+  requestModel: string;
+  status: number;
+  errorText: string;
+}) {
+  if (!input.selectedChannel) return;
+  const upstreamModel = asTrimmedString(input.selectedChannel.actualModel) || asTrimmedString(input.requestModel) || undefined;
+  void Promise.resolve(tokenRouter.recordFailure(input.selectedChannel.channel.id, {
+    status: input.status,
+    errorText: input.errorText,
+    modelName: upstreamModel,
+  })).catch(() => undefined);
+}
+
 async function forwardResponsesRequestViaHttp(input: {
   app: FastifyInstance;
   socket: WebSocket;
@@ -407,7 +524,16 @@ async function forwardResponsesRequestViaHttp(input: {
   payload: Record<string, unknown>;
   preserveIncrementalMode: boolean;
   authToken: string;
-}): Promise<unknown[] | null> {
+}): Promise<{
+  output: unknown[];
+  usage: {
+    promptTokens: number;
+    completionTokens: number;
+    cacheReadTokens: number;
+    cacheCreationTokens: number;
+    promptTokensIncludeCache: boolean | null;
+  } | null;
+} | null> {
   const injectHeaders: Record<string, string | string[]> = {
     ...buildInjectHeaders(input.request),
     [RESPONSES_WEBSOCKET_TRANSPORT_HEADER]: '1',
@@ -449,8 +575,9 @@ async function forwardResponsesRequestViaHttp(input: {
     try {
       const payload = JSON.parse(response.body);
       const output = collectResponsesOutput([payload]);
+      const usage = extractResponsesUsage([payload]);
       input.socket.send(JSON.stringify(payload));
-      return output;
+      return { output, usage };
     } catch {
       writeResponsesWebsocketError(input.socket, 502, 'Unexpected non-JSON websocket proxy response');
       return null;
@@ -477,7 +604,10 @@ async function forwardResponsesRequestViaHttp(input: {
   if (!sawTerminalPayload) {
     writeResponsesWebsocketError(input.socket, 408, 'stream closed before response.completed');
   }
-  return collectResponsesOutput(forwardedPayloads);
+  return {
+    output: collectResponsesOutput(forwardedPayloads),
+    usage: extractResponsesUsage(forwardedPayloads),
+  };
 }
 
 function buildInjectHeaders(request: IncomingMessage): Record<string, string | string[]> {
@@ -552,11 +682,27 @@ async function handleResponsesWebsocketConnection(
   request: IncomingMessage,
   authContext: ResponsesWebsocketAuthContext,
 ) {
-  const websocketSessionId = headerValueToTrimmedString(request.headers['session-id'])
-    || headerValueToTrimmedString(request.headers['session_id'])
-    || headerValueToTrimmedString(request.headers['conversation-id'])
-    || headerValueToTrimmedString(request.headers['conversation_id'])
-    || randomUUID();
+  const continuitySessionId = resolveResponsesContinuityKey({
+    headers: request.headers as Record<string, unknown>,
+    body: null,
+    clientSessionId: null,
+  });
+  if (config.responsesRequireContinuitySession && !continuitySessionId) {
+    writeResponsesWebsocketError(
+      socket,
+      400,
+      'responses websocket requires session_id or conversation_id when continuity guard is enabled',
+    );
+    setTimeout(() => {
+      try {
+        socket.close(1008, 'session_id required');
+      } catch {
+        // Ignore close failures after emitting the protocol error frame.
+      }
+    }, 0);
+    return;
+  }
+  const websocketSessionId = continuitySessionId || randomUUID();
   const runtimeSessionKeys = new Set<string>();
   let lastRequest: Record<string, unknown> | null = null;
   let lastResponseOutput: unknown[] = [];
@@ -588,6 +734,7 @@ async function handleResponsesWebsocketConnection(
           }
 
           const requestModel = asTrimmedString(parsed.model) || asTrimmedString(lastRequest?.model);
+          const turnStartedAtMs = Date.now();
           if (requestModel && !await isModelAllowedByPolicyOrAllowedRoutes(requestModel, authContext.policy)) {
             writeResponsesWebsocketError(socket, 403, 'model is not allowed for this downstream key');
             return;
@@ -694,6 +841,12 @@ async function handleResponsesWebsocketConnection(
               for (const payload of runtimeResult.events) {
                 socket.send(JSON.stringify(payload));
               }
+              recordResponsesWebsocketSuccessBestEffort({
+                selectedChannel: codexWebsocketChannel,
+                requestModel,
+                latencyMs: Date.now() - turnStartedAtMs,
+                usage: extractResponsesUsage(runtimeResult.events),
+              });
             } catch (error) {
               const runtimeError = unwrapCodexWebsocketRuntimeError(error);
               if (runtimeError.status && runtimeError.events.length === 0) {
@@ -706,7 +859,20 @@ async function handleResponsesWebsocketConnection(
                   authToken: authContext.token,
                 });
                 if (forwarded) {
-                  lastResponseOutput = forwarded;
+                  lastResponseOutput = forwarded.output;
+                  recordResponsesWebsocketSuccessBestEffort({
+                    selectedChannel: codexWebsocketChannel,
+                    requestModel,
+                    latencyMs: Date.now() - turnStartedAtMs,
+                    usage: forwarded.usage,
+                  });
+                } else {
+                  recordResponsesWebsocketFailureBestEffort({
+                    selectedChannel: codexWebsocketChannel,
+                    requestModel,
+                    status: runtimeError.status || 502,
+                    errorText: runtimeError.message,
+                  });
                 }
                 return;
               }
@@ -720,6 +886,12 @@ async function handleResponsesWebsocketConnection(
                 return type === 'response.completed' || type === 'response.failed' || type === 'response.incomplete';
               });
               if (!emittedTerminalResponsesEvent) {
+                recordResponsesWebsocketFailureBestEffort({
+                  selectedChannel: codexWebsocketChannel,
+                  requestModel,
+                  status: runtimeError.status || 408,
+                  errorText: runtimeError.message,
+                });
                 writeResponsesWebsocketError(
                   socket,
                   runtimeError.status || 408,
@@ -740,9 +912,28 @@ async function handleResponsesWebsocketConnection(
             authToken: authContext.token,
           });
           if (forwarded) {
-            lastResponseOutput = forwarded;
+            lastResponseOutput = forwarded.output;
+            recordResponsesWebsocketSuccessBestEffort({
+              selectedChannel,
+              requestModel,
+              latencyMs: Date.now() - turnStartedAtMs,
+              usage: forwarded.usage,
+            });
+          } else {
+            recordResponsesWebsocketFailureBestEffort({
+              selectedChannel,
+              requestModel,
+              status: 502,
+              errorText: 'responses websocket fallback HTTP request failed',
+            });
           }
         } catch {
+          recordResponsesWebsocketFailureBestEffort({
+            selectedChannel,
+            requestModel: asTrimmedString(lastRequest?.model),
+            status: 500,
+            errorText: 'internal websocket proxy error',
+          });
           writeResponsesWebsocketError(socket, 500, 'internal websocket proxy error');
         }
       });

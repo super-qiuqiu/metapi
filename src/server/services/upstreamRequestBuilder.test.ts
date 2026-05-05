@@ -174,4 +174,41 @@ describe('upstreamRequestBuilder', () => {
     expect(request.headers['anthropic-beta']).toContain('header-beta');
     expect(request.headers['anthropic-beta']).toContain('beta-from-body');
   });
+
+  it('preserves codex previous_response_id only for websocket incremental bridge mode', () => {
+    const sourceBody = {
+      model: 'gpt-5.4',
+      input: [],
+      previous_response_id: 'resp_prev_ws_1',
+    };
+
+    const defaultRequest = buildUpstreamEndpointRequest({
+      endpoint: 'responses',
+      modelName: 'gpt-5.4',
+      stream: true,
+      tokenValue: 'oauth-access-token',
+      sitePlatform: 'codex',
+      siteUrl: 'https://chatgpt.com/backend-api/codex',
+      openaiBody: sourceBody,
+      downstreamFormat: 'responses',
+      responsesOriginalBody: sourceBody,
+    });
+    expect(defaultRequest.body.previous_response_id).toBeUndefined();
+
+    const incrementalRequest = buildUpstreamEndpointRequest({
+      endpoint: 'responses',
+      modelName: 'gpt-5.4',
+      stream: true,
+      tokenValue: 'oauth-access-token',
+      sitePlatform: 'codex',
+      siteUrl: 'https://chatgpt.com/backend-api/codex',
+      openaiBody: sourceBody,
+      downstreamFormat: 'responses',
+      responsesOriginalBody: sourceBody,
+      downstreamHeaders: {
+        'x-metapi-responses-websocket-mode': 'incremental',
+      },
+    });
+    expect(incrementalRequest.body.previous_response_id).toBe('resp_prev_ws_1');
+  });
 });

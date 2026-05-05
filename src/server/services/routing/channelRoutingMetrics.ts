@@ -1,36 +1,120 @@
-import {
-  Counter,
-  Gauge,
-  Histogram,
-  Registry,
-  collectDefaultMetrics,
-  register,
-} from 'prom-client';
+import { createRequire } from 'node:module';
 
 type LabelValues = Record<string, string>;
+
+type CounterLike = {
+  inc(labels?: LabelValues, value?: number): void;
+};
+
+type GaugeLike = {
+  set(value: number): void;
+  set(labels: LabelValues, value: number): void;
+};
+
+type HistogramLike = {
+  observe(value: number): void;
+  observe(labels: LabelValues, value: number): void;
+};
+
+type RegisterLike = {
+  getSingleMetric(name: string): unknown;
+  metrics(): Promise<string>;
+  resetMetrics(): void;
+};
+
+type PromClientRuntime = {
+  Counter: new (input: unknown) => CounterLike;
+  Gauge: new (input: unknown) => GaugeLike;
+  Histogram: new (input: unknown) => HistogramLike;
+  Registry: {
+    OPENMETRICS_CONTENT_TYPE: string;
+  };
+  collectDefaultMetrics: (input?: unknown) => void;
+  register: RegisterLike;
+};
+
+class NoopCounter implements CounterLike {
+  inc(_labels?: LabelValues, _value?: number): void {}
+}
+
+class NoopGauge implements GaugeLike {
+  set(_valueOrLabels: number | LabelValues, _value?: number): void {}
+}
+
+class NoopHistogram implements HistogramLike {
+  observe(_valueOrLabels: number | LabelValues, _value?: number): void {}
+}
+
+class NoopRegister implements RegisterLike {
+  private readonly metricStore = new Map<string, unknown>();
+
+  getSingleMetric(name: string): unknown {
+    return this.metricStore.get(name);
+  }
+
+  setMetric(name: string, metric: unknown): void {
+    this.metricStore.set(name, metric);
+  }
+
+  async metrics(): Promise<string> {
+    return '';
+  }
+
+  resetMetrics(): void {
+    this.metricStore.clear();
+  }
+}
+
+function tryLoadPromClient(): PromClientRuntime | null {
+  try {
+    const require = createRequire(import.meta.url);
+    const loaded = require('prom-client') as PromClientRuntime;
+    if (!loaded?.Counter || !loaded?.Gauge || !loaded?.Histogram || !loaded?.register) {
+      return null;
+    }
+    return loaded;
+  } catch {
+    return null;
+  }
+}
+
+const promClient = tryLoadPromClient();
+const fallbackRegister = new NoopRegister();
+const register: RegisterLike = promClient?.register ?? fallbackRegister;
+const OPENMETRICS_CONTENT_TYPE = promClient?.Registry?.OPENMETRICS_CONTENT_TYPE ?? 'text/plain; version=0.0.4; charset=utf-8';
 
 let initialized = false;
 
 function ensureInitialized(): void {
   if (initialized) return;
-  collectDefaultMetrics({ register });
+  if (promClient) {
+    promClient.collectDefaultMetrics({ register });
+  }
   initialized = true;
 }
 
-function getOrCreateCounter(name: string, help: string, labelNames: string[] = []): Counter<string> {
+function getOrCreateCounter(name: string, help: string, labelNames: string[] = []): CounterLike {
   const existing = register.getSingleMetric(name);
-  if (existing instanceof Counter) {
-    return existing as Counter<string>;
+  if (existing) return existing as CounterLike;
+  const metric = promClient
+    ? new promClient.Counter({ name, help, labelNames, registers: [register] })
+    : new NoopCounter();
+  if (register instanceof NoopRegister) {
+    register.setMetric(name, metric);
   }
-  return new Counter({ name, help, labelNames, registers: [register] });
+  return metric;
 }
 
-function getOrCreateGauge(name: string, help: string, labelNames: string[] = []): Gauge<string> {
+function getOrCreateGauge(name: string, help: string, labelNames: string[] = []): GaugeLike {
   const existing = register.getSingleMetric(name);
-  if (existing instanceof Gauge) {
-    return existing as Gauge<string>;
+  if (existing) return existing as GaugeLike;
+  const metric = promClient
+    ? new promClient.Gauge({ name, help, labelNames, registers: [register] })
+    : new NoopGauge();
+  if (register instanceof NoopRegister) {
+    register.setMetric(name, metric);
   }
-  return new Gauge({ name, help, labelNames, registers: [register] });
+  return metric;
 }
 
 function getOrCreateHistogram(
@@ -38,18 +122,22 @@ function getOrCreateHistogram(
   help: string,
   labelNames: string[] = [],
   buckets?: number[],
-): Histogram<string> {
+): HistogramLike {
   const existing = register.getSingleMetric(name);
-  if (existing instanceof Histogram) {
-    return existing as Histogram<string>;
+  if (existing) return existing as HistogramLike;
+  const metric = promClient
+    ? new promClient.Histogram({
+      name,
+      help,
+      labelNames,
+      buckets,
+      registers: [register],
+    })
+    : new NoopHistogram();
+  if (register instanceof NoopRegister) {
+    register.setMetric(name, metric);
   }
-  return new Histogram({
-    name,
-    help,
-    labelNames,
-    buckets,
-    registers: [register],
-  });
+  return metric;
 }
 
 ensureInitialized();
@@ -207,7 +295,7 @@ export async function renderChannelRoutingMetrics(): Promise<string> {
 }
 
 export function getChannelRoutingMetricsContentType(): string {
-  return Registry.OPENMETRICS_CONTENT_TYPE;
+  return OPENMETRICS_CONTENT_TYPE;
 }
 
 export function resetChannelRoutingMetricsForTests(): void {
@@ -219,8 +307,10 @@ export function hasMetric(name: string): boolean {
 }
 
 export function incCounterByName(name: string, labels: LabelValues = {}, amount = 1): void {
-  const metric = register.getSingleMetric(name);
-  if (metric instanceof Counter) {
-    (metric as Counter<string>).inc(labels, amount);
-  }
+  const metric = register.getSingleMetric(name) as CounterLike | undefined;
+  metric?.inc(labels, amount);
+}
+
+export function isChannelRoutingMetricsOperational(): boolean {
+  return !!promClient;
 }

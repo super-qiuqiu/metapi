@@ -240,6 +240,9 @@ describe('siteProxy', () => {
 
   it('resolveChannelProxyUrl prefers account proxy over site proxy', async () => {
     const { resolveChannelProxyUrl } = await import('./siteProxy.js');
+    const { config } = await import('../config.js');
+    const previousSystemProxyUrl = config.systemProxyUrl;
+    config.systemProxyUrl = '';
 
     const accountConfig = JSON.stringify({ proxyUrl: 'http://account-proxy:8080' });
     const siteWithProxy = { useSystemProxy: true };
@@ -247,6 +250,7 @@ describe('siteProxy', () => {
     expect(resolveChannelProxyUrl(siteWithProxy, accountConfig)).toBe('http://account-proxy:8080');
     expect(resolveChannelProxyUrl(siteWithProxy, null)).toBeNull();
     expect(resolveChannelProxyUrl(siteWithProxy, JSON.stringify({}))).toBeNull();
+    config.systemProxyUrl = previousSystemProxyUrl;
   });
 
   it('withSiteRecordProxyRequestInit uses account proxy when provided', async () => {
