@@ -235,6 +235,25 @@ export const routeChannels = sqliteTable('route_channels', {
   routeTokenIdx: index('route_channels_route_token_idx').on(table.routeId, table.tokenId),
 }));
 
+export const channelRoutingState = sqliteTable('channel_routing_state', {
+  channelId: integer('channel_id').primaryKey().references(() => routeChannels.id, { onDelete: 'cascade' }),
+  successAlpha: real('success_alpha').notNull().default(2),
+  successBeta: real('success_beta').notNull().default(2),
+  latencyLogMu: real('latency_log_mu').notNull().default(0),
+  latencyLogSigma2: real('latency_log_sigma2').notNull().default(0.8),
+  latencyN: integer('latency_n').notNull().default(0),
+  promptEwma: real('prompt_ewma').notNull().default(0),
+  completionEwma: real('completion_ewma').notNull().default(0),
+  cacheReadEwma: real('cache_read_ewma').notNull().default(0),
+  cacheCreationEwma: real('cache_creation_ewma').notNull().default(0),
+  pricingSnapshot: text('pricing_snapshot'),
+  manualWeight: real('manual_weight').notNull().default(1),
+  version: integer('version').notNull().default(1),
+  updatedAt: text('updated_at').default(sql`(datetime('now'))`),
+}, (table) => ({
+  updatedAtIdx: index('channel_routing_state_updated_at_idx').on(table.updatedAt),
+}));
+
 export const proxyLogs = sqliteTable('proxy_logs', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   routeId: integer('route_id'),
