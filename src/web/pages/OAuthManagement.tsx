@@ -1842,8 +1842,8 @@ export default function OAuthManagement() {
                         </span>
                         <span className="oauth-cell-tertiary">{resolveQuotaSourceLabel(quota.source)}</span>
                       </div>
-                      <QuotaWindowRow label="5h" window={quota.windows?.fiveHour} />
-                      <QuotaWindowRow label="7d" window={quota.windows?.sevenDay} />
+                      {quota.windows?.fiveHour?.supported !== false ? <QuotaWindowRow label="5h" window={quota.windows?.fiveHour} /> : null}
+                      {quota.windows?.sevenDay?.supported !== false ? <QuotaWindowRow label="7d" window={quota.windows?.sevenDay} /> : null}
                     </div>
                   ) : (
                     <span className="oauth-cell-secondary">--</span>
@@ -1985,8 +1985,8 @@ export default function OAuthManagement() {
                     </span>
                     <span className="oauth-cell-tertiary">{resolveQuotaSourceLabel(quota.source)}</span>
                   </div>
-                  <QuotaWindowRow label="5h" window={quota.windows?.fiveHour} />
-                  <QuotaWindowRow label="7d" window={quota.windows?.sevenDay} />
+                  {quota.windows?.fiveHour?.supported !== false ? <QuotaWindowRow label="5h" window={quota.windows?.fiveHour} /> : null}
+                  {quota.windows?.sevenDay?.supported !== false ? <QuotaWindowRow label="7d" window={quota.windows?.sevenDay} /> : null}
                 </>
               ) : (
                 <div className="oauth-cell-secondary">--</div>
