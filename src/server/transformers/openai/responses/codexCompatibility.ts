@@ -170,6 +170,12 @@ function stripCodexUnsupportedResponsesFields(
   delete next.max_completion_tokens;
   delete next.max_tokens;
   delete next.stream_options;
+  // Codex backend (chatgpt.com/backend-api/codex) does not support
+  // previous_response_id — it returns HTTP 400 "Unsupported parameter".
+  // Session continuity must be achieved via input-array expansion
+  // (see responsesWebsocket.ts merge logic) rather than reference-based
+  // continuation.
+  delete next.previous_response_id;
   return next;
 }
 
