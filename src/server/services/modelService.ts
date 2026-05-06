@@ -205,7 +205,7 @@ function normalizeModels(models: string[]): string[] {
   return normalizedModels;
 }
 
-async function updateOauthModelDiscoveryState(input: {
+export async function updateOauthModelDiscoveryState(input: {
   account: typeof schema.accounts.$inferSelect;
   checkedAt: string;
   status: 'healthy' | 'abnormal';

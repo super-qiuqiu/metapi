@@ -22,10 +22,12 @@ import {
   discoverOauthModels,
   persistModelAvailabilityBatch,
   rebuildTokenRoutesFromAvailability,
+  updateOauthModelDiscoveryState,
   type OauthDiscoveryResult,
   type ModelRefreshAccountNotFoundResult,
   type ModelRefreshSkippedResult,
 } from '../modelService.js';
+import { setAccountRuntimeHealth } from '../accountHealthService.js';
 import { ensureOauthProviderSite } from './oauthSiteRegistry.js';
 import {
   getOAuthProviderDefinition,
@@ -307,6 +309,32 @@ function groupAccountsForRefresh(accounts: UpsertedAccountInfo[]): RefreshGroup[
   return groups;
 }
 
+/** 标记模型探测失败：写入 lastModelSyncError + runtimeHealth unhealthy */
+async function markModelDiscoveryFailed(accountId: number, errorMessage: string): Promise<void> {
+  try {
+    const account = await db.select().from(schema.accounts)
+      .where(eq(schema.accounts.id, accountId))
+      .get();
+    if (!account) return;
+    const checkedAt = new Date().toISOString();
+    await updateOauthModelDiscoveryState({
+      account,
+      checkedAt,
+      status: 'abnormal',
+      lastModelSyncError: errorMessage,
+      lastDiscoveredModels: [],
+    });
+    await setAccountRuntimeHealth(accountId, {
+      state: 'unhealthy',
+      reason: errorMessage,
+      source: 'model-discovery',
+      checkedAt,
+    });
+  } catch {
+    // best effort — 不阻断导入主流程
+  }
+}
+
 async function refreshGroup(input: {
   group: RefreshGroup;
   globalIndex: { value: number };
@@ -368,17 +396,20 @@ async function refreshGroup(input: {
             message: errorMessage || 'model discovery returned no models',
             phase: 'refresh',
           });
+          void markModelDiscoveryFailed(account.accountId, errorMessage);
         }
       } catch (innerError: any) {
         const idx = globalIndex.value++;
         failedCount++;
+        const innerMsg = innerError?.message || 'model discovery failed';
         callbacks.onError({
           index: idx,
           accountId: account.accountId,
           provider: account.provider,
-          message: innerError?.message || 'model discovery failed',
+          message: innerMsg,
           phase: 'refresh',
         });
+        void markModelDiscoveryFailed(account.accountId, innerMsg);
       }
     }
     return { refreshedCount, failedCount };
@@ -426,17 +457,20 @@ async function refreshGroup(input: {
             message: singleErrorMessage || 'model discovery returned no models',
             phase: 'refresh',
           });
+          void markModelDiscoveryFailed(account.accountId, singleErrorMessage);
         }
       } catch (innerError: any) {
         const idx = globalIndex.value++;
         failedCount++;
+        const innerMsg = innerError?.message || 'model discovery failed';
         callbacks.onError({
           index: idx,
           accountId: account.accountId,
           provider: account.provider,
-          message: innerError?.message || 'model discovery failed',
+          message: innerMsg,
           phase: 'refresh',
         });
+        void markModelDiscoveryFailed(account.accountId, innerMsg);
       }
     }
     return { refreshedCount, failedCount };
@@ -474,6 +508,7 @@ async function refreshGroup(input: {
     }
   } catch (error: any) {
     // 批量写入失败，所有账号标记失败
+    const batchErrorMsg = error?.message || 'persist model availability batch failed';
     for (const account of group.accounts) {
       const idx = globalIndex.value++;
       failedCount++;
@@ -481,9 +516,10 @@ async function refreshGroup(input: {
         index: idx,
         accountId: account.accountId,
         provider: account.provider,
-        message: error?.message || 'persist model availability batch failed',
+        message: batchErrorMsg,
         phase: 'refresh',
       });
+      void markModelDiscoveryFailed(account.accountId, batchErrorMsg);
     }
   }
 

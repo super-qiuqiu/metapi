@@ -37,6 +37,7 @@ import {
   type OauthIdentityCarrierLike,
 } from './codexAccount.js';
 import { resolveOauthAccountProxyUrl, resolveOauthProviderProxyUrl } from './requestProxy.js';
+import { extractRuntimeHealth } from '../accountHealthService.js';
 import { ensureOauthIdentityBackfill } from './oauthIdentityBackfill.js';
 import { fingerprintKey } from './oauthIdentityResolver.js';
 import type { OauthFingerprint } from './oauthIdentityResolver.js';
@@ -1047,6 +1048,7 @@ export async function listOauthConnections(options: {
       oauth.modelDiscoveryStatus === 'abnormal'
       || row.accounts.status !== 'active'
       || row.sites.status !== 'active'
+      || extractRuntimeHealth(row.accounts.extraConfig)?.state === 'unhealthy'
     ) ? 'abnormal' : 'healthy';
     const routeUnit = routeParticipationByAccount.get(row.accounts.id) || null;
     const routeParticipation = routeUnit

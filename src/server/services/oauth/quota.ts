@@ -11,6 +11,7 @@ import {
   type OauthInfo,
 } from './oauthAccount.js';
 import { resolveOauthAccountProxyUrl } from './requestProxy.js';
+import { setAccountRuntimeHealth } from '../accountHealthService.js';
 import type { OauthQuotaSnapshot, OauthQuotaWindowSnapshot, AntigravityQuotaGroupSnapshot } from './quotaTypes.js';
 import {
   ANTIGRAVITY_UPSTREAM_BASE_URL,
@@ -1256,6 +1257,15 @@ export async function refreshOauthQuotaSnapshot(accountId: number): Promise<Oaut
       const message = error instanceof Error
         ? (error.message || error.name)
         : String(error || 'codex quota probe failed');
+      // token 不可恢复时标记账户 unhealthy
+      if (/token_invalidated|refresh_token_reused|401/i.test(message)) {
+        void setAccountRuntimeHealth(accountId, {
+          state: 'unhealthy',
+          reason: message,
+          source: 'quota-refresh',
+          checkedAt: syncedAt,
+        });
+      }
       return persistQuotaSnapshot(accountId, buildQuotaErrorSnapshot({
         oauth,
         message,
@@ -1276,6 +1286,15 @@ export async function refreshOauthQuotaSnapshot(accountId: number): Promise<Oaut
       const message = error instanceof Error
         ? (error.message || error.name)
         : String(error || 'antigravity quota fetch failed');
+      // token 不可恢复时标记账户 unhealthy
+      if (/token_invalidated|refresh_token_reused|401/i.test(message)) {
+        void setAccountRuntimeHealth(accountId, {
+          state: 'unhealthy',
+          reason: message,
+          source: 'quota-refresh',
+          checkedAt: syncedAt,
+        });
+      }
       return persistQuotaSnapshot(accountId, buildQuotaErrorSnapshot({
         oauth,
         message,
