@@ -1,0 +1,9 @@
+{
+  "id": "02-oauth-import-streaming",
+  "title": "OAuth 批量导入 SSE 流式化 + 5 项性能优化",
+  "status": "in_progress",
+  "priority": "high",
+  "created_at": "2026-05-06",
+  "assignee": "qiuqiu",
+  "labels": ["oauth", "performance", "streaming", "cross-cutting"]
+}
