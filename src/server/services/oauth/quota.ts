@@ -1310,13 +1310,19 @@ export async function refreshOauthQuotaSnapshot(accountId: number): Promise<Oaut
       // Token is irrecoverably dead — models cannot be fetched either.
       // Update modelDiscoveryStatus so the frontend shows "获取失败"
       // instead of stale "同步正常".
+      // Re-read account from DB so updateOauthModelDiscoveryState sees
+      // the latest extraConfig (which now includes the quota we just persisted).
       const checkedAt = snapshot.lastSyncAt || new Date().toISOString();
-      await updateOauthModelDiscoveryState({
-        account,
-        checkedAt,
-        status: 'abnormal',
-        lastModelSyncError: errorText,
-      }).catch(() => {});
+      const refreshedAccount = await db.select().from(schema.accounts)
+        .where(eq(schema.accounts.id, accountId)).get();
+      if (refreshedAccount) {
+        await updateOauthModelDiscoveryState({
+          account: refreshedAccount,
+          checkedAt,
+          status: 'abnormal',
+          lastModelSyncError: errorText,
+        }).catch(() => {});
+      }
     }
   }
 
