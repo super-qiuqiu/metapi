@@ -48,7 +48,7 @@ import {
 type OAuthProviderMetadata = ReturnType<typeof listOauthProviders>[number];
 const MANUAL_CALLBACK_DELAY_MS = 15_000;
 const OAUTH_QUOTA_BATCH_REFRESH_CONCURRENCY = 4;
-const MAX_OAUTH_IMPORT_BATCH_SIZE = 100;
+export const MAX_OAUTH_IMPORT_BATCH_SIZE = 100;
 type OauthProviderHeaderAccountInput = OauthIdentityCarrierLike & {
   extraConfig?: OauthExtraConfigInput;
 };
@@ -62,7 +62,7 @@ type OAuthStartInstructions = {
   sshTunnelKeyCommand?: string;
 };
 
-type ImportedNativeOauthJson = {
+export type ImportedNativeOauthJson = {
   type?: unknown;
   access_token?: unknown;
   refresh_token?: unknown;
@@ -159,13 +159,13 @@ function parseManualCallbackUrl(input: {
   };
 }
 
-function asNonEmptyString(value: unknown): string | undefined {
+export function asNonEmptyString(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const trimmed = value.trim();
   return trimmed || undefined;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+export function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
@@ -285,7 +285,7 @@ function parseImportedOauthExpiry(value: unknown): number | undefined {
   return parsed;
 }
 
-function resolveImportedNativeOauthIdentity(
+export function resolveImportedNativeOauthIdentity(
   payload: ImportedNativeOauthJson,
 ): {
   provider: OAuthProviderId;
@@ -437,7 +437,7 @@ async function mapWithConcurrency<T, TResult>(
   return results;
 }
 
-function normalizeImportedOauthJsonItems(input: {
+export function normalizeImportedOauthJsonItems(input: {
   data?: unknown;
   items?: unknown[];
 }): unknown[] {
@@ -601,7 +601,7 @@ function isUniqueConstraintError(error: unknown): boolean {
   return false;
 }
 
-async function upsertOauthAccount(input: {
+export async function upsertOauthAccount(input: {
   definition: OAuthProviderDefinition;
   exchange: {
     accessToken: string;
@@ -619,8 +619,10 @@ async function upsertOauthAccount(input: {
   proxyUrl?: string | null;
   useSystemProxy?: boolean;
   persistedStatus?: 'active' | 'disabled';
+  /** 若已预解析 site，跳过 ensureOauthSite 调用 */
+  preResolvedSite?: { id: number; [key: string]: any };
 }) {
-  const site = await ensureOauthSite(input.definition);
+  const site = input.preResolvedSite ?? await ensureOauthSite(input.definition);
 
   // rebind 路径：不走事务，对特定 ID 更新，无并发插入问题
   if (typeof input.rebindAccountId === 'number' && input.rebindAccountId > 0) {
