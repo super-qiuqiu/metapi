@@ -4,6 +4,7 @@
  * Phase 0: 预缓存 ensureOauthSite（按 provider 去重，每种调用一次）
  * Phase 1: 串行 upsert（复用 normalize + fingerprint 去重，使用预缓存 site）
  * Phase 2: 按 (provider, projectId) 分组并发 refresh（discoverOauthModels + persistModelAvailabilityBatch）
+ * Phase 2.5: 并发批量额度刷新（refreshOauthConnectionQuotaBatch）
  * Phase 3: rebuildTokenRoutesFromAvailability（只执行 1 次）
  */
 
@@ -15,6 +16,7 @@ import {
   asNonEmptyString,
   MAX_OAUTH_IMPORT_BATCH_SIZE,
   type ImportedNativeOauthJson,
+  refreshOauthConnectionQuotaBatch,
 } from './service.js';
 import {
   discoverOauthModels,
@@ -48,8 +50,9 @@ export type OauthImportStreamCallbacks = {
   onItem: (item: OauthImportStreamItem) => void;
   onCheckpoint: (data: { upsertedAccountIds: number[]; pendingRefreshIds: number[] }) => void;
   onRefreshed: (data: { index: number; accountId: number; modelCount: number; provider: string }) => void;
+  onQuotaRefreshed: (data: { index: number; accountId: number; success: boolean; provider: string }) => void;
   onError: (data: { index: number; accountId?: number; provider?: string; message: string; phase: 'upsert' | 'refresh' }) => void;
-  onDone: (data: { imported: number; updated: number; skipped: number; parseFailed: number; refreshFailed: number }) => void;
+  onDone: (data: { imported: number; updated: number; skipped: number; parseFailed: number; refreshFailed: number; quotaRefreshFailed: number }) => void;
   signal?: { aborted: boolean };
 };
 
@@ -597,6 +600,36 @@ export async function importOauthConnectionsStream(input: {
     refreshFailed = refreshResult.failedCount;
   }
 
+  // --- Phase 2.5: 批量额度刷新 ---
+  let quotaRefreshFailed = 0;
+  if (phase1Result.upsertedAccounts.length > 0 && !callbacks.signal?.aborted) {
+    // 只刷新 status=active 的账户
+    const activeAccountIds = phase1Result.upsertedAccounts
+      .filter(a => a.status === 'active')
+      .map(a => a.accountId);
+
+    if (activeAccountIds.length > 0) {
+      try {
+        const quotaResult = await refreshOauthConnectionQuotaBatch(activeAccountIds);
+        let quotaIdx = 0;
+        for (const item of quotaResult.items) {
+          callbacks.onQuotaRefreshed({
+            index: quotaIdx++,
+            accountId: item.accountId,
+            success: item.success,
+            provider: phase1Result.upsertedAccounts.find(a => a.accountId === item.accountId)?.provider || 'unknown',
+          });
+          if (!item.success) {
+            quotaRefreshFailed++;
+          }
+        }
+      } catch {
+        // 额度刷新整体失败不阻断主流程
+        quotaRefreshFailed = activeAccountIds.length;
+      }
+    }
+  }
+
   // --- Phase 3: rebuildRoutes ---
   if (!callbacks.signal?.aborted) {
     try {
@@ -613,5 +646,6 @@ export async function importOauthConnectionsStream(input: {
     skipped: phase1Result.skipped,
     parseFailed: phase1Result.failed,
     refreshFailed: refreshFailed,
+    quotaRefreshFailed,
   });
 }

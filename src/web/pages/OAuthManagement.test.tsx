@@ -1218,7 +1218,7 @@ describe('OAuthManagement page', () => {
       handlers.onItem?.({ index: 0, name: 'Imported Codex OAuth', status: 'imported', provider: 'codex', accountId: 7 });
       handlers.onCheckpoint?.({ upsertedAccountIds: [7], pendingRefreshIds: [7] });
       handlers.onRefreshed?.({ index: 0, accountId: 7, modelCount: 0, provider: 'codex' });
-      handlers.onDone?.({ imported: 1, updated: 0, skipped: 0, parseFailed: 0, refreshFailed: 0 });
+      handlers.onDone?.({ imported: 1, updated: 0, skipped: 0, parseFailed: 0, refreshFailed: 0, quotaRefreshFailed: 0 });
     });
 
     let root!: WebTestRenderer;
@@ -1329,7 +1329,7 @@ describe('OAuthManagement page', () => {
         handlers.onCheckpoint?.({ upsertedAccountIds: [7, 9], pendingRefreshIds: [7, 9] });
         handlers.onRefreshed?.({ index: 0, accountId: 7, modelCount: 0, provider: 'codex' });
         handlers.onRefreshed?.({ index: 1, accountId: 9, modelCount: 0, provider: 'codex' });
-        handlers.onDone?.({ imported: 2, updated: 0, skipped: 1, parseFailed: 0, refreshFailed: 0 });
+        handlers.onDone?.({ imported: 2, updated: 0, skipped: 1, parseFailed: 0, refreshFailed: 0, quotaRefreshFailed: 0 });
       });
 
     const fileA = {

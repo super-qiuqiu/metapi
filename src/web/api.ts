@@ -1219,6 +1219,7 @@ export const api = {
       onItem?: (item: any) => void;
       onCheckpoint?: (data: any) => void;
       onRefreshed?: (data: any) => void;
+      onQuotaRefreshed?: (data: { index: number; accountId: number; success: boolean; provider: string }) => void;
       onError?: (data: any) => void;
       onDone?: (data: any) => void;
       signal?: AbortSignal;
@@ -1237,6 +1238,9 @@ export const api = {
               break;
             case "refreshed":
               handlers.onRefreshed?.(payload);
+              break;
+            case "quotaRefreshed":
+              handlers.onQuotaRefreshed?.(payload);
               break;
             case "error":
               handlers.onError?.(payload);

@@ -1494,6 +1494,9 @@ export default function OAuthManagement() {
             onRefreshed: () => {
               setImportProgress(prev => ({ ...prev, current: prev.current + 1 }));
             },
+            onQuotaRefreshed: () => {
+              // 额度刷新很快，不需要单独进度展示
+            },
             onError: (data) => {
               if (data.phase === 'refresh') refreshFailed++;
               else parseFailed++;

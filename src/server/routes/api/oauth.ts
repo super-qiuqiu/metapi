@@ -515,6 +515,7 @@ export async function oauthRoutes(app: FastifyInstance) {
             onItem: (item) => pushEvent('item', item),
             onCheckpoint: (data) => pushEvent('checkpoint', data),
             onRefreshed: (data) => pushEvent('refreshed', data),
+            onQuotaRefreshed: (data) => pushEvent('quotaRefreshed', data),
             onError: (data) => pushEvent('error', data),
             onDone: (data) => pushEvent('done', data),
             signal: { get aborted() { return aborted; } },
@@ -524,7 +525,7 @@ export async function oauthRoutes(app: FastifyInstance) {
         if (!aborted) {
           const message = error?.message || 'oauth import failed';
           pushEvent('error', { message });
-          pushEvent('done', { imported: 0, updated: 0, skipped: 0, parseFailed: 1, refreshFailed: 0 });
+          pushEvent('done', { imported: 0, updated: 0, skipped: 0, parseFailed: 1, refreshFailed: 0, quotaRefreshFailed: 0 });
         }
       }
 
