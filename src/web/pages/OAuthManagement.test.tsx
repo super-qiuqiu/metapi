@@ -17,6 +17,7 @@ const { apiMock, openMock, focusMock, confirmMock, promptMock } = vi.hoisted(() 
     updateOAuthConnectionProxy: vi.fn(),
     deleteOAuthConnection: vi.fn(),
     importOAuthConnections: vi.fn(),
+    importOAuthConnectionsStream: vi.fn(),
     createOAuthRouteUnit: vi.fn(),
     deleteOAuthRouteUnit: vi.fn(),
     getAccountModels: vi.fn(),
@@ -1213,19 +1214,11 @@ describe('OAuthManagement page', () => {
         limit: 100,
         offset: 0,
       });
-    apiMock.importOAuthConnections.mockResolvedValue({
-      success: true,
-      imported: 1,
-      skipped: 0,
-      failed: 0,
-      items: [
-        {
-          name: 'Imported Codex OAuth',
-          status: 'imported',
-          accountId: 7,
-          provider: 'codex',
-        },
-      ],
+    apiMock.importOAuthConnectionsStream.mockImplementation(async (_data: any, handlers: any) => {
+      handlers.onItem?.({ index: 0, name: 'Imported Codex OAuth', status: 'imported', provider: 'codex', accountId: 7 });
+      handlers.onCheckpoint?.({ upsertedAccountIds: [7], pendingRefreshIds: [7] });
+      handlers.onRefreshed?.({ index: 0, accountId: 7, modelCount: 0, provider: 'codex' });
+      handlers.onDone?.({ imported: 1, updated: 0, skipped: 0, failed: 0 });
     });
 
     let root!: WebTestRenderer;
@@ -1269,11 +1262,16 @@ describe('OAuthManagement page', () => {
 
       await clickButton(root, '添加');
 
-      expect(apiMock.importOAuthConnections).toHaveBeenCalledWith({
-        type: 'codex',
-        access_token: 'oauth-access-token',
-        refresh_token: 'oauth-refresh-token',
-      });
+      expect(apiMock.importOAuthConnectionsStream).toHaveBeenCalledWith(
+        {
+          items: [{
+            type: 'codex',
+            access_token: 'oauth-access-token',
+            refresh_token: 'oauth-refresh-token',
+          }],
+        },
+        expect.any(Object),
+      );
       await act(async () => {
         vi.advanceTimersByTime(300);
       });
@@ -1324,31 +1322,14 @@ describe('OAuthManagement page', () => {
         limit: 100,
         offset: 0,
     });
-    apiMock.importOAuthConnections
-      .mockResolvedValueOnce({
-        success: true,
-        imported: 2,
-        skipped: 1,
-        failed: 0,
-        items: [
-          {
-            name: 'Workspace B',
-            status: 'imported',
-            accountId: 9,
-            provider: 'codex',
-          },
-          {
-            name: 'Workspace A',
-            status: 'imported',
-            accountId: 7,
-            provider: 'codex',
-          },
-          {
-            name: 'Skipped API Key',
-            status: 'skipped',
-            message: 'not oauth',
-          },
-        ],
+    apiMock.importOAuthConnectionsStream
+      .mockImplementationOnce(async (_data: any, handlers: any) => {
+        handlers.onItem?.({ index: 0, name: 'Workspace A', status: 'imported', provider: 'codex', accountId: 7 });
+        handlers.onItem?.({ index: 1, name: 'Workspace B', status: 'imported', provider: 'codex', accountId: 9 });
+        handlers.onCheckpoint?.({ upsertedAccountIds: [7, 9], pendingRefreshIds: [7, 9] });
+        handlers.onRefreshed?.({ index: 0, accountId: 7, modelCount: 0, provider: 'codex' });
+        handlers.onRefreshed?.({ index: 1, accountId: 9, modelCount: 0, provider: 'codex' });
+        handlers.onDone?.({ imported: 2, updated: 0, skipped: 1, failed: 0 });
       });
 
     const fileA = {
@@ -1409,22 +1390,25 @@ describe('OAuthManagement page', () => {
 
       await clickButton(root, '添加');
 
-      expect(apiMock.importOAuthConnections).toHaveBeenCalledTimes(1);
-      expect(apiMock.importOAuthConnections).toHaveBeenCalledWith({
-        items: [
-          {
-            type: 'codex',
-            access_token: 'oauth-access-token-a',
-            email: 'workspace-a@example.com',
-          },
-          {
-            type: 'codex',
-            access_token: 'oauth-access-token-b',
-            email: 'workspace-b@example.com',
-          },
-        ],
-        useSystemProxy: true,
-      });
+      expect(apiMock.importOAuthConnectionsStream).toHaveBeenCalledTimes(1);
+      expect(apiMock.importOAuthConnectionsStream).toHaveBeenCalledWith(
+        {
+          items: [
+            {
+              type: 'codex',
+              access_token: 'oauth-access-token-a',
+              email: 'workspace-a@example.com',
+            },
+            {
+              type: 'codex',
+              access_token: 'oauth-access-token-b',
+              email: 'workspace-b@example.com',
+            },
+          ],
+          useSystemProxy: true,
+        },
+        expect.any(Object),
+      );
       await act(async () => {
         vi.advanceTimersByTime(300);
       });
