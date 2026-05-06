@@ -1,6 +1,6 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 import { eq } from 'drizzle-orm';
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -4135,6 +4135,240 @@ describe('oauth routes', { timeout: 15_000 }, () => {
     expect(callbackResponse.statusCode).toBe(400);
     expect(callbackResponse.json()).toMatchObject({
       message: expect.stringContaining('invalid oauth callback url'),
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // SSE stream import tests
+  // ---------------------------------------------------------------------------
+
+  async function consumeSseResponse(response: any): Promise<Array<{ event: string; data: any }>> {
+    const events: Array<{ event: string; data: any }> = [];
+    const body = response.body as string;
+    const chunks = body.split('\n\n').filter(Boolean);
+    for (const chunk of chunks) {
+      const lines = chunk.split('\n');
+      let eventName = 'message';
+      const dataLines: string[] = [];
+      for (const line of lines) {
+        if (line.startsWith('event:')) eventName = line.slice('event:'.length).trim();
+        else if (line.startsWith('data:')) dataLines.push(line.slice('data:'.length).trim());
+        // skip : comment lines
+      }
+      if (dataLines.length > 0) {
+        try {
+          events.push({ event: eventName, data: JSON.parse(dataLines.join('\n')) });
+        } catch {
+          events.push({ event: eventName, data: dataLines.join('\n') });
+        }
+      }
+    }
+    return events;
+  }
+
+  describe('POST /api/oauth/import/stream', () => {
+    let importStreamMock: ReturnType<typeof vi.fn>;
+
+    beforeEach(async () => {
+      const module = await import('../../services/oauth/importStreamService.js');
+      importStreamMock = vi.fn();
+      vi.spyOn(module, 'importOauthConnectionsStream').mockImplementation(importStreamMock);
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it('streams a single codex import as SSE events with item, checkpoint, refreshed and done', async () => {
+      importStreamMock.mockImplementation(async (_input: any, callbacks: any) => {
+        callbacks.onItem({ index: 0, name: 'stream-user@example.com', status: 'imported', provider: 'codex', accountId: 42 });
+        callbacks.onCheckpoint({ upsertedAccountIds: [42], pendingRefreshIds: [42] });
+        callbacks.onRefreshed({ index: 0, accountId: 42, modelCount: 3, provider: 'codex' });
+        callbacks.onDone({ imported: 1, updated: 0, skipped: 0, failed: 0 });
+      });
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/oauth/import/stream',
+        payload: {
+          data: {
+            type: 'codex',
+            access_token: 'stream-access-token',
+            refresh_token: 'stream-refresh-token',
+            id_token: buildJwt({
+              email: 'stream-user@example.com',
+              'https://api.openai.com/auth': {
+                chatgpt_account_id: 'stream-account-123',
+                chatgpt_plan_type: 'plus',
+              },
+            }),
+          },
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const events = await consumeSseResponse(response);
+      const eventTypes = events.map((e) => e.event);
+
+      expect(eventTypes).toContain('item');
+      expect(eventTypes).toContain('checkpoint');
+      expect(eventTypes).toContain('refreshed');
+      expect(eventTypes).toContain('done');
+
+      const itemEvent = events.find((e) => e.event === 'item');
+      expect(itemEvent?.data).toMatchObject({
+        index: 0,
+        name: 'stream-user@example.com',
+        status: 'imported',
+        provider: 'codex',
+        accountId: 42,
+      });
+
+      const doneEvent = events.find((e) => e.event === 'done');
+      expect(doneEvent?.data).toMatchObject({
+        imported: 1,
+        updated: 0,
+        skipped: 0,
+        failed: 0,
+      });
+    });
+
+    it('invokes importOauthConnectionsStream once for batch items of the same provider', async () => {
+      importStreamMock.mockImplementation(async (_input: any, callbacks: any) => {
+        callbacks.onItem({ index: 0, name: 'batch-a@example.com', status: 'imported', provider: 'codex', accountId: 1 });
+        callbacks.onItem({ index: 1, name: 'batch-b@example.com', status: 'imported', provider: 'codex', accountId: 2 });
+        callbacks.onCheckpoint({ upsertedAccountIds: [1, 2], pendingRefreshIds: [1, 2] });
+        callbacks.onRefreshed({ index: 0, accountId: 1, modelCount: 1, provider: 'codex' });
+        callbacks.onRefreshed({ index: 1, accountId: 2, modelCount: 1, provider: 'codex' });
+        callbacks.onDone({ imported: 2, updated: 0, skipped: 0, failed: 0 });
+      });
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/oauth/import/stream',
+        payload: {
+          items: [
+            {
+              type: 'codex',
+              access_token: 'batch-access-a',
+              refresh_token: 'batch-refresh-a',
+              email: 'batch-a@example.com',
+              account_id: 'batch-account-a',
+            },
+            {
+              type: 'codex',
+              access_token: 'batch-access-b',
+              refresh_token: 'batch-refresh-b',
+              email: 'batch-b@example.com',
+              account_id: 'batch-account-b',
+            },
+          ],
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(importStreamMock).toHaveBeenCalledTimes(1);
+
+      const events = await consumeSseResponse(response);
+      const itemEvents = events.filter((e) => e.event === 'item');
+      expect(itemEvents).toHaveLength(2);
+      expect(itemEvents[0]?.data).toMatchObject({ provider: 'codex', status: 'imported' });
+      expect(itemEvents[1]?.data).toMatchObject({ provider: 'codex', status: 'imported' });
+    });
+
+    it('passes cross-provider items to importOauthConnectionsStream which groups them for discovery', async () => {
+      importStreamMock.mockImplementation(async (_input: any, callbacks: any) => {
+        callbacks.onItem({ index: 0, name: 'cross-codex@example.com', status: 'imported', provider: 'codex', accountId: 10 });
+        callbacks.onItem({ index: 1, name: 'cross-claude@example.com', status: 'imported', provider: 'claude', accountId: 20 });
+        callbacks.onCheckpoint({ upsertedAccountIds: [10, 20], pendingRefreshIds: [10, 20] });
+        callbacks.onRefreshed({ index: 0, accountId: 10, modelCount: 1, provider: 'codex' });
+        callbacks.onRefreshed({ index: 1, accountId: 20, modelCount: 2, provider: 'claude' });
+        callbacks.onDone({ imported: 2, updated: 0, skipped: 0, failed: 0 });
+      });
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/oauth/import/stream',
+        payload: {
+          items: [
+            {
+              type: 'codex',
+              access_token: 'cross-codex-access',
+              refresh_token: 'cross-codex-refresh',
+              email: 'cross-codex@example.com',
+              account_id: 'cross-codex-account',
+            },
+            {
+              type: 'claude',
+              access_token: 'cross-claude-access',
+              refresh_token: 'cross-claude-refresh',
+              email: 'cross-claude@example.com',
+              account_id: 'cross-claude-account',
+            },
+          ],
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(importStreamMock).toHaveBeenCalledTimes(1);
+
+      // Verify the service received both items
+      const callArgs = importStreamMock.mock.calls[0] as [any, any];
+      expect(callArgs[0].items).toHaveLength(2);
+
+      const events = await consumeSseResponse(response);
+      const refreshedEvents = events.filter((e) => e.event === 'refreshed');
+      expect(refreshedEvents).toHaveLength(2);
+      expect(refreshedEvents.map((e) => e.data.provider).sort()).toEqual(['claude', 'codex']);
+    });
+
+    it('reports skipped count in done event when fingerprint deduplication removes duplicate items', async () => {
+      importStreamMock.mockImplementation(async (_input: any, callbacks: any) => {
+        // Only 1 onItem for the first item; the duplicate is silently skipped
+        callbacks.onItem({ index: 0, name: 'dedup-user@example.com', status: 'imported', provider: 'codex', accountId: 50 });
+        callbacks.onCheckpoint({ upsertedAccountIds: [50], pendingRefreshIds: [50] });
+        callbacks.onRefreshed({ index: 0, accountId: 50, modelCount: 1, provider: 'codex' });
+        callbacks.onDone({ imported: 1, updated: 0, skipped: 1, failed: 0 });
+      });
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/oauth/import/stream',
+        payload: {
+          items: [
+            {
+              type: 'codex',
+              access_token: 'dedup-access-token',
+              refresh_token: 'dedup-refresh-token',
+              email: 'dedup-user@example.com',
+              account_id: 'dedup-account-same',
+            },
+            {
+              type: 'codex',
+              access_token: 'dedup-access-token',
+              refresh_token: 'dedup-refresh-token',
+              email: 'dedup-user@example.com',
+              account_id: 'dedup-account-same',
+            },
+          ],
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const events = await consumeSseResponse(response);
+
+      // Only 1 item event (the duplicate is not emitted as an onItem)
+      const itemEvents = events.filter((e) => e.event === 'item');
+      expect(itemEvents).toHaveLength(1);
+      expect(itemEvents[0]?.data).toMatchObject({ status: 'imported' });
+
+      // The done event carries the skipped count
+      const doneEvent = events.find((e) => e.event === 'done');
+      expect(doneEvent?.data).toMatchObject({
+        imported: 1,
+        skipped: 1,
+        failed: 0,
+      });
     });
   });
 });
