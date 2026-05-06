@@ -524,7 +524,7 @@ export async function oauthRoutes(app: FastifyInstance) {
         if (!aborted) {
           const message = error?.message || 'oauth import failed';
           pushEvent('error', { message });
-          pushEvent('done', { imported: 0, updated: 0, skipped: 0, failed: 1 });
+          pushEvent('done', { imported: 0, updated: 0, skipped: 0, parseFailed: 1, refreshFailed: 0 });
         }
       }
 

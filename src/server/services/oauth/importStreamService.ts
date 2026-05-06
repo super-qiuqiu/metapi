@@ -48,8 +48,8 @@ export type OauthImportStreamCallbacks = {
   onItem: (item: OauthImportStreamItem) => void;
   onCheckpoint: (data: { upsertedAccountIds: number[]; pendingRefreshIds: number[] }) => void;
   onRefreshed: (data: { index: number; accountId: number; modelCount: number; provider: string }) => void;
-  onError: (data: { index: number; accountId?: number; provider?: string; message: string }) => void;
-  onDone: (data: { imported: number; updated: number; skipped: number; failed: number }) => void;
+  onError: (data: { index: number; accountId?: number; provider?: string; message: string; phase: 'upsert' | 'refresh' }) => void;
+  onDone: (data: { imported: number; updated: number; skipped: number; parseFailed: number; refreshFailed: number }) => void;
   signal?: { aborted: boolean };
 };
 
@@ -325,36 +325,116 @@ async function refreshGroup(input: {
   try {
     discoveryResult = await discoverOauthModels({ accountId: discoveryAccountId });
   } catch (error: any) {
-    // discover 本身抛异常 → 组内所有账号标记失败
+    // 代表账户 discover 抛异常 → 回退到组内逐个独立探测
     for (const account of group.accounts) {
-      const idx = globalIndex.value++;
-      failedCount++;
-      callbacks.onError({
-        index: idx,
-        accountId: account.accountId,
-        provider: account.provider,
-        message: error?.message || 'model discovery failed',
-      });
+      if (signal?.aborted) break;
+      try {
+        const singleResult = await discoverOauthModels({ accountId: account.accountId });
+        if ('models' in singleResult && singleResult.models !== null && singleResult.models !== undefined) {
+          await persistModelAvailabilityBatch({
+            items: [{
+              accountId: account.accountId,
+              models: singleResult.models,
+              discoveryAccount: singleResult.discoveryAccount,
+              checkedAt: singleResult.checkedAt,
+              latencyMs: singleResult.latencyMs,
+              provider: singleResult.provider,
+              previousModelAvailability: singleResult.previousModelAvailability,
+              previousAccountTokens: singleResult.previousAccountTokens,
+              previousTokenModelAvailability: singleResult.previousTokenModelAvailability,
+            }],
+          });
+          const idx = globalIndex.value++;
+          refreshedCount++;
+          callbacks.onRefreshed({
+            index: idx,
+            accountId: account.accountId,
+            modelCount: singleResult.models.length,
+            provider: account.provider,
+          });
+        } else {
+          const idx = globalIndex.value++;
+          failedCount++;
+          const errorMessage = 'errorMessage' in singleResult
+            ? (singleResult as any).errorMessage
+            : 'model discovery returned no models';
+          callbacks.onError({
+            index: idx,
+            accountId: account.accountId,
+            provider: account.provider,
+            message: errorMessage || 'model discovery returned no models',
+            phase: 'refresh',
+          });
+        }
+      } catch (innerError: any) {
+        const idx = globalIndex.value++;
+        failedCount++;
+        callbacks.onError({
+          index: idx,
+          accountId: account.accountId,
+          provider: account.provider,
+          message: innerError?.message || 'model discovery failed',
+          phase: 'refresh',
+        });
+      }
     }
     return { refreshedCount, failedCount };
   }
 
   // 判断 discover 结果
   if (!('models' in discoveryResult) || discoveryResult.models === null || discoveryResult.models === undefined) {
-    // 失败或跳过
-    const errorMessage = 'errorMessage' in discoveryResult
-      ? (discoveryResult as any).errorMessage
-      : 'model discovery returned no models';
-
+    // 代表账户 discover 返回无模型 → 回退到组内逐个独立探测
     for (const account of group.accounts) {
-      const idx = globalIndex.value++;
-      failedCount++;
-      callbacks.onError({
-        index: idx,
-        accountId: account.accountId,
-        provider: account.provider,
-        message: errorMessage || 'model discovery returned no models',
-      });
+      if (signal?.aborted) break;
+      try {
+        const singleResult = await discoverOauthModels({ accountId: account.accountId });
+        if ('models' in singleResult && singleResult.models !== null && singleResult.models !== undefined) {
+          await persistModelAvailabilityBatch({
+            items: [{
+              accountId: account.accountId,
+              models: singleResult.models,
+              discoveryAccount: singleResult.discoveryAccount,
+              checkedAt: singleResult.checkedAt,
+              latencyMs: singleResult.latencyMs,
+              provider: singleResult.provider,
+              previousModelAvailability: singleResult.previousModelAvailability,
+              previousAccountTokens: singleResult.previousAccountTokens,
+              previousTokenModelAvailability: singleResult.previousTokenModelAvailability,
+            }],
+          });
+          const idx = globalIndex.value++;
+          refreshedCount++;
+          callbacks.onRefreshed({
+            index: idx,
+            accountId: account.accountId,
+            modelCount: singleResult.models.length,
+            provider: account.provider,
+          });
+        } else {
+          const idx = globalIndex.value++;
+          failedCount++;
+          const singleErrorMessage = 'errorMessage' in singleResult
+            ? (singleResult as any).errorMessage
+            : 'model discovery returned no models';
+          callbacks.onError({
+            index: idx,
+            accountId: account.accountId,
+            provider: account.provider,
+            message: singleErrorMessage || 'model discovery returned no models',
+            phase: 'refresh',
+          });
+        }
+      } catch (innerError: any) {
+        const idx = globalIndex.value++;
+        failedCount++;
+        callbacks.onError({
+          index: idx,
+          accountId: account.accountId,
+          provider: account.provider,
+          message: innerError?.message || 'model discovery failed',
+          phase: 'refresh',
+        });
+      }
     }
     return { refreshedCount, failedCount };
   }
@@ -399,6 +479,7 @@ async function refreshGroup(input: {
         accountId: account.accountId,
         provider: account.provider,
         message: error?.message || 'persist model availability batch failed',
+        phase: 'refresh',
       });
     }
   }
@@ -526,11 +607,11 @@ export async function importOauthConnectionsStream(input: {
   }
 
   // --- 完成 ---
-  const totalFailed = phase1Result.failed + refreshFailed;
   callbacks.onDone({
     imported: phase1Result.imported,
     updated: phase1Result.updated,
     skipped: phase1Result.skipped,
-    failed: totalFailed,
+    parseFailed: phase1Result.failed,
+    refreshFailed: refreshFailed,
   });
 }

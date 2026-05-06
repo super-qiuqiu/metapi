@@ -753,7 +753,8 @@ export type OAuthImportResponse = {
   imported: number;
   updated: number;
   skipped: number;
-  failed: number;
+  parseFailed: number;
+  refreshFailed: number;
   items: Array<{
     name: string;
     status: "imported" | "updated" | "skipped" | "failed";

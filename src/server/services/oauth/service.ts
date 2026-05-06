@@ -1277,7 +1277,8 @@ export async function importOauthConnectionsFromNativeJson(input: {
     imported,
     updated,
     skipped,
-    failed,
+    parseFailed: failed,
+    refreshFailed: 0,
     items,
   };
 }

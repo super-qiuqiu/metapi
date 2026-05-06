@@ -1474,7 +1474,7 @@ export default function OAuthManagement() {
           proxyValue: importProxyUrl,
         });
 
-      let imported = 0, updated = 0, skipped = 0, failed = 0;
+      let imported = 0, updated = 0, skipped = 0, parseFailed = 0, refreshFailed = 0;
 
       // 先尝试 SSE 流式导入
       try {
@@ -1484,7 +1484,7 @@ export default function OAuthManagement() {
             onItem: (item) => {
               if (item.status === 'imported') imported++;
               else if (item.status === 'updated') updated++;
-              else if (item.status === 'failed') failed++;
+              else if (item.status === 'failed') parseFailed++;
               setImportProgress(prev => ({ ...prev, current: prev.current + 1 }));
             },
             onCheckpoint: () => {
@@ -1494,14 +1494,16 @@ export default function OAuthManagement() {
             onRefreshed: () => {
               setImportProgress(prev => ({ ...prev, current: prev.current + 1 }));
             },
-            onError: () => {
-              failed++;
+            onError: (data) => {
+              if (data.phase === 'refresh') refreshFailed++;
+              else parseFailed++;
             },
             onDone: (data) => {
               imported = data.imported;
               updated = data.updated;
               skipped = data.skipped;
-              failed = data.failed;
+              parseFailed = data.parseFailed;
+              refreshFailed = data.refreshFailed;
             },
           },
         );
@@ -1521,7 +1523,8 @@ export default function OAuthManagement() {
           imported = fallbackResult.imported;
           updated = fallbackResult.updated;
           skipped = fallbackResult.skipped;
-          failed = fallbackResult.failed;
+          parseFailed = fallbackResult.parseFailed;
+          refreshFailed = fallbackResult.refreshFailed;
         } else {
           throw streamError;
         }
@@ -1530,14 +1533,16 @@ export default function OAuthManagement() {
       await loadConnections();
 
       const parts: string[] = [];
-      if (imported > 0) parts.push(`新增 ${imported} 个`);
+      if (imported > 0) parts.push(`成功入库 ${imported} 个`);
       if (updated > 0) parts.push(`更新 ${updated} 个`);
-      if (skipped > 0) parts.push(`跳过 ${skipped} 个`);
-      if (failed > 0) parts.push(`失败 ${failed} 个`);
+      if (skipped > 0) parts.push(`重复跳过 ${skipped} 个`);
+      if (parseFailed > 0) parts.push(`格式无效 ${parseFailed} 个`);
+      if (refreshFailed > 0) parts.push(`模型探测失败 ${refreshFailed} 个（账户已入库，可稍后刷新模型）`);
       const importMessage = parts.length > 0
         ? parts.join('，')
         : '没有需要导入的连接';
-      if (failed > 0) {
+      const hasAnyFailed = parseFailed > 0 || refreshFailed > 0;
+      if (hasAnyFailed) {
         toast.info(importMessage);
         setSessionInfo(importMessage);
       } else {
@@ -2522,7 +2527,7 @@ export default function OAuthManagement() {
               <div style={{ marginTop: 8, width: '100%' }}>
                 <div style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 4 }}>
                   {importPhase === 'upserting' && `正在导入 ${importProgress.current}/${importProgress.total}`}
-                  {importPhase === 'refreshing' && `正在刷新模型 ${importProgress.current}/${importProgress.total}`}
+                  {importPhase === 'refreshing' && `正在探测模型 ${importProgress.current}/${importProgress.total}`}
                 </div>
                 <div style={{ height: 4, background: 'var(--bg-tertiary)', borderRadius: 2, overflow: 'hidden' }}>
                   <div style={{
