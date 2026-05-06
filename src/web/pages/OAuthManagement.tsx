@@ -1262,14 +1262,13 @@ export default function OAuthManagement() {
     }
     setActionLoadingKey('delete:selected');
     try {
-      const results = await Promise.allSettled(selectedConnectionIds.map((accountId) => api.deleteOAuthConnection(accountId)));
-      const failed = results.filter((item) => item.status === 'rejected').length;
+      const result = await api.deleteOAuthConnectionsBatch(selectedConnectionIds);
       await loadConnections();
       setSelectedConnectionIds([]);
-      if (failed > 0) {
-        setSessionInfo(`批量删除完成，${failed} 个连接删除失败`);
+      if (result.failed > 0) {
+        setSessionInfo(`批量删除完成，${result.deleted} 个成功，${result.failed} 个失败`);
       } else {
-        setSessionSuccess(`已删除 ${results.length} 个 OAuth 连接`);
+        setSessionSuccess(`已删除 ${result.deleted} 个 OAuth 连接`);
       }
     } finally {
       setActionLoadingKey('');

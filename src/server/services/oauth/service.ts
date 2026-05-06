@@ -1109,6 +1109,39 @@ export async function deleteOauthConnection(accountId: number) {
   return { success: true };
 }
 
+export async function deleteOauthConnectionsBatch(accountIds: number[]) {
+  const uniqueIds = Array.from(new Set(accountIds.filter((id) => Number.isFinite(id) && id > 0)));
+  const items = await mapWithConcurrency(uniqueIds, 8, async (accountId) => {
+    try {
+      const account = await db.select().from(schema.accounts)
+        .where(eq(schema.accounts.id, accountId))
+        .get();
+      if (!account) {
+        return { accountId, success: false, error: 'oauth account not found' };
+      }
+      const normalizedOauth = getOauthInfoFromAccount(account);
+      if (!normalizedOauth) {
+        return { accountId, success: false, error: 'account is not managed by oauth' };
+      }
+      await db.delete(schema.accounts).where(eq(schema.accounts.id, accountId)).run();
+      return { accountId, success: true };
+    } catch (error: any) {
+      return { accountId, success: false, error: error?.message || 'delete failed' };
+    }
+  }) satisfies Array<{ accountId: number; success: boolean; error?: string }>;
+
+  // 批量删除完成后，只重建一次路由
+  try {
+    await routeRefreshWorkflow.rebuildRoutesOnly();
+  } catch {
+    // rebuild 失败不影响删除结果
+  }
+
+  const deleted = items.filter((item) => item.success).length;
+  const failed = items.length - deleted;
+  return { success: failed === 0, deleted, failed, items };
+}
+
 export async function refreshOauthConnectionQuota(accountId: number) {
   const quota = await refreshOauthQuotaSnapshot(accountId);
   return { success: true, quota };

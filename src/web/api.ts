@@ -1208,6 +1208,11 @@ export const api = {
     request(`/api/oauth/connections/${accountId}`, {
       method: "DELETE",
     }) as Promise<{ success: true }>,
+  deleteOAuthConnectionsBatch: (accountIds: number[]): Promise<{ success: boolean; deleted: number; failed: number }> =>
+    request('/api/oauth/connections/delete-batch', {
+      method: 'POST',
+      body: JSON.stringify({ accountIds }),
+    }),
   importOAuthConnections: (data: Record<string, unknown>) =>
     request("/api/oauth/import", {
       method: "POST",

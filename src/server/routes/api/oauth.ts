@@ -4,6 +4,7 @@ import { createRateLimitGuard } from '../../middleware/requestRateLimit.js';
 import {
   getOauthProviderDefaults,
   deleteOauthConnection,
+  deleteOauthConnectionsBatch,
   importOauthConnectionsFromNativeJson,
   getOauthSessionStatus,
   handleOauthCallback,
@@ -373,6 +374,22 @@ export async function oauthRoutes(app: FastifyInstance) {
       } catch (error: any) {
         return reply.code(404).send({ message: error?.message || 'oauth account not found' });
       }
+    },
+  );
+
+  app.post<{ Body: unknown }>(
+    '/api/oauth/connections/delete-batch',
+    { preHandler: [limitOauthConnectionMutate] },
+    async (request, reply) => {
+      const body = request.body as Record<string, unknown> | null;
+      const accountIds = Array.isArray(body?.accountIds) ? (body as any).accountIds.filter((id: any) => Number.isFinite(id) && id > 0) : [];
+      if (accountIds.length === 0) {
+        return reply.code(400).send({ message: 'accountIds is required' });
+      }
+      if (accountIds.length > 100) {
+        return reply.code(400).send({ message: 'accountIds must contain at most 100 items' });
+      }
+      return await deleteOauthConnectionsBatch(accountIds);
     },
   );
 
