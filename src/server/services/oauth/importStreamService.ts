@@ -8,6 +8,8 @@
  * Phase 3: rebuildTokenRoutesFromAvailability（只执行 1 次）
  */
 
+import { eq } from 'drizzle-orm';
+import { db, schema } from '../../db/index.js';
 import {
   normalizeImportedOauthJsonItems,
   resolveImportedNativeOauthIdentity,

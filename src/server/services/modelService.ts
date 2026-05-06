@@ -859,10 +859,13 @@ export async function persistModelAvailabilityBatch(input: {
   const accountRows = await db.select().from(schema.accounts)
     .where(inArray(schema.accounts.id, uniqueAccountIds))
     .all();
-  const accountById = new Map(accountRows.map((a) => [a.id, a]));
+  const accountById = new Map<number, ModelDiscoveryAccountRow>(
+    accountRows.map((a) => [a.id, a] as const),
+  );
 
   for (const item of items) {
-    const ownAccount = accountById.get(item.accountId) || item.discoveryAccount;
+    const ownAccount: ModelDiscoveryAccountRow =
+      accountById.get(item.accountId) ?? item.discoveryAccount;
     await updateOauthModelDiscoveryState({
       account: ownAccount,
       checkedAt: item.checkedAt,
