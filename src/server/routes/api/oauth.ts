@@ -22,6 +22,7 @@ import {
   deleteOauthRouteUnit,
   updateOauthRouteUnit,
 } from '../../services/oauth/routeUnitService.js';
+import { importOauthConnectionsStream } from '../../services/oauth/importStreamService.js';
 import { parseSiteProxyUrlInput } from '../../services/siteProxy.js';
 import {
   parseOauthConnectionRebindPayload,
@@ -449,6 +450,89 @@ export async function oauthRoutes(app: FastifyInstance) {
         }
         request.log.error({ err: error }, 'oauth import failed');
         return reply.code(500).send({ message });
+      }
+    },
+  );
+
+  app.post<{ Body: unknown }>(
+    '/api/oauth/import/stream',
+    { preHandler: [limitOauthConnectionMutate] },
+    async (request, reply) => {
+      // 1. rate limit
+      try {
+        await oauthImportLimiter.consume(request.ip);
+      } catch (error) {
+        sendOauthSensitiveRateLimit(reply, error);
+        return;
+      }
+      // 2. parse body
+      const parsedBody = parseOauthImportPayload(request.body);
+      if (!parsedBody.success) {
+        return reply.code(400).send({ message: parsedBody.error });
+      }
+      const hasBatchItems = Array.isArray(parsedBody.data.items) && parsedBody.data.items.length > 0;
+      const data = parsedBody.data.data;
+      if (!hasBatchItems && (!data || typeof data !== 'object' || Array.isArray(data))) {
+        return reply.code(400).send({ message: 'data must be a native oauth json object' });
+      }
+      const normalizedProxyUrl = parseSiteProxyUrlInput(parsedBody.data.proxyUrl);
+      if (normalizedProxyUrl.present && !normalizedProxyUrl.valid) {
+        return reply.code(400).send({ message: 'invalid proxy url' });
+      }
+
+      // 3. Setup SSE response
+      reply.raw.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      });
+      // Send an initial comment to establish the connection
+      reply.raw.write(': connected\n\n');
+
+      let aborted = false;
+      request.raw.on('close', () => { aborted = true; });
+
+      const pushEvent = (event: string, data: unknown) => {
+        if (aborted) return;
+        try {
+          reply.raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+        } catch {
+          // Connection already closed
+          aborted = true;
+        }
+      };
+
+      // 4. Call importOauthConnectionsStream with callbacks
+      try {
+        await importOauthConnectionsStream(
+          {
+            data,
+            items: hasBatchItems ? parsedBody.data.items : undefined,
+            proxyUrl: normalizedProxyUrl.present ? normalizedProxyUrl.proxyUrl : undefined,
+            useSystemProxy: parsedBody.data.useSystemProxy,
+          },
+          {
+            onItem: (item) => pushEvent('item', item),
+            onCheckpoint: (data) => pushEvent('checkpoint', data),
+            onRefreshed: (data) => pushEvent('refreshed', data),
+            onError: (data) => pushEvent('error', data),
+            onDone: (data) => pushEvent('done', data),
+            signal: { get aborted() { return aborted; } },
+          },
+        );
+      } catch (error: any) {
+        if (!aborted) {
+          const message = error?.message || 'oauth import failed';
+          pushEvent('error', { message });
+          pushEvent('done', { imported: 0, updated: 0, skipped: 0, failed: 1 });
+        }
+      }
+
+      // 5. End response
+      if (!aborted) {
+        try {
+          reply.raw.end();
+        } catch { /* ignore */ }
       }
     },
   );
