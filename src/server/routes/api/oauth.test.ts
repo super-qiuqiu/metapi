@@ -2551,7 +2551,8 @@ describe('oauth routes', { timeout: 15_000 }, () => {
       success: true,
       imported: 1,
       skipped: 0,
-      failed: 0,
+      parseFailed: 0,
+      refreshFailed: 0,
     });
 
     const accounts = await db.select().from(schema.accounts).all();
@@ -2655,7 +2656,8 @@ describe('oauth routes', { timeout: 15_000 }, () => {
     expect(response.json()).toMatchObject({
       success: true,
       imported: 2,
-      failed: 0,
+      parseFailed: 0,
+      refreshFailed: 0,
       skipped: 0,
     });
 
@@ -2706,7 +2708,8 @@ describe('oauth routes', { timeout: 15_000 }, () => {
       success: true,
       imported: 1,
       skipped: 0,
-      failed: 0,
+      parseFailed: 0,
+      refreshFailed: 0,
     });
 
     const accounts = await db.select().from(schema.accounts).all();
@@ -2886,7 +2889,8 @@ describe('oauth routes', { timeout: 15_000 }, () => {
     expect(response.json()).toMatchObject({
       success: false,
       imported: 1,
-      failed: 1,
+      parseFailed: 1,
+      refreshFailed: 0,
       items: [
         expect.objectContaining({
           name: 'batch-success@example.com',
@@ -3450,7 +3454,8 @@ describe('oauth routes', { timeout: 15_000 }, () => {
     expect(response.json()).toMatchObject({
       success: true,
       imported: 2,
-      failed: 0,
+      parseFailed: 0,
+      refreshFailed: 0,
     });
 
     const accounts = await db.select().from(schema.accounts).all();
@@ -3719,7 +3724,8 @@ describe('oauth routes', { timeout: 15_000 }, () => {
     expect(response.json()).toMatchObject({
       success: true,
       imported: 2,
-      failed: 0,
+      parseFailed: 0,
+      refreshFailed: 0,
     });
 
     const accounts = await db.select().from(schema.accounts).all();
@@ -4184,7 +4190,7 @@ describe('oauth routes', { timeout: 15_000 }, () => {
         callbacks.onItem({ index: 0, name: 'stream-user@example.com', status: 'imported', provider: 'codex', accountId: 42 });
         callbacks.onCheckpoint({ upsertedAccountIds: [42], pendingRefreshIds: [42] });
         callbacks.onRefreshed({ index: 0, accountId: 42, modelCount: 3, provider: 'codex' });
-        callbacks.onDone({ imported: 1, updated: 0, skipped: 0, failed: 0 });
+        callbacks.onDone({ imported: 1, updated: 0, skipped: 0, parseFailed: 0, refreshFailed: 0 });
       });
 
       const response = await app.inject({
@@ -4229,7 +4235,8 @@ describe('oauth routes', { timeout: 15_000 }, () => {
         imported: 1,
         updated: 0,
         skipped: 0,
-        failed: 0,
+        parseFailed: 0,
+        refreshFailed: 0,
       });
     });
 
@@ -4240,7 +4247,7 @@ describe('oauth routes', { timeout: 15_000 }, () => {
         callbacks.onCheckpoint({ upsertedAccountIds: [1, 2], pendingRefreshIds: [1, 2] });
         callbacks.onRefreshed({ index: 0, accountId: 1, modelCount: 1, provider: 'codex' });
         callbacks.onRefreshed({ index: 1, accountId: 2, modelCount: 1, provider: 'codex' });
-        callbacks.onDone({ imported: 2, updated: 0, skipped: 0, failed: 0 });
+        callbacks.onDone({ imported: 2, updated: 0, skipped: 0, parseFailed: 0, refreshFailed: 0 });
       });
 
       const response = await app.inject({
@@ -4283,7 +4290,7 @@ describe('oauth routes', { timeout: 15_000 }, () => {
         callbacks.onCheckpoint({ upsertedAccountIds: [10, 20], pendingRefreshIds: [10, 20] });
         callbacks.onRefreshed({ index: 0, accountId: 10, modelCount: 1, provider: 'codex' });
         callbacks.onRefreshed({ index: 1, accountId: 20, modelCount: 2, provider: 'claude' });
-        callbacks.onDone({ imported: 2, updated: 0, skipped: 0, failed: 0 });
+        callbacks.onDone({ imported: 2, updated: 0, skipped: 0, parseFailed: 0, refreshFailed: 0 });
       });
 
       const response = await app.inject({
@@ -4328,7 +4335,7 @@ describe('oauth routes', { timeout: 15_000 }, () => {
         callbacks.onItem({ index: 0, name: 'dedup-user@example.com', status: 'imported', provider: 'codex', accountId: 50 });
         callbacks.onCheckpoint({ upsertedAccountIds: [50], pendingRefreshIds: [50] });
         callbacks.onRefreshed({ index: 0, accountId: 50, modelCount: 1, provider: 'codex' });
-        callbacks.onDone({ imported: 1, updated: 0, skipped: 1, failed: 0 });
+        callbacks.onDone({ imported: 1, updated: 0, skipped: 1, parseFailed: 0, refreshFailed: 0 });
       });
 
       const response = await app.inject({
@@ -4367,7 +4374,8 @@ describe('oauth routes', { timeout: 15_000 }, () => {
       expect(doneEvent?.data).toMatchObject({
         imported: 1,
         skipped: 1,
-        failed: 0,
+        parseFailed: 0,
+        refreshFailed: 0,
       });
     });
   });

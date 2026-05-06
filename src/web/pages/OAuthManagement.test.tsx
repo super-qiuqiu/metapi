@@ -1218,7 +1218,7 @@ describe('OAuthManagement page', () => {
       handlers.onItem?.({ index: 0, name: 'Imported Codex OAuth', status: 'imported', provider: 'codex', accountId: 7 });
       handlers.onCheckpoint?.({ upsertedAccountIds: [7], pendingRefreshIds: [7] });
       handlers.onRefreshed?.({ index: 0, accountId: 7, modelCount: 0, provider: 'codex' });
-      handlers.onDone?.({ imported: 1, updated: 0, skipped: 0, failed: 0 });
+      handlers.onDone?.({ imported: 1, updated: 0, skipped: 0, parseFailed: 0, refreshFailed: 0 });
     });
 
     let root!: WebTestRenderer;
@@ -1276,7 +1276,7 @@ describe('OAuthManagement page', () => {
         vi.advanceTimersByTime(300);
       });
       await flushMicrotasks();
-      expect(collectText(root.root)).toContain('新增 1 个');
+      expect(collectText(root.root)).toContain('成功入库 1 个');
       expect(collectText(root.root)).not.toContain('导入 OAuth 连接 JSON');
       expect(apiMock.getOAuthConnections).toHaveBeenCalledTimes(2);
     } finally {
@@ -1329,7 +1329,7 @@ describe('OAuthManagement page', () => {
         handlers.onCheckpoint?.({ upsertedAccountIds: [7, 9], pendingRefreshIds: [7, 9] });
         handlers.onRefreshed?.({ index: 0, accountId: 7, modelCount: 0, provider: 'codex' });
         handlers.onRefreshed?.({ index: 1, accountId: 9, modelCount: 0, provider: 'codex' });
-        handlers.onDone?.({ imported: 2, updated: 0, skipped: 1, failed: 0 });
+        handlers.onDone?.({ imported: 2, updated: 0, skipped: 1, parseFailed: 0, refreshFailed: 0 });
       });
 
     const fileA = {
@@ -1413,7 +1413,7 @@ describe('OAuthManagement page', () => {
         vi.advanceTimersByTime(300);
       });
       await flushMicrotasks();
-      expect(collectText(root.root)).toContain('新增 2 个');
+      expect(collectText(root.root)).toContain('成功入库 2 个');
       expect(collectText(root.root)).not.toContain('导入 OAuth 连接 JSON');
       expect(apiMock.getOAuthConnections).toHaveBeenCalledTimes(2);
     } finally {
