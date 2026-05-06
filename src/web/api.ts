@@ -172,16 +172,32 @@ async function streamSse(
   handlers: {
     onLog?: (entry: any) => void;
     onDone?: (payload: any) => void;
+    onEvent?: (eventName: string, payload: any) => void;
     signal?: AbortSignal;
   },
+  options?: {
+    method?: string;
+    body?: string;
+    headers?: Record<string, string>;
+    timeoutMs?: number;
+  },
 ) {
+  const {
+    method = "GET",
+    body,
+    headers: extraHeaders,
+    timeoutMs = 120_000,
+  } = options ?? {};
+
   const response = await fetchAuthenticatedResponse(url, {
-    method: "GET",
+    method,
+    ...(body != null ? { body } : {}),
     signal: handlers.signal,
     headers: {
       Accept: "text/event-stream",
+      ...extraHeaders,
     },
-    timeoutMs: 120_000,
+    timeoutMs,
   });
 
   if (!response.ok) {
@@ -225,6 +241,8 @@ async function streamSse(
         handlers.onLog?.(payload);
       } else if (eventName === "done") {
         handlers.onDone?.(payload);
+      } else {
+        handlers.onEvent?.(eventName, payload);
       }
     }
   };
@@ -1194,6 +1212,45 @@ export const api = {
       method: "POST",
       body: JSON.stringify(Array.isArray(data.items) ? data : { data }),
     }) as Promise<OAuthImportResponse>,
+  importOAuthConnectionsStream: (
+    data: Record<string, unknown>,
+    handlers: {
+      onItem?: (item: any) => void;
+      onCheckpoint?: (data: any) => void;
+      onRefreshed?: (data: any) => void;
+      onError?: (data: any) => void;
+      onDone?: (data: any) => void;
+      signal?: AbortSignal;
+    },
+  ) =>
+    streamSse(
+      "/api/oauth/import/stream",
+      {
+        onEvent: (eventName, payload) => {
+          switch (eventName) {
+            case "item":
+              handlers.onItem?.(payload);
+              break;
+            case "checkpoint":
+              handlers.onCheckpoint?.(payload);
+              break;
+            case "refreshed":
+              handlers.onRefreshed?.(payload);
+              break;
+            case "error":
+              handlers.onError?.(payload);
+              break;
+          }
+        },
+        onDone: handlers.onDone,
+        signal: handlers.signal,
+      },
+      {
+        method: "POST",
+        body: JSON.stringify(Array.isArray(data.items) ? data : { data }),
+        timeoutMs: 300_000,
+      },
+    ),
   createOAuthRouteUnit: (data: {
     accountIds: number[];
     name: string;
