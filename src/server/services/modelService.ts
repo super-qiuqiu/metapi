@@ -853,9 +853,18 @@ export async function persistModelAvailabilityBatch(input: {
     antigravity: 'Antigravity OAuth 健康探测成功',
   };
 
+  // Batch-fetch account rows for all items so we can update each account's
+  // own extraConfig (not just the discovery representative's).
+  const uniqueAccountIds = [...new Set(items.map((item) => item.accountId))];
+  const accountRows = await db.select().from(schema.accounts)
+    .where(inArray(schema.accounts.id, uniqueAccountIds))
+    .all();
+  const accountById = new Map(accountRows.map((a) => [a.id, a]));
+
   for (const item of items) {
+    const ownAccount = accountById.get(item.accountId) || item.discoveryAccount;
     await updateOauthModelDiscoveryState({
-      account: item.discoveryAccount,
+      account: ownAccount,
       checkedAt: item.checkedAt,
       status: 'healthy',
       lastDiscoveredModels: item.models,
