@@ -700,6 +700,8 @@ export default function OAuthManagement() {
   const [importDrafts, setImportDrafts] = useState<OAuthImportDraft[]>([]);
   const [importDragOver, setImportDragOver] = useState(false);
   const [importing, setImporting] = useState(false);
+  const [importPhase, setImportPhase] = useState<'idle' | 'upserting' | 'refreshing'>('idle');
+  const [importProgress, setImportProgress] = useState({ current: 0, total: 0 });
   const [importCustomProxyEnabled, setImportCustomProxyEnabled] = useState(false);
   const [importSystemProxyEnabled, setImportSystemProxyEnabled] = useState(false);
   const [importProxyUrl, setImportProxyUrl] = useState('');
@@ -1455,11 +1457,15 @@ export default function OAuthManagement() {
       return;
     }
 
+    const validItems = importPreviewSummary.items.filter(item => item.valid && item.parsedData);
+    const totalItems = validItems.length;
+
     setImporting(true);
+    setImportPhase('upserting');
+    setImportProgress({ current: 0, total: totalItems });
+
     try {
-      const parsedItems = importPreviewSummary.items
-        .filter((item) => item.valid && item.parsedData)
-        .map((item) => item.parsedData as Record<string, unknown>);
+      const parsedItems = validItems.map(item => item.parsedData as Record<string, unknown>);
       const importProxySettings = importSystemProxyEnabled && !importCustomProxyEnabled
         ? { useSystemProxy: true as const }
         : resolveProxySettingsPayload({
@@ -1467,32 +1473,75 @@ export default function OAuthManagement() {
           systemEnabled: importSystemProxyEnabled,
           proxyValue: importProxyUrl,
         });
-      const result = parsedItems.length === 1
-        && !('proxyUrl' in importProxySettings)
-        && !('useSystemProxy' in importProxySettings)
-        ? await api.importOAuthConnections(parsedItems[0]!)
-        : await api.importOAuthConnections({
-          items: parsedItems,
-          ...importProxySettings,
-        });
+
+      let imported = 0, updated = 0, skipped = 0, failed = 0;
+
+      // 先尝试 SSE 流式导入
+      try {
+        await api.importOAuthConnectionsStream(
+          { items: parsedItems, ...importProxySettings },
+          {
+            onItem: (item) => {
+              if (item.status === 'imported') imported++;
+              else if (item.status === 'updated') updated++;
+              else if (item.status === 'failed') failed++;
+              setImportProgress(prev => ({ ...prev, current: prev.current + 1 }));
+            },
+            onCheckpoint: () => {
+              setImportPhase('refreshing');
+              setImportProgress({ current: 0, total: totalItems });
+            },
+            onRefreshed: () => {
+              setImportProgress(prev => ({ ...prev, current: prev.current + 1 }));
+            },
+            onError: () => {
+              failed++;
+            },
+            onDone: (data) => {
+              imported = data.imported;
+              updated = data.updated;
+              skipped = data.skipped;
+              failed = data.failed;
+            },
+          },
+        );
+      } catch (streamError: any) {
+        // 降级：如果 SSE 失败（旧版后端），回退到同步接口
+        const msg = streamError?.message || '';
+        if (msg.includes('404') || msg.includes('Not Found') || msg.includes('Failed to fetch')) {
+          setImportPhase('upserting');
+          const fallbackResult = parsedItems.length === 1
+            && !('proxyUrl' in importProxySettings)
+            && !('useSystemProxy' in importProxySettings)
+            ? await api.importOAuthConnections(parsedItems[0]!)
+            : await api.importOAuthConnections({
+              items: parsedItems,
+              ...importProxySettings,
+            });
+          imported = fallbackResult.imported;
+          updated = fallbackResult.updated;
+          skipped = fallbackResult.skipped;
+          failed = fallbackResult.failed;
+        } else {
+          throw streamError;
+        }
+      }
 
       await loadConnections();
+
       const parts: string[] = [];
-      if (result.imported > 0) parts.push(`新增 ${result.imported} 个`);
-      if (result.updated > 0) parts.push(`更新 ${result.updated} 个`);
-      if (result.skipped > 0) parts.push(`跳过 ${result.skipped} 个`);
-      if (result.failed > 0) parts.push(`失败 ${result.failed} 个`);
+      if (imported > 0) parts.push(`新增 ${imported} 个`);
+      if (updated > 0) parts.push(`更新 ${updated} 个`);
+      if (skipped > 0) parts.push(`跳过 ${skipped} 个`);
+      if (failed > 0) parts.push(`失败 ${failed} 个`);
       const importMessage = parts.length > 0
         ? parts.join('，')
         : '没有需要导入的连接';
-      if (result.failed > 0) {
+      if (failed > 0) {
         toast.info(importMessage);
-      } else {
-        toast.success(importMessage);
-      }
-      if (result.failed > 0) {
         setSessionInfo(importMessage);
       } else {
+        toast.success(importMessage);
         setSessionSuccess(importMessage);
       }
       closeImportModal();
@@ -1502,6 +1551,8 @@ export default function OAuthManagement() {
       setSessionError(message);
     } finally {
       setImporting(false);
+      setImportPhase('idle');
+      setImportProgress({ current: 0, total: 0 });
     }
   };
 
@@ -2467,6 +2518,22 @@ export default function OAuthManagement() {
             <button type="button" className="btn btn-primary" onClick={handleImport} disabled={importing || !importPreviewSummary?.canImport}>
               {importing ? '添加中...' : '添加'}
             </button>
+            {importing && importPhase !== 'idle' && (
+              <div style={{ marginTop: 8, width: '100%' }}>
+                <div style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 4 }}>
+                  {importPhase === 'upserting' && `正在导入 ${importProgress.current}/${importProgress.total}`}
+                  {importPhase === 'refreshing' && `正在刷新模型 ${importProgress.current}/${importProgress.total}`}
+                </div>
+                <div style={{ height: 4, background: 'var(--bg-tertiary)', borderRadius: 2, overflow: 'hidden' }}>
+                  <div style={{
+                    height: '100%',
+                    width: `${importProgress.total > 0 ? (importProgress.current / importProgress.total * 100) : 0}%`,
+                    background: 'var(--accent-primary)',
+                    transition: 'width 0.2s ease',
+                  }} />
+                </div>
+              </div>
+            )}
           </>
         )}
       >
