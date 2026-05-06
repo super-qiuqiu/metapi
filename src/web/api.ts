@@ -1213,6 +1213,34 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ accountIds }),
     }),
+  exportOAuthConnectionsBatch: (accountIds: number[]) =>
+    request('/api/oauth/connections/export', {
+      method: 'POST',
+      body: JSON.stringify({ accountIds }),
+    }) as Promise<{
+      items: Array<{
+        type: string;
+        access_token: string;
+        refresh_token?: string;
+        id_token?: string;
+        email?: string;
+        account_id?: string;
+        account_key?: string;
+        expired?: number;
+        disabled?: boolean;
+        last_refresh?: string;
+        _meta: {
+          accountId: number;
+          siteName: string;
+          projectId?: string;
+          proxyUrl?: string;
+          useSystemProxy?: boolean;
+          planType?: string;
+        };
+      }>;
+      exported: number;
+      failed: number;
+    }>,
   importOAuthConnections: (data: Record<string, unknown>) =>
     request("/api/oauth/import", {
       method: "POST",

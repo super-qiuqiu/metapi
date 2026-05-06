@@ -1491,4 +1491,79 @@ export async function refreshCodexOauthAccessToken(accountId: number) {
   return refreshOauthAccessToken(accountId);
 }
 
+export type ExportedOauthConnection = {
+  type: string;
+  access_token: string;
+  refresh_token?: string;
+  id_token?: string;
+  email?: string;
+  account_id?: string;
+  account_key?: string;
+  expired?: number;
+  disabled?: boolean;
+  last_refresh?: string;
+  _meta: {
+    accountId: number;
+    siteName: string;
+    projectId?: string;
+    proxyUrl?: string;
+    useSystemProxy?: boolean;
+    planType?: string;
+  };
+};
+
+export async function exportOauthConnectionsBatch(accountIds: number[]) {
+  if (accountIds.length <= 0) {
+    return { items: [] as ExportedOauthConnection[], exported: 0, failed: 0 };
+  }
+
+  const rows = await db.select().from(schema.accounts)
+    .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
+    .where(inArray(schema.accounts.id, accountIds))
+    .all();
+
+  const items: ExportedOauthConnection[] = [];
+  let failed = 0;
+
+  for (const row of rows) {
+    const oauth = getOauthInfoFromAccount(row.accounts);
+    if (!oauth) {
+      failed += 1;
+      continue;
+    }
+
+    const proxyUrl = getProxyUrlFromExtraConfig(row.accounts.extraConfig);
+    const useSystemProxy = getUseSystemProxyFromExtraConfig(row.accounts.extraConfig);
+
+    items.push({
+      type: oauth.provider,
+      access_token: row.accounts.accessToken || '',
+      refresh_token: oauth.refreshToken || undefined,
+      id_token: oauth.idToken || undefined,
+      email: oauth.email || undefined,
+      account_id: oauth.accountId || oauth.accountKey || undefined,
+      account_key: oauth.accountKey || oauth.accountId || undefined,
+      expired: oauth.tokenExpiresAt || undefined,
+      disabled: row.accounts.status !== 'active' ? true : undefined,
+      last_refresh: oauth.tokenExpiresAt
+        ? new Date(oauth.tokenExpiresAt).toISOString()
+        : undefined,
+      _meta: {
+        accountId: row.accounts.id,
+        siteName: row.sites.name,
+        projectId: oauth.projectId || undefined,
+        proxyUrl: proxyUrl || undefined,
+        useSystemProxy: useSystemProxy || undefined,
+        planType: oauth.planType || undefined,
+      },
+    });
+  }
+
+  return {
+    items,
+    exported: items.length,
+    failed,
+  };
+}
+
 export type { OAuthProviderMetadata };

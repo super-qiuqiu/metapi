@@ -5823,6 +5823,42 @@ textarea {
     min-width: 0;
   }
 
+  .oauth-export-modal-body {
+    padding: 4px 0;
+  }
+
+  .oauth-export-modal-body p {
+    margin: 0 0 16px;
+    color: var(--color-text-secondary);
+    font-size: 14px;
+  }
+
+  .oauth-export-option {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    margin-bottom: 8px;
+    background: var(--color-bg-secondary);
+  }
+
+  .oauth-export-option strong {
+    font-size: 14px;
+  }
+
+  .oauth-export-option span {
+    font-size: 12px;
+    color: var(--color-text-tertiary);
+  }
+
+  .oauth-export-modal-footer {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+  }
+
   /* --- Topbar --- */
   .topbar {
     padding: 0 12px;

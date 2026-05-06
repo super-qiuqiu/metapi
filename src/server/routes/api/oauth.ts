@@ -5,6 +5,7 @@ import {
   getOauthProviderDefaults,
   deleteOauthConnection,
   deleteOauthConnectionsBatch,
+  exportOauthConnectionsBatch,
   importOauthConnectionsFromNativeJson,
   getOauthSessionStatus,
   handleOauthCallback,
@@ -390,6 +391,22 @@ export async function oauthRoutes(app: FastifyInstance) {
         return reply.code(400).send({ message: 'accountIds must contain at most 100 items' });
       }
       return await deleteOauthConnectionsBatch(accountIds);
+    },
+  );
+
+  app.post<{ Body: unknown }>(
+    '/api/oauth/connections/export',
+    { preHandler: [limitOauthConnectionRead] },
+    async (request, reply) => {
+      const body = request.body as Record<string, unknown> | null;
+      const accountIds = Array.isArray(body?.accountIds) ? (body as any).accountIds.filter((id: any) => Number.isFinite(id) && id > 0) : [];
+      if (accountIds.length === 0) {
+        return reply.code(400).send({ message: 'accountIds is required' });
+      }
+      if (accountIds.length > 200) {
+        return reply.code(400).send({ message: 'accountIds must contain at most 200 items' });
+      }
+      return await exportOauthConnectionsBatch(accountIds);
     },
   );
 

@@ -147,6 +147,21 @@ function asTrimmedString(value: string | null | undefined): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
+function triggerBrowserDownload(blob: Blob, filename: string): void {
+  if (typeof window === 'undefined' || typeof document === 'undefined') return;
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.style.display = 'none';
+  document.body.appendChild(anchor);
+  anchor.click();
+  requestAnimationFrame(() => {
+    document.body.removeChild(anchor);
+    URL.revokeObjectURL(url);
+  });
+}
+
 function normalizeOauthMessage(value: string | null | undefined): string {
   const text = asTrimmedString(value);
   if (!text) return '';
@@ -731,6 +746,9 @@ export default function OAuthManagement() {
     name: '',
     strategy: 'round_robin',
   });
+  const [exportModeModal, setExportModeModal] = useState<{
+    open: boolean;
+  }>({ open: false });
 
   const setSessionMessage = useCallback((
     message: string,
@@ -1305,6 +1323,92 @@ export default function OAuthManagement() {
     } finally {
       setActionLoadingKey('');
     }
+  };
+
+  const handleExportSingle = async (item: { type: string; access_token: string; email?: string; account_key?: string; account_id?: string; _meta: { accountId: number; siteName: string } }) => {
+    const name = item.email || item.account_key || item.account_id || `${item.type}-${item._meta.accountId}`;
+    const blob = new Blob([JSON.stringify(item, null, 2)], { type: 'application/json' });
+    triggerBrowserDownload(blob, `${name}.json`);
+  };
+
+  const handleExportSelectedAsZip = async () => {
+    setExportModeModal({ open: false });
+    if (selectedConnectionIds.length === 0) return;
+    setActionLoadingKey('export:selected');
+    try {
+      const result = await api.exportOAuthConnectionsBatch(selectedConnectionIds);
+      if (result.items.length <= 0) {
+        setSessionError('没有可导出的连接');
+        return;
+      }
+      const { zipSync } = await import('fflate');
+      const zipData: Record<string, Uint8Array> = {};
+      for (const item of result.items) {
+        const name = item.email || item.account_key || item.account_id || `${item.type}-${item._meta.accountId}`;
+        const safeName = name.replace(/[/\\?%*:|"<>]/g, '_');
+        const jsonStr = JSON.stringify(item, null, 2);
+        zipData[`${safeName}.json`] = new TextEncoder().encode(jsonStr);
+      }
+      const zipped = zipSync(zipData);
+      const blob = new Blob([zipped.buffer as ArrayBuffer], { type: 'application/zip' });
+      const timestamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
+      triggerBrowserDownload(blob, `oauth-export-${timestamp}.zip`);
+      if (result.failed > 0) {
+        setSessionInfo(`已导出 ${result.exported} 个连接（${result.failed} 个无法导出）`);
+      } else {
+        setSessionSuccess(`已导出 ${result.exported} 个 OAuth 连接为 ZIP`);
+      }
+    } catch (error: any) {
+      setSessionError(error?.message || '导出失败');
+    } finally {
+      setActionLoadingKey('');
+    }
+  };
+
+  const handleExportSelectedIndividual = async () => {
+    setExportModeModal({ open: false });
+    if (selectedConnectionIds.length === 0) return;
+    setActionLoadingKey('export:selected');
+    try {
+      const result = await api.exportOAuthConnectionsBatch(selectedConnectionIds);
+      if (result.items.length <= 0) {
+        setSessionError('没有可导出的连接');
+        return;
+      }
+      for (const item of result.items) {
+        await handleExportSingle(item);
+      }
+      if (result.failed > 0) {
+        setSessionInfo(`已逐个导出 ${result.exported} 个连接（${result.failed} 个无法导出）`);
+      } else {
+        setSessionSuccess(`已逐个导出 ${result.exported} 个 OAuth 连接`);
+      }
+    } catch (error: any) {
+      setSessionError(error?.message || '导出失败');
+    } finally {
+      setActionLoadingKey('');
+    }
+  };
+
+  const handleExportSelected = () => {
+    if (selectedConnectionIds.length === 0) return;
+    if (selectedConnectionIds.length === 1) {
+      setActionLoadingKey('export:selected');
+      api.exportOAuthConnectionsBatch(selectedConnectionIds).then((result) => {
+        if (result.items.length > 0) {
+          handleExportSingle(result.items[0]!);
+          setSessionSuccess('已导出 1 个 OAuth 连接');
+        } else {
+          setSessionError('该连接无法导出');
+        }
+      }).catch((error: any) => {
+        setSessionError(error?.message || '导出失败');
+      }).finally(() => {
+        setActionLoadingKey('');
+      });
+      return;
+    }
+    setExportModeModal({ open: true });
   };
 
   const applyLoadedModelsModal = useCallback((connection: OAuthConnectionInfo, result: any) => {
@@ -2219,6 +2323,14 @@ export default function OAuthManagement() {
             >
               {actionLoadingKey === 'quota:selected' ? '刷新中...' : '批量刷新额度'}
             </button>
+            <button
+              type="button"
+              className="btn btn-ghost oauth-outline-button"
+              onClick={handleExportSelected}
+              disabled={actionLoadingKey === 'export:selected'}
+            >
+              {actionLoadingKey === 'export:selected' ? '导出中...' : '导出 JSON'}
+            </button>
             {canMergeSelectedIntoRouteUnit ? (
               <button
                 type="button"
@@ -2726,6 +2838,54 @@ export default function OAuthManagement() {
             ]}
             placeholder="选择路由池策略"
           />
+        </div>
+      </CenteredModal>
+
+      <CenteredModal
+        open={exportModeModal.open}
+        onClose={() => setExportModeModal({ open: false })}
+        title="导出 JSON"
+        maxWidth={420}
+        closeOnBackdrop
+        closeOnEscape
+        footer={
+          <div className="oauth-export-modal-footer">
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={handleExportSelectedAsZip}
+              disabled={actionLoadingKey === 'export:selected'}
+            >
+              打包为 ZIP 下载
+            </button>
+            <button
+              type="button"
+              className="btn btn-ghost oauth-outline-button"
+              onClick={handleExportSelectedIndividual}
+              disabled={actionLoadingKey === 'export:selected'}
+            >
+              逐个下载 JSON
+            </button>
+            <button
+              type="button"
+              className="btn btn-link"
+              onClick={() => setExportModeModal({ open: false })}
+            >
+              取消
+            </button>
+          </div>
+        }
+      >
+        <div className="oauth-export-modal-body">
+          <p>已选择 {selectedConnectionIds.length} 个连接，请选择导出方式：</p>
+          <div className="oauth-export-option">
+            <strong>打包为 ZIP</strong>
+            <span>所有连接合并为一个 .zip 文件，每个连接一个独立 JSON</span>
+          </div>
+          <div className="oauth-export-option">
+            <strong>逐个下载</strong>
+            <span>每个连接单独下载一个 JSON 文件（浏览器可能拦截多个下载）</span>
+          </div>
         </div>
       </CenteredModal>
     </div>
