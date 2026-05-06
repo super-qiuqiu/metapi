@@ -3,7 +3,7 @@
  *
  * Phase 0: 预缓存 ensureOauthSite（按 provider 去重，每种调用一次）
  * Phase 1: 串行 upsert（复用 normalize + fingerprint 去重，使用预缓存 site）
- * Phase 2: 按 (provider, projectId) 分组并发 refresh（discoverOauthModels + persistModelAvailability）
+ * Phase 2: 按 (provider, projectId) 分组并发 refresh（discoverOauthModels + persistModelAvailabilityBatch）
  * Phase 3: rebuildTokenRoutesFromAvailability（只执行 1 次）
  */
 
@@ -18,7 +18,7 @@ import {
 } from './service.js';
 import {
   discoverOauthModels,
-  persistModelAvailability,
+  persistModelAvailabilityBatch,
   rebuildTokenRoutesFromAvailability,
   type OauthDiscoveryResult,
   type ModelRefreshAccountNotFoundResult,
@@ -359,14 +359,13 @@ async function refreshGroup(input: {
     return { refreshedCount, failedCount };
   }
 
-  // discover 成功 — 组内所有账号逐个 persistModelAvailability（共享同一份模型列表）
+  // discover 成功 — 组内所有账号批量 persistModelAvailability（共享同一份模型列表）
   const models = discoveryResult.models;
-  for (const account of group.accounts) {
-    if (signal?.aborted) break;
 
-    const idx = globalIndex.value++;
-    try {
-      await persistModelAvailability({
+  // 批量写入 modelAvailability，替代逐条调用
+  try {
+    await persistModelAvailabilityBatch({
+      items: group.accounts.map((account) => ({
         accountId: account.accountId,
         models,
         discoveryAccount: discoveryResult.discoveryAccount,
@@ -376,8 +375,12 @@ async function refreshGroup(input: {
         previousModelAvailability: discoveryResult.previousModelAvailability,
         previousAccountTokens: discoveryResult.previousAccountTokens,
         previousTokenModelAvailability: discoveryResult.previousTokenModelAvailability,
-      });
+      })),
+    });
 
+    // 批量写入成功，逐条推送 onRefreshed 回调
+    for (const account of group.accounts) {
+      const idx = globalIndex.value++;
       refreshedCount++;
       callbacks.onRefreshed({
         index: idx,
@@ -385,13 +388,17 @@ async function refreshGroup(input: {
         modelCount: models.length,
         provider: account.provider,
       });
-    } catch (error: any) {
+    }
+  } catch (error: any) {
+    // 批量写入失败，所有账号标记失败
+    for (const account of group.accounts) {
+      const idx = globalIndex.value++;
       failedCount++;
       callbacks.onError({
         index: idx,
         accountId: account.accountId,
         provider: account.provider,
-        message: error?.message || 'persist model availability failed',
+        message: error?.message || 'persist model availability batch failed',
       });
     }
   }

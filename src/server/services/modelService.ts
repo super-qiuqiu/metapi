@@ -1,4 +1,4 @@
-import { and, eq } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import { db, schema } from '../db/index.js';
 import { getInsertedRowId } from '../db/insertHelpers.js';
 import { getAdapter } from './platforms/index.js';
@@ -758,6 +758,115 @@ export async function persistModelAvailability(input: {
     discoveredByCredential: true,
     discoveredApiToken: false,
   });
+}
+
+// ---------------------------------------------------------------------------
+// persistModelAvailabilityBatch — batch version for import stream Phase 2
+// Replaces multiple sequential persistModelAvailability calls within a group
+// sharing the same discovery result.
+// ---------------------------------------------------------------------------
+
+export async function persistModelAvailabilityBatch(input: {
+  items: Array<{
+    accountId: number;
+    models: string[];
+    discoveryAccount: ModelDiscoveryAccountRow;
+    checkedAt: string;
+    latencyMs: number;
+    provider: string;
+    previousModelAvailability: any[];
+    previousAccountTokens: any[];
+    previousTokenModelAvailability: any[];
+    allowInactive?: boolean;
+  }>;
+}): Promise<void> {
+  const { items } = input;
+  if (items.length === 0) return;
+
+  const accountIds = items.map((item) => item.accountId);
+
+  // 1. Batch delete non-manual modelAvailability rows for all accounts
+  await db.delete(schema.modelAvailability)
+    .where(and(
+      inArray(schema.modelAvailability.accountId, accountIds),
+      eq(schema.modelAvailability.isManual, false),
+    ))
+    .run();
+
+  // 2. Batch delete tokenModelAvailability for all accounts' tokens
+  const accountTokenRows = await db.select({ id: schema.accountTokens.id, accountId: schema.accountTokens.accountId })
+    .from(schema.accountTokens)
+    .where(inArray(schema.accountTokens.accountId, accountIds))
+    .all();
+
+  const tokenIdsByAccount = new Map<number, number[]>();
+  for (const row of accountTokenRows) {
+    if (!tokenIdsByAccount.has(row.accountId)) tokenIdsByAccount.set(row.accountId, []);
+    tokenIdsByAccount.get(row.accountId)!.push(row.id);
+  }
+
+  if (accountTokenRows.length > 0) {
+    const allTokenIds = accountTokenRows.map((r) => r.id);
+    await db.delete(schema.tokenModelAvailability)
+      .where(inArray(schema.tokenModelAvailability.tokenId, allTokenIds))
+      .run();
+  }
+
+  // 3. Batch query manual model names for all accounts
+  const manualRows = await db.select({ accountId: schema.modelAvailability.accountId, modelName: schema.modelAvailability.modelName })
+    .from(schema.modelAvailability)
+    .where(and(
+      inArray(schema.modelAvailability.accountId, accountIds),
+      eq(schema.modelAvailability.isManual, true),
+    ))
+    .all();
+
+  const manualByAccount = new Map<number, Set<string>>();
+  for (const row of manualRows) {
+    if (!manualByAccount.has(row.accountId)) manualByAccount.set(row.accountId, new Set());
+    manualByAccount.get(row.accountId)!.add(row.modelName.toLowerCase());
+  }
+
+  // 4. Collect all new model rows across all items, batch insert
+  const allValues = items.flatMap((item) => {
+    const manualNames = manualByAccount.get(item.accountId) || new Set<string>();
+    const newModels = item.models.filter((m) => !manualNames.has(m.toLowerCase()));
+    return newModels.map((modelName) => ({
+      accountId: item.accountId,
+      modelName,
+      available: true as boolean,
+      latencyMs: item.latencyMs,
+      checkedAt: item.checkedAt,
+    }));
+  });
+
+  if (allValues.length > 0) {
+    await db.insert(schema.modelAvailability).values(allValues).run();
+  }
+
+  // 5. Per-account: updateOauthModelDiscoveryState + setAccountRuntimeHealth
+  //    (these involve extraConfig JSON operations, must be per-account)
+  const healthReasonMap: Record<string, string> = {
+    codex: 'Codex 云端模型探测成功',
+    claude: 'Claude OAuth 模型探测成功',
+    'gemini-cli': 'Gemini CLI OAuth 健康探测成功',
+    antigravity: 'Antigravity OAuth 健康探测成功',
+  };
+
+  for (const item of items) {
+    await updateOauthModelDiscoveryState({
+      account: item.discoveryAccount,
+      checkedAt: item.checkedAt,
+      status: 'healthy',
+      lastDiscoveredModels: item.models,
+    });
+    await setAccountRuntimeHealth(item.accountId, {
+      state: 'healthy',
+      reason: healthReasonMap[item.provider] || 'OAuth 模型探测成功',
+      source: 'model-discovery',
+      checkedAt: item.checkedAt,
+    });
+  }
 }
 
 async function persistModelAvailabilityFailure(input: {
