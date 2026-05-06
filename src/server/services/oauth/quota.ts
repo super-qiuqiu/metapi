@@ -12,6 +12,7 @@ import {
 } from './oauthAccount.js';
 import { resolveOauthAccountProxyUrl } from './requestProxy.js';
 import { setAccountRuntimeHealth } from '../accountHealthService.js';
+import { updateOauthModelDiscoveryState } from '../modelService.js';
 import type { OauthQuotaSnapshot, OauthQuotaWindowSnapshot, AntigravityQuotaGroupSnapshot } from './quotaTypes.js';
 import {
   ANTIGRAVITY_UPSTREAM_BASE_URL,
@@ -1292,7 +1293,8 @@ export async function refreshOauthQuotaSnapshot(accountId: number): Promise<Oaut
     });
   }
 
-  // Post-check: if snapshot indicates token failure, mark account unhealthy.
+  // Post-check: if snapshot indicates token failure, mark account unhealthy
+  // AND mark model discovery as abnormal (token dead = models cannot be fetched).
   // This catches both thrown-exception paths (catch blocks above) AND
   // non-throwing paths (e.g. probeCodexQuotaSnapshot returns buildQuotaErrorSnapshot
   // on 401 without throwing, so the catch block is never reached).
@@ -1304,6 +1306,16 @@ export async function refreshOauthQuotaSnapshot(accountId: number): Promise<Oaut
         reason: errorText,
         source: 'quota-refresh',
         checkedAt: snapshot.lastSyncAt || new Date().toISOString(),
+      }).catch(() => {});
+      // Token is irrecoverably dead — models cannot be fetched either.
+      // Update modelDiscoveryStatus so the frontend shows "获取失败"
+      // instead of stale "同步正常".
+      const checkedAt = snapshot.lastSyncAt || new Date().toISOString();
+      await updateOauthModelDiscoveryState({
+        account,
+        checkedAt,
+        status: 'abnormal',
+        lastModelSyncError: errorText,
       }).catch(() => {});
     }
   }
