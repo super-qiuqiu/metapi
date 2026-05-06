@@ -1237,78 +1237,78 @@ export async function refreshOauthQuotaSnapshot(accountId: number): Promise<Oaut
   if (!oauth) {
     throw new Error('account is not managed by oauth');
   }
+
+  let snapshot: OauthQuotaSnapshot;
+
   if (oauth.provider === 'codex') {
     const syncedAt = new Date().toISOString();
     try {
       // Prefer official wham/usage API for accurate quota data
       const whamSnapshot = await fetchCodexWhamUsage({ account, oauth, syncedAt });
       if (whamSnapshot) {
-        return persistQuotaSnapshot(accountId, whamSnapshot);
+        snapshot = await persistQuotaSnapshot(accountId, whamSnapshot);
+      } else {
+        // Fallback to header-inferred probe if wham/usage is unavailable
+        snapshot = await persistQuotaSnapshot(accountId, await probeCodexQuotaSnapshot({
+          account,
+          oauth,
+          syncedAt,
+        }));
       }
-
-      // Fallback to header-inferred probe if wham/usage is unavailable
-      const snapshot = await probeCodexQuotaSnapshot({
-        account,
-        oauth,
-        syncedAt,
-      });
-      return persistQuotaSnapshot(accountId, snapshot);
     } catch (error) {
       const message = error instanceof Error
         ? (error.message || error.name)
         : String(error || 'codex quota probe failed');
-      // token 不可恢复时标记账户 unhealthy
-      if (/token_invalidated|refresh_token_reused|401/i.test(message)) {
-        void setAccountRuntimeHealth(accountId, {
-          state: 'unhealthy',
-          reason: message,
-          source: 'quota-refresh',
-          checkedAt: syncedAt,
-        });
-      }
-      return persistQuotaSnapshot(accountId, buildQuotaErrorSnapshot({
+      snapshot = await persistQuotaSnapshot(accountId, buildQuotaErrorSnapshot({
         oauth,
         message,
         syncedAt,
       }));
     }
-  }
-  if (oauth.provider === 'antigravity') {
+  } else if (oauth.provider === 'antigravity') {
     const syncedAt = new Date().toISOString();
     try {
-      const snapshot = await fetchAntigravityQuotaSnapshot({
+      snapshot = await persistQuotaSnapshot(accountId, await fetchAntigravityQuotaSnapshot({
         account,
         oauth,
         syncedAt,
-      });
-      return persistQuotaSnapshot(accountId, snapshot);
+      }));
     } catch (error) {
       const message = error instanceof Error
         ? (error.message || error.name)
         : String(error || 'antigravity quota fetch failed');
-      // token 不可恢复时标记账户 unhealthy
-      if (/token_invalidated|refresh_token_reused|401/i.test(message)) {
-        void setAccountRuntimeHealth(accountId, {
-          state: 'unhealthy',
-          reason: message,
-          source: 'quota-refresh',
-          checkedAt: syncedAt,
-        });
-      }
-      return persistQuotaSnapshot(accountId, buildQuotaErrorSnapshot({
+      snapshot = await persistQuotaSnapshot(accountId, buildQuotaErrorSnapshot({
         oauth,
         message,
         syncedAt,
       }));
     }
+  } else {
+    const baseSnapshot = buildQuotaSnapshotFromOauthInfo(oauth);
+    snapshot = await persistQuotaSnapshot(accountId, {
+      ...baseSnapshot,
+      lastSyncAt: new Date().toISOString(),
+      ...(baseSnapshot.status === 'error' ? {} : { lastError: undefined }),
+    });
   }
-  const baseSnapshot = buildQuotaSnapshotFromOauthInfo(oauth);
-  const snapshot: OauthQuotaSnapshot = {
-    ...baseSnapshot,
-    lastSyncAt: new Date().toISOString(),
-    ...(baseSnapshot.status === 'error' ? {} : { lastError: undefined }),
-  };
-  return persistQuotaSnapshot(accountId, snapshot);
+
+  // Post-check: if snapshot indicates token failure, mark account unhealthy.
+  // This catches both thrown-exception paths (catch blocks above) AND
+  // non-throwing paths (e.g. probeCodexQuotaSnapshot returns buildQuotaErrorSnapshot
+  // on 401 without throwing, so the catch block is never reached).
+  if (snapshot.status === 'error') {
+    const errorText = snapshot.lastError || snapshot.providerMessage || '';
+    if (/token_invalidated|refresh_token_reused|http\s*401|status.*401/i.test(errorText)) {
+      await setAccountRuntimeHealth(accountId, {
+        state: 'unhealthy',
+        reason: errorText,
+        source: 'quota-refresh',
+        checkedAt: snapshot.lastSyncAt || new Date().toISOString(),
+      }).catch(() => {});
+    }
+  }
+
+  return snapshot;
 }
 
 export async function recordOauthQuotaResetHint(input: {

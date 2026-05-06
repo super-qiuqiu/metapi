@@ -396,7 +396,7 @@ async function refreshGroup(input: {
             message: errorMessage || 'model discovery returned no models',
             phase: 'refresh',
           });
-          void markModelDiscoveryFailed(account.accountId, errorMessage);
+          await markModelDiscoveryFailed(account.accountId, errorMessage);
         }
       } catch (innerError: any) {
         const idx = globalIndex.value++;
@@ -409,7 +409,7 @@ async function refreshGroup(input: {
           message: innerMsg,
           phase: 'refresh',
         });
-        void markModelDiscoveryFailed(account.accountId, innerMsg);
+        await markModelDiscoveryFailed(account.accountId, innerMsg);
       }
     }
     return { refreshedCount, failedCount };
@@ -457,7 +457,7 @@ async function refreshGroup(input: {
             message: singleErrorMessage || 'model discovery returned no models',
             phase: 'refresh',
           });
-          void markModelDiscoveryFailed(account.accountId, singleErrorMessage);
+          await markModelDiscoveryFailed(account.accountId, singleErrorMessage);
         }
       } catch (innerError: any) {
         const idx = globalIndex.value++;
@@ -470,7 +470,7 @@ async function refreshGroup(input: {
           message: innerMsg,
           phase: 'refresh',
         });
-        void markModelDiscoveryFailed(account.accountId, innerMsg);
+        await markModelDiscoveryFailed(account.accountId, innerMsg);
       }
     }
     return { refreshedCount, failedCount };
@@ -519,7 +519,7 @@ async function refreshGroup(input: {
         message: batchErrorMsg,
         phase: 'refresh',
       });
-      void markModelDiscoveryFailed(account.accountId, batchErrorMsg);
+      await markModelDiscoveryFailed(account.accountId, batchErrorMsg);
     }
   }
 

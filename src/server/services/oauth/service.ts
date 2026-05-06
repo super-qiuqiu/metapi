@@ -1146,7 +1146,7 @@ export async function deleteOauthConnectionsBatch(accountIds: number[]) {
 
 export async function refreshOauthConnectionQuota(accountId: number) {
   const quota = await refreshOauthQuotaSnapshot(accountId);
-  return { success: true, quota };
+  return { success: quota.status !== 'error', quota };
 }
 
 export async function refreshOauthConnectionQuotaBatch(accountIds: number[]) {
