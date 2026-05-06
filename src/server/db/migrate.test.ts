@@ -19,14 +19,23 @@ function readMigrationJournalEntries(): MigrationJournalEntry[] {
   return journal.entries ?? [];
 }
 
-function applyMigrationSql(sqlite: Database.Database, sqlText: string) {
+function applyMigrationSql(sqlite: Database.Database, sqlText: string, options?: { ignoreMissingColumns?: boolean }) {
   const statements = sqlText
     .split('--> statement-breakpoint')
     .map((statement) => statement.trim())
     .filter((statement) => statement.length > 0);
 
   for (const statement of statements) {
-    sqlite.exec(statement);
+    try {
+      sqlite.exec(statement);
+    } catch (error: any) {
+      // 当 ignoreMissingColumns=true 且错误是 "no such column" 时，安全跳过
+      // 这用于模拟跳过了创建列的迁移的极端场景
+      if (options?.ignoreMissingColumns && String(error?.message || '').includes('no such column')) {
+        continue;
+      }
+      throw error;
+    }
   }
 }
 
@@ -392,7 +401,9 @@ describe('sqlite migrate bootstrap', () => {
 
     for (const entry of appliedEntries) {
       const sqlText = readFileSync(join(migrationsDir, `${entry.tag}.sql`), 'utf8');
-      applyMigrationSql(sqlite, sqlText);
+      // skipMissingColumns: 0013_oauth_multi_provider (creates oauth_provider/oauth_account_key/oauth_project_id)
+      // is in missingTags, so later migrations referencing those columns will fail silently
+      applyMigrationSql(sqlite, sqlText, { ignoreMissingColumns: true });
     }
     recordAppliedMigrations(sqlite, appliedEntries);
 
@@ -517,7 +528,9 @@ describe('sqlite migrate bootstrap', () => {
 
     for (const entry of appliedEntries) {
       const sqlText = readFileSync(join(migrationsDir, `${entry.tag}.sql`), 'utf8');
-      applyMigrationSql(sqlite, sqlText);
+      // ignoreMissingColumns: 0013_oauth_multi_provider is skipped, so later migrations
+      // referencing oauth_provider/oauth_account_key/oauth_project_id will fail silently
+      applyMigrationSql(sqlite, sqlText, { ignoreMissingColumns: true });
     }
     recordAppliedMigrations(sqlite, appliedEntries);
 

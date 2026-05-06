@@ -39,6 +39,8 @@ type SqliteMigrationRecoveryLoopInput = {
   recoverDuplicateColumnMigrationError: (error: unknown) => DuplicateColumnRecoveryResult | null;
   isSitesPlatformUrlUniqueConflictError: (error: unknown) => boolean;
   deduplicateLegacySitesForUniqueIndex: () => boolean;
+  isOauthIdentityUniqueConflictError: (error: unknown) => boolean;
+  deduplicateLegacyOauthAccountsForUniqueIndex: () => number;
   closeSqlite: () => void;
   retryBudget?: number;
 };
@@ -360,6 +362,21 @@ function isSitesPlatformUrlUniqueConflictError(error: unknown): boolean {
     === normalizeSqlForMatch('CREATE UNIQUE INDEX `sites_platform_url_unique` ON `sites` (`platform`,`url`);');
 }
 
+function isOauthIdentityUniqueConflictError(error: unknown): boolean {
+  const lowered = normalizeSchemaErrorMessage(error).toLowerCase();
+  if (!lowered.includes('unique constraint failed: accounts.oauth_provider, accounts.oauth_account_key, accounts.oauth_project_id')) {
+    return false;
+  }
+
+  const failedSqlText = extractFailedSqlFromError(error);
+  if (!failedSqlText) {
+    return true;
+  }
+
+  return normalizeSqlForMatch(failedSqlText)
+    === normalizeSqlForMatch('CREATE UNIQUE INDEX `accounts_oauth_identity_unique` ON `accounts` (`oauth_provider`,`oauth_account_key`,`oauth_project_id`);');
+}
+
 function replayMigrationStatements(sqlite: Database.Database, statements: string[]): void {
   for (const statement of statements) {
     try {
@@ -370,6 +387,18 @@ function replayMigrationStatements(sqlite: Database.Database, statements: string
       }
 
       if (isSitesPlatformUrlUniqueConflictError(error) && deduplicateLegacySitesForUniqueIndex(sqlite)) {
+        try {
+          sqlite.exec(statement);
+          continue;
+        } catch (retryError) {
+          if (isRecoverableSchemaConflictError(retryError)) {
+            continue;
+          }
+          throw retryError;
+        }
+      }
+
+      if (isOauthIdentityUniqueConflictError(error) && deduplicateLegacyOauthAccountsForUniqueIndex(sqlite) > 0) {
         try {
           sqlite.exec(statement);
           continue;
@@ -518,6 +547,18 @@ function runSqliteMigrationRecoveryLoop(input: SqliteMigrationRecoveryLoopInput)
         continue;
       }
 
+      if (input.isOauthIdentityUniqueConflictError(error)) {
+        const deduped = input.deduplicateLegacyOauthAccountsForUniqueIndex();
+        if (deduped > 0) {
+          recoveryRetries += 1;
+          if (recoveryRetries > retryBudget) {
+            input.closeSqlite();
+            throw buildSqliteMigrationRetryBudgetError(error, retryBudget);
+          }
+          continue;
+        }
+      }
+
       input.closeSqlite();
       throw error;
     }
@@ -634,6 +675,66 @@ function deduplicateLegacySitesForUniqueIndex(sqlite: Database.Database): boolea
   return siteIdMapping.size > 0;
 }
 
+function deduplicateLegacyOauthAccountsForUniqueIndex(sqlite: Database.Database): number {
+  const columns = sqlite.pragma('table_info(accounts)') as Array<{ name: string }>;
+  const hasOauthProvider = columns.some((col) => col.name === 'oauth_provider');
+  const hasOauthAccountKey = columns.some((col) => col.name === 'oauth_account_key');
+  const hasOauthProjectId = columns.some((col) => col.name === 'oauth_project_id');
+
+  if (!hasOauthProvider || !hasOauthAccountKey || !hasOauthProjectId) {
+    return 0;
+  }
+
+  const duplicates = sqlite.prepare(`
+    SELECT oauth_provider, oauth_account_key, COALESCE(oauth_project_id, '') AS pid, COUNT(*) AS cnt
+    FROM accounts
+    WHERE oauth_provider IS NOT NULL AND oauth_account_key IS NOT NULL
+    GROUP BY oauth_provider, oauth_account_key, pid
+    HAVING cnt > 1
+  `).all() as Array<{ oauth_provider: string; oauth_account_key: string; pid: string; cnt: number }>;
+
+  if (duplicates.length === 0) return 0;
+
+  let removedCount = 0;
+  for (const dup of duplicates) {
+    const projectIdCondition = dup.pid
+      ? 'oauth_project_id = ?'
+      : '(oauth_project_id IS NULL OR oauth_project_id = "")';
+
+    const args = dup.pid
+      ? [dup.oauth_provider, dup.oauth_account_key, dup.pid]
+      : [dup.oauth_provider, dup.oauth_account_key];
+
+    sqlite.prepare(`
+      DELETE FROM model_availability
+      WHERE account_id IN (
+        SELECT id FROM accounts
+        WHERE oauth_provider = ? AND oauth_account_key = ? AND ${projectIdCondition}
+          AND updated_at < (
+            SELECT MAX(updated_at) FROM accounts
+            WHERE oauth_provider = ? AND oauth_account_key = ? AND ${projectIdCondition}
+          )
+      )
+    `).run(...args, ...args);
+
+    const result = sqlite.prepare(`
+      DELETE FROM accounts
+      WHERE oauth_provider = ? AND oauth_account_key = ? AND ${projectIdCondition}
+        AND updated_at < (
+          SELECT MAX(updated_at) FROM accounts
+          WHERE oauth_provider = ? AND oauth_account_key = ? AND ${projectIdCondition}
+        )
+    `).run(...args, ...args);
+
+    removedCount += result.changes;
+  }
+
+  if (removedCount > 0) {
+    console.warn(`[db] Deduplicated ${removedCount} legacy OAuth account entries before applying accounts_oauth_identity_unique.`);
+  }
+  return removedCount;
+}
+
 export const __migrateTestUtils = {
   splitMigrationStatements,
   normalizeSqlForMatch,
@@ -647,6 +748,8 @@ export const __migrateTestUtils = {
   tryRecoverDuplicateColumnMigrationError,
   isSitesPlatformUrlUniqueConflictError,
   deduplicateLegacySitesForUniqueIndex,
+  isOauthIdentityUniqueConflictError,
+  deduplicateLegacyOauthAccountsForUniqueIndex,
   runSqliteMigrationRecoveryLoop,
   sqliteMigrationRecoveryRetryBudget: SQLITE_MIGRATION_RECOVERY_RETRY_BUDGET,
 };
@@ -698,6 +801,8 @@ export function runSqliteMigrations(): void {
     ),
     isSitesPlatformUrlUniqueConflictError,
     deduplicateLegacySitesForUniqueIndex: () => deduplicateLegacySitesForUniqueIndex(sqlite),
+    isOauthIdentityUniqueConflictError,
+    deduplicateLegacyOauthAccountsForUniqueIndex: () => deduplicateLegacyOauthAccountsForUniqueIndex(sqlite),
     closeSqlite: () => sqlite.close(),
   });
 

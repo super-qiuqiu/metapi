@@ -1477,9 +1477,14 @@ export default function OAuthManagement() {
         });
 
       await loadConnections();
-      const importMessage = result.failed > 0
-        ? `批量导入完成，成功 ${result.imported} 个，失败 ${result.failed} 个`
-        : `已添加 ${result.imported} 个 OAuth 连接`;
+      const parts: string[] = [];
+      if (result.imported > 0) parts.push(`新增 ${result.imported} 个`);
+      if (result.updated > 0) parts.push(`更新 ${result.updated} 个`);
+      if (result.skipped > 0) parts.push(`跳过 ${result.skipped} 个`);
+      if (result.failed > 0) parts.push(`失败 ${result.failed} 个`);
+      const importMessage = parts.length > 0
+        ? parts.join('，')
+        : '没有需要导入的连接';
       if (result.failed > 0) {
         toast.info(importMessage);
       } else {

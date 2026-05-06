@@ -210,8 +210,13 @@ python3 ./.trellis/scripts/task.py create "<title>" --slug <task-name>
 
 5. Commit code
    --> git add <files>
-   --> git commit -m "type(scope): description"
-       Format: feat/fix/docs/refactor/test/chore
+   --> git commit -m "type(scope): 中文描述" -m "<中文 body>"
+       Format: type(scope): description + body
+       type: feat/fix/docs/refactor/test/chore
+       规则:
+       - description 和 body 使用中文
+       - 允许出现必要英文单词（如模块名、协议名、接口名），但应尽量少
+       - scope 使用英文短词（如 routing、proxy、settings）
 
 6. Record session (one command)
    --> python3 ./.trellis/scripts/add_session.py --title "Title" --commit "hash"
@@ -379,11 +384,16 @@ python3 ./.trellis/scripts/task.py list-archive    # List archived tasks
 ### Commit Convention
 
 ```bash
-git commit -m "type(scope): description"
+git commit -m "type(scope): 中文描述" -m "<中文 body>"
 ```
 
-**Type**: feat, fix, docs, refactor, test, chore
-**Scope**: Module name (e.g., auth, api, ui)
+**格式**: `type(scope): description + body`
+**Type**: `feat`、`fix`、`docs`、`refactor`、`test`、`chore`
+**Scope**: 英文模块短词（如 `routing`、`proxy`、`settings`）
+**Description/Body 规则**:
+- 使用中文表达，避免全英文句子
+- 允许必要英文单词，但应控制数量
+- body 用条目描述变更点，优先写影响面与行为变化
 
 ### Common Commands
 

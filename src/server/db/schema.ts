@@ -78,7 +78,7 @@ export const accounts = sqliteTable('accounts', {
   statusIdx: index('accounts_status_idx').on(table.status),
   siteStatusIdx: index('accounts_site_status_idx').on(table.siteId, table.status),
   oauthProviderIdx: index('accounts_oauth_provider_idx').on(table.oauthProvider),
-  oauthIdentityIdx: index('accounts_oauth_identity_idx').on(table.oauthProvider, table.oauthAccountKey, table.oauthProjectId),
+  oauthIdentityUnique: uniqueIndex('accounts_oauth_identity_unique').on(table.oauthProvider, table.oauthAccountKey, table.oauthProjectId),
 }));
 
 export const accountTokens = sqliteTable('account_tokens', {

@@ -1278,7 +1278,7 @@ describe('OAuthManagement page', () => {
         vi.advanceTimersByTime(300);
       });
       await flushMicrotasks();
-      expect(collectText(root.root)).toContain('已添加 1 个 OAuth 连接');
+      expect(collectText(root.root)).toContain('新增 1 个');
       expect(collectText(root.root)).not.toContain('导入 OAuth 连接 JSON');
       expect(apiMock.getOAuthConnections).toHaveBeenCalledTimes(2);
     } finally {
@@ -1429,7 +1429,7 @@ describe('OAuthManagement page', () => {
         vi.advanceTimersByTime(300);
       });
       await flushMicrotasks();
-      expect(collectText(root.root)).toContain('已添加 2 个 OAuth 连接');
+      expect(collectText(root.root)).toContain('新增 2 个');
       expect(collectText(root.root)).not.toContain('导入 OAuth 连接 JSON');
       expect(apiMock.getOAuthConnections).toHaveBeenCalledTimes(2);
     } finally {

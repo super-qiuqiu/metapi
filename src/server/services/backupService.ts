@@ -5,6 +5,7 @@ import { requireInsertedRowId } from '../db/insertHelpers.js';
 import { upsertSetting } from '../db/upsertSetting.js';
 import { mergeAccountExtraConfig } from './accountExtraConfig.js';
 import { getOauthInfoFromAccount } from './oauth/oauthAccount.js';
+import { fingerprintFromAccount, fingerprintKey } from './oauth/oauthIdentityResolver.js';
 import { PLATFORM_ALIASES, detectPlatformByUrlHint } from '../../shared/platformIdentity.js';
 
 const BACKUP_VERSION = '2.1';
@@ -319,11 +320,13 @@ function buildAccountIdentityKey(input: {
   oauthAccountKey?: string | null;
   oauthProjectId?: string | null;
 }): string {
-  const oauthProvider = asString(input.oauthProvider).toLowerCase();
-  const oauthAccountKey = asString(input.oauthAccountKey);
-  const oauthProjectId = asString(input.oauthProjectId);
-  if (oauthProvider || oauthAccountKey || oauthProjectId) {
-    return `oauth::${input.siteKey}::${oauthProvider}::${oauthAccountKey}::${oauthProjectId}`;
+  const fp = fingerprintFromAccount({
+    oauthProvider: input.oauthProvider ?? null,
+    oauthAccountKey: input.oauthAccountKey ?? null,
+    oauthProjectId: input.oauthProjectId ?? null,
+  });
+  if (fp) {
+    return `oauth::${fingerprintKey(fp)}`;
   }
 
   const apiToken = asString(input.apiToken);

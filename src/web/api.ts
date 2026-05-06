@@ -733,11 +733,12 @@ export type OAuthQuotaBatchRefreshResponse = {
 export type OAuthImportResponse = {
   success: boolean;
   imported: number;
+  updated: number;
   skipped: number;
   failed: number;
   items: Array<{
     name: string;
-    status: "imported" | "skipped" | "failed";
+    status: "imported" | "updated" | "skipped" | "failed";
     accountId?: number;
     provider?: string;
     message?: string;

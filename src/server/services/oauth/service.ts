@@ -38,6 +38,8 @@ import {
 } from './codexAccount.js';
 import { resolveOauthAccountProxyUrl, resolveOauthProviderProxyUrl } from './requestProxy.js';
 import { ensureOauthIdentityBackfill } from './oauthIdentityBackfill.js';
+import { fingerprintKey } from './oauthIdentityResolver.js';
+import type { OauthFingerprint } from './oauthIdentityResolver.js';
 import { buildQuotaSnapshotFromOauthInfo, refreshOauthQuotaSnapshot } from './quota.js';
 import {
   listOauthRouteUnitsByAccountIds,
@@ -296,6 +298,7 @@ function resolveImportedNativeOauthIdentity(
     accountKey?: string;
     accountId?: string;
     planType?: string;
+    projectId?: string;
     idToken?: string;
     providerData?: Record<string, unknown>;
   };
@@ -358,8 +361,9 @@ function buildUsername(input: {
   return input.email || input.accountKey || `${input.provider}-user`;
 }
 
-async function getNextAccountSortOrder(): Promise<number> {
-  const row = await db.select({
+async function getNextAccountSortOrder(txDb?: typeof db): Promise<number> {
+  const queryDb = txDb ?? db;
+  const row = await queryDb.select({
     maxSortOrder: sql<number>`COALESCE(MAX(${schema.accounts.sortOrder}), -1)`,
   }).from(schema.accounts).get();
   return (row?.maxSortOrder ?? -1) + 1;
@@ -549,9 +553,11 @@ async function findExistingOauthAccount(input: {
   email?: string;
   projectId?: string;
   rebindAccountId?: number;
-}) {
+}, txDb?: typeof db) {
+  const queryDb = txDb ?? db;
+
   if (typeof input.rebindAccountId === 'number' && input.rebindAccountId > 0) {
-    return db.select().from(schema.accounts)
+    return queryDb.select().from(schema.accounts)
       .where(eq(schema.accounts.id, input.rebindAccountId))
       .get();
   }
@@ -561,7 +567,7 @@ async function findExistingOauthAccount(input: {
   const projectId = asNonEmptyString(input.projectId);
 
   if (accountKey) {
-    const byKey = await db.select().from(schema.accounts).where(and(
+    const byKey = await queryDb.select().from(schema.accounts).where(and(
       eq(schema.accounts.oauthProvider, input.provider),
       eq(schema.accounts.oauthAccountKey, accountKey),
       projectId
@@ -572,7 +578,7 @@ async function findExistingOauthAccount(input: {
   }
 
   if (!accountKey && email && input.provider !== 'codex') {
-    const byEmail = await db.select().from(schema.accounts).where(and(
+    const byEmail = await queryDb.select().from(schema.accounts).where(and(
       eq(schema.accounts.oauthProvider, input.provider),
       eq(schema.accounts.username, email),
     )).get();
@@ -580,6 +586,19 @@ async function findExistingOauthAccount(input: {
   }
 
   return null;
+}
+
+function isUniqueConstraintError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const message = error.message || '';
+  const code = (error as any)?.code;
+  // SQLite: SQLITE_CONSTRAINT_UNIQUE (code 2067 or message contains UNIQUE)
+  if (code === 'SQLITE_CONSTRAINT_UNIQUE' || message.includes('UNIQUE constraint failed')) return true;
+  // MySQL/TiDB: ER_DUP_ENTRY (code 1062)
+  if (code === 'ER_DUP_ENTRY' || message.includes('Duplicate entry')) return true;
+  // PostgreSQL: 23505 unique_violation
+  if (code === '23505' || message.includes('unique constraint') || message.includes('duplicate key')) return true;
+  return false;
 }
 
 async function upsertOauthAccount(input: {
@@ -602,39 +621,120 @@ async function upsertOauthAccount(input: {
   persistedStatus?: 'active' | 'disabled';
 }) {
   const site = await ensureOauthSite(input.definition);
-  const existing = await findExistingOauthAccount({
-    provider: input.definition.metadata.provider,
-    accountKey: input.exchange.accountKey || input.exchange.accountId,
-    email: input.exchange.email,
-    projectId: input.exchange.projectId,
-    rebindAccountId: input.rebindAccountId,
-  });
-  const username = buildUsername({
-    email: input.exchange.email,
-    accountKey: input.exchange.accountKey || input.exchange.accountId,
-    provider: input.definition.metadata.provider,
-  });
-  const oauth = buildOauthInfo(existing?.extraConfig, {
-    provider: input.definition.metadata.provider,
-    accountId: input.exchange.accountId || input.exchange.accountKey,
-    accountKey: input.exchange.accountKey || input.exchange.accountId,
-    email: input.exchange.email,
-    planType: input.exchange.planType,
-    projectId: input.exchange.projectId,
-    refreshToken: input.exchange.refreshToken,
-    tokenExpiresAt: input.exchange.tokenExpiresAt,
-    idToken: input.exchange.idToken,
-    providerData: input.exchange.providerData,
-  });
-  const extraConfig = mergeAccountExtraConfig(existing?.extraConfig, {
-    credentialMode: 'session',
-    ...(input.proxyUrl !== undefined ? { proxyUrl: input.proxyUrl } : {}),
-    ...(input.useSystemProxy !== undefined ? { useSystemProxy: input.useSystemProxy } : {}),
-    oauth: buildStoredOauthState(oauth),
-  });
 
-  if (existing) {
-    await db.update(schema.accounts).set({
+  // rebind 路径：不走事务，对特定 ID 更新，无并发插入问题
+  if (typeof input.rebindAccountId === 'number' && input.rebindAccountId > 0) {
+    const existing = await findExistingOauthAccount({
+      provider: input.definition.metadata.provider,
+      accountKey: input.exchange.accountKey || input.exchange.accountId,
+      email: input.exchange.email,
+      projectId: input.exchange.projectId,
+      rebindAccountId: input.rebindAccountId,
+    });
+    const username = buildUsername({
+      email: input.exchange.email,
+      accountKey: input.exchange.accountKey || input.exchange.accountId,
+      provider: input.definition.metadata.provider,
+    });
+    const oauth = buildOauthInfo(existing?.extraConfig, {
+      provider: input.definition.metadata.provider,
+      accountId: input.exchange.accountId || input.exchange.accountKey,
+      accountKey: input.exchange.accountKey || input.exchange.accountId,
+      email: input.exchange.email,
+      planType: input.exchange.planType,
+      projectId: input.exchange.projectId,
+      refreshToken: input.exchange.refreshToken,
+      tokenExpiresAt: input.exchange.tokenExpiresAt,
+      idToken: input.exchange.idToken,
+      providerData: input.exchange.providerData,
+    });
+    const extraConfig = mergeAccountExtraConfig(existing?.extraConfig, {
+      credentialMode: 'session',
+      ...(input.proxyUrl !== undefined ? { proxyUrl: input.proxyUrl } : {}),
+      ...(input.useSystemProxy !== undefined ? { useSystemProxy: input.useSystemProxy } : {}),
+      oauth: buildStoredOauthState(oauth),
+    });
+
+    if (existing) {
+      await db.update(schema.accounts).set({
+        siteId: site.id,
+        username,
+        accessToken: input.exchange.accessToken,
+        apiToken: null,
+        checkinEnabled: false,
+        status: input.persistedStatus ?? 'disabled',
+        oauthProvider: input.definition.metadata.provider,
+        oauthAccountKey: oauth.accountKey || oauth.accountId || null,
+        oauthProjectId: oauth.projectId || null,
+        extraConfig,
+        updatedAt: new Date().toISOString(),
+      }).where(eq(schema.accounts.id, existing.id)).run();
+      return {
+        account: await db.select().from(schema.accounts).where(eq(schema.accounts.id, existing.id)).get(),
+        site,
+        created: false,
+        previousAccount: existing,
+      };
+    }
+
+    // rebind 目标不存在时也走 INSERT（不常见，但保持兼容）
+    const created = await insertAndGetById<typeof schema.accounts.$inferSelect>({
+      table: schema.accounts,
+      idColumn: schema.accounts.id,
+      values: {
+        siteId: site.id,
+        username,
+        accessToken: input.exchange.accessToken,
+        apiToken: null,
+        checkinEnabled: false,
+        status: input.persistedStatus ?? 'active',
+        oauthProvider: input.definition.metadata.provider,
+        oauthAccountKey: oauth.accountKey || oauth.accountId || null,
+        oauthProjectId: oauth.projectId || null,
+        extraConfig,
+        isPinned: false,
+        sortOrder: await getNextAccountSortOrder(),
+      },
+      insertErrorMessage: `failed to create oauth account: ${input.definition.metadata.provider}`,
+      loadErrorMessage: `failed to load created oauth account: ${input.definition.metadata.provider}`,
+    });
+    return { account: created, site, created: true, previousAccount: null };
+  }
+
+  // 非 rebind 路径：全部走事务
+  return db.transaction(async (tx) => {
+    const existing = await findExistingOauthAccount({
+      provider: input.definition.metadata.provider,
+      accountKey: input.exchange.accountKey || input.exchange.accountId,
+      email: input.exchange.email,
+      projectId: input.exchange.projectId,
+    }, tx);
+
+    const username = buildUsername({
+      email: input.exchange.email,
+      accountKey: input.exchange.accountKey || input.exchange.accountId,
+      provider: input.definition.metadata.provider,
+    });
+    const oauth = buildOauthInfo(existing?.extraConfig, {
+      provider: input.definition.metadata.provider,
+      accountId: input.exchange.accountId || input.exchange.accountKey,
+      accountKey: input.exchange.accountKey || input.exchange.accountId,
+      email: input.exchange.email,
+      planType: input.exchange.planType,
+      projectId: input.exchange.projectId,
+      refreshToken: input.exchange.refreshToken,
+      tokenExpiresAt: input.exchange.tokenExpiresAt,
+      idToken: input.exchange.idToken,
+      providerData: input.exchange.providerData,
+    });
+    const extraConfig = mergeAccountExtraConfig(existing?.extraConfig, {
+      credentialMode: 'session',
+      ...(input.proxyUrl !== undefined ? { proxyUrl: input.proxyUrl } : {}),
+      ...(input.useSystemProxy !== undefined ? { useSystemProxy: input.useSystemProxy } : {}),
+      oauth: buildStoredOauthState(oauth),
+    });
+
+    const updateSet = {
       siteId: site.id,
       username,
       accessToken: input.exchange.accessToken,
@@ -646,36 +746,57 @@ async function upsertOauthAccount(input: {
       oauthProjectId: oauth.projectId || null,
       extraConfig,
       updatedAt: new Date().toISOString(),
-    }).where(eq(schema.accounts.id, existing.id)).run();
-    return {
-      account: await db.select().from(schema.accounts).where(eq(schema.accounts.id, existing.id)).get(),
-      site,
-      created: false,
-      previousAccount: existing,
     };
-  }
 
-  const created = await insertAndGetById<typeof schema.accounts.$inferSelect>({
-    table: schema.accounts,
-    idColumn: schema.accounts.id,
-    values: {
-      siteId: site.id,
-      username,
-      accessToken: input.exchange.accessToken,
-      apiToken: null,
-      checkinEnabled: false,
-      status: input.persistedStatus ?? 'active',
-      oauthProvider: input.definition.metadata.provider,
-      oauthAccountKey: oauth.accountKey || oauth.accountId || null,
-      oauthProjectId: oauth.projectId || null,
-      extraConfig,
-      isPinned: false,
-      sortOrder: await getNextAccountSortOrder(),
-    },
-    insertErrorMessage: `failed to create oauth account: ${input.definition.metadata.provider}`,
-    loadErrorMessage: `failed to load created oauth account: ${input.definition.metadata.provider}`,
+    if (existing) {
+      await tx.update(schema.accounts).set(updateSet).where(eq(schema.accounts.id, existing.id)).run();
+      const account = await tx.select().from(schema.accounts).where(eq(schema.accounts.id, existing.id)).get();
+      return { account: account!, site, created: false, previousAccount: existing };
+    }
+
+    // INSERT — UNIQUE 约束兜底
+    try {
+      const sortOrder = await getNextAccountSortOrder(tx);
+      const account = await insertAndGetById<typeof schema.accounts.$inferSelect>({
+        txDb: tx,
+        table: schema.accounts,
+        idColumn: schema.accounts.id,
+        values: {
+          siteId: site.id,
+          username,
+          accessToken: input.exchange.accessToken,
+          apiToken: null,
+          checkinEnabled: false,
+          status: input.persistedStatus ?? 'active',
+          oauthProvider: input.definition.metadata.provider,
+          oauthAccountKey: oauth.accountKey || oauth.accountId || null,
+          oauthProjectId: oauth.projectId || null,
+          extraConfig,
+          isPinned: false,
+          sortOrder,
+        },
+        insertErrorMessage: `failed to create oauth account: ${input.definition.metadata.provider}`,
+        loadErrorMessage: `failed to load created oauth account: ${input.definition.metadata.provider}`,
+      });
+      return { account, site, created: true, previousAccount: null };
+    } catch (insertError: unknown) {
+      // UNIQUE 约束兜底：并发插入导致冲突，回查并走 UPDATE
+      if (isUniqueConstraintError(insertError)) {
+        const conflictExisting = await findExistingOauthAccount({
+          provider: input.definition.metadata.provider,
+          accountKey: input.exchange.accountKey || input.exchange.accountId,
+          email: input.exchange.email,
+          projectId: input.exchange.projectId,
+        }, tx);
+        if (conflictExisting) {
+          await tx.update(schema.accounts).set(updateSet).where(eq(schema.accounts.id, conflictExisting.id)).run();
+          const account = await tx.select().from(schema.accounts).where(eq(schema.accounts.id, conflictExisting.id)).get();
+          return { account: account!, site, created: false, previousAccount: conflictExisting };
+        }
+      }
+      throw insertError;
+    }
   });
-  return { account: created, site, created: true, previousAccount: null };
 }
 
 export function listOauthProviders() {
@@ -1039,20 +1160,61 @@ export async function importOauthConnectionsFromNativeJson(input: {
   if (payloadItems.length > MAX_OAUTH_IMPORT_BATCH_SIZE) {
     throwOauthImportValidationError(`oauth import supports at most ${MAX_OAUTH_IMPORT_BATCH_SIZE} items`);
   }
+
   const items: Array<{
     name: string;
-    status: 'imported' | 'skipped' | 'failed';
+    status: 'imported' | 'updated' | 'skipped' | 'failed';
     accountId?: number;
     provider?: string;
     message?: string;
   }> = [];
-  let imported = 0;
+
+  // 批内 fingerprint 去重
+  const dedupedPayloads = new Map<string, ImportedNativeOauthJson>();
+  const skippedInBatch: Array<{ name: string; provider?: string }> = [];
 
   for (const rawPayload of payloadItems) {
     if (!isRecord(rawPayload)) {
       throwOauthImportValidationError('data must be a native oauth json object');
     }
     const payload = rawPayload as ImportedNativeOauthJson;
+    let resolvedIdentity: ReturnType<typeof resolveImportedNativeOauthIdentity> | null = null;
+    try {
+      resolvedIdentity = resolveImportedNativeOauthIdentity(payload);
+      const fp: OauthFingerprint = {
+        provider: resolvedIdentity.provider,
+        accountKey: resolvedIdentity.exchange.accountKey ?? null,
+        projectId: resolvedIdentity.exchange.projectId ?? null,
+      };
+      const key = fingerprintKey(fp);
+      if (dedupedPayloads.has(key)) {
+        // 批内重复，跳过（保留最后一条）
+        skippedInBatch.push({ name: resolvedIdentity.name, provider: resolvedIdentity.provider });
+      }
+      dedupedPayloads.set(key, payload);
+    } catch (error: any) {
+      // 解析失败的项目直接标记 failed
+      items.push({
+        name: asNonEmptyString(payload.email)
+          || asNonEmptyString(payload.account_key)
+          || asNonEmptyString(payload.account_id)
+          || asNonEmptyString(payload.type)
+          || 'unknown',
+        status: 'failed',
+        provider: asNonEmptyString(payload.type) || undefined,
+        message: error?.message || 'oauth import failed',
+      });
+      if (!continueOnItemFailure) {
+        throw error;
+      }
+    }
+  }
+
+  // 处理去重后的条目
+  let imported = 0;
+  let updated = 0;
+
+  for (const payload of dedupedPayloads.values()) {
     let resolvedIdentity: ReturnType<typeof resolveImportedNativeOauthIdentity> | null = null;
     try {
       resolvedIdentity = resolveImportedNativeOauthIdentity(payload);
@@ -1067,10 +1229,14 @@ export async function importOauthConnectionsFromNativeJson(input: {
         useSystemProxy: input.useSystemProxy,
         persistedStatus: resolvedIdentity.disabled ? 'disabled' : 'active',
       });
-      imported += 1;
+      if (persisted.created) {
+        imported += 1;
+      } else {
+        updated += 1;
+      }
       items.push({
         name: resolvedIdentity.name,
-        status: 'imported',
+        status: persisted.created ? 'imported' : 'updated',
         provider: resolvedIdentity.provider,
         accountId: persisted.account?.id,
       });
@@ -1092,12 +1258,23 @@ export async function importOauthConnectionsFromNativeJson(input: {
     }
   }
 
+  // 批内跳过的条目追加到结果
+  for (const skipped of skippedInBatch) {
+    items.push({
+      name: skipped.name,
+      status: 'skipped',
+      provider: skipped.provider,
+    });
+  }
+
   const failed = items.filter((item) => item.status === 'failed').length;
+  const skipped = items.filter((item) => item.status === 'skipped').length;
 
   return {
     success: failed === 0,
     imported,
-    skipped: 0,
+    updated,
+    skipped,
     failed,
     items,
   };
