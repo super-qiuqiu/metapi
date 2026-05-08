@@ -160,6 +160,30 @@ function ensureCodexResponsesStoreFalse(
   };
 }
 
+function stripStatusFieldDeep(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => stripStatusFieldDeep(item));
+  }
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => key !== 'status')
+      .map(([key, entry]) => [key, stripStatusFieldDeep(entry)]),
+  );
+}
+
+function stripCodexInputStatusFields(
+  body: Record<string, unknown>,
+  sitePlatform: string,
+): Record<string, unknown> {
+  if (sitePlatform !== 'codex') return body;
+  if (body.input === undefined) return body;
+  return {
+    ...body,
+    input: stripStatusFieldDeep(body.input),
+  };
+}
+
 function stripCodexUnsupportedResponsesFields(
   body: Record<string, unknown>,
   sitePlatform: string,
@@ -188,7 +212,9 @@ function applyCodexResponsesCompatibility(
   sitePlatform: string,
 ): Record<string, unknown> {
   if (sitePlatform !== 'codex') return body;
-  return extractSystemMessagesToInstructions(body);
+  return extractSystemMessagesToInstructions(
+    stripCodexInputStatusFields(body, sitePlatform),
+  );
 }
 
 export function normalizeCodexResponsesBodyForProxy(

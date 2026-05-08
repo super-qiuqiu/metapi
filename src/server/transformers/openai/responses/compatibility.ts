@@ -28,7 +28,8 @@ export function buildResponsesCompatibilityBodies(
 ): Record<string, unknown>[] {
   const candidates: Record<string, unknown>[] = [];
   const seen = new Set<string>();
-  const useSemanticDedupe = asTrimmedString(options?.sitePlatform).toLowerCase() === 'sub2api';
+  const normalizedSitePlatform = asTrimmedString(options?.sitePlatform).toLowerCase();
+  const useSemanticDedupe = normalizedSitePlatform === 'sub2api';
   try {
     const originalKey = useSemanticDedupe
       ? fingerprintCompatibilityValue(body)
@@ -40,17 +41,20 @@ export function buildResponsesCompatibilityBodies(
 
   const push = (next: Record<string, unknown> | null) => {
     if (!next) return;
+    const normalizedCandidate = normalizedSitePlatform === 'codex'
+      ? { ...next, store: false }
+      : next;
     let key = '';
     try {
       key = useSemanticDedupe
-        ? fingerprintCompatibilityValue(next)
-        : JSON.stringify(next);
+        ? fingerprintCompatibilityValue(normalizedCandidate)
+        : JSON.stringify(normalizedCandidate);
     } catch {
       return;
     }
     if (!key || seen.has(key)) return;
     seen.add(key);
-    candidates.push(next);
+    candidates.push(normalizedCandidate);
   };
 
   push(stripResponsesMetadata(body));
@@ -89,7 +93,6 @@ export function buildResponsesCompatibilityBodies(
       'background',
       'top_logprobs',
     ] as const;
-    const normalizedSitePlatform = asTrimmedString(options?.sitePlatform).toLowerCase();
     if (normalizedSitePlatform === 'sub2api' && body.store !== undefined) {
       richCandidate.store = cloneJsonValue(body.store);
     }

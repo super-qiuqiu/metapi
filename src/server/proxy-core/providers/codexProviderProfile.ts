@@ -32,10 +32,15 @@ export const codexProviderProfile: ProviderProfile = {
         || (websocketTransport ? asTrimmedString(config.codexResponsesWebsocketBeta) : null),
     });
 
+    const body = {
+      ...input.body,
+      store: false,
+    };
+
     return {
       path: '/responses',
       headers,
-      body: input.body,
+      body,
       runtime: {
         executor: 'codex',
         modelName: input.modelName,
