@@ -75,6 +75,35 @@ let proxyLogDownstreamApiKeyIdColumnAvailable: boolean | null = null;
 let proxyLogClientColumnsAvailable: boolean | null = null;
 let proxyLogStreamTimingColumnsAvailable: boolean | null = null;
 
+const DB_ERROR_LOG_MAX_LEN = 280;
+
+function sanitizeDbErrorMessage(message: string): string {
+  const compact = message.replace(/\s+/g, ' ').trim();
+  const redacted = compact
+    .replace(/(accessToken|apiToken|refreshToken|idToken|authorization|cookie)\s*[:=]\s*['\"]?[^,'\"\s}]{6,}/gi, '$1=[REDACTED]')
+    .replace(/\b(sk-[A-Za-z0-9_-]{8,})\b/g, '[REDACTED_SK]')
+    .replace(/\b(rt_[A-Za-z0-9._-]{8,})\b/g, '[REDACTED_RT]');
+  if (redacted.length <= DB_ERROR_LOG_MAX_LEN) return redacted;
+  return `${redacted.slice(0, DB_ERROR_LOG_MAX_LEN)}...`;
+}
+
+function formatDbError(error: unknown): string {
+  if (!error) return 'unknown error';
+  if (typeof error === 'string') return sanitizeDbErrorMessage(error);
+  if (typeof error === 'object') {
+    const message = (error as { message?: unknown }).message;
+    const code = (error as { code?: unknown }).code;
+    const sqlState = (error as { sqlState?: unknown }).sqlState;
+    const parts = [
+      typeof code === 'string' ? code : null,
+      typeof sqlState === 'string' ? sqlState : null,
+      typeof message === 'string' ? sanitizeDbErrorMessage(message) : null,
+    ].filter(Boolean);
+    if (parts.length > 0) return parts.join(' | ');
+  }
+  return 'unknown error';
+}
+
 function buildMysqlPoolOptions(
   connectionString = config.dbUrl,
   sslEnabled = config.dbSsl,
@@ -782,7 +811,7 @@ export async function ensureProxyLogBillingDetailsColumn(): Promise<boolean> {
       return true;
     }
     proxyLogBillingDetailsColumnAvailable = false;
-    console.warn('[db] failed to ensure proxy_logs.billing_details column', error);
+    console.warn(`[db] failed to ensure proxy_logs.billing_details column: ${formatDbError(error)}`);
     return false;
   }
 }
@@ -848,7 +877,7 @@ export async function ensureProxyLogDownstreamApiKeyIdColumn(): Promise<boolean>
       return true;
     }
     proxyLogDownstreamApiKeyIdColumnAvailable = false;
-    console.warn('[db] failed to ensure proxy_logs.downstream_api_key_id column', error);
+    console.warn(`[db] failed to ensure proxy_logs.downstream_api_key_id column: ${formatDbError(error)}`);
     return false;
   }
 }
@@ -967,7 +996,7 @@ export async function ensureProxyLogClientColumns(): Promise<boolean> {
         }
       } catch (error) {
         if (!isDuplicateIndexError(error)) {
-          console.warn(`[db] failed to ensure ${requiredIndex.name}`, error);
+          console.warn(`[db] failed to ensure ${requiredIndex.name}: ${formatDbError(error)}`);
         }
       }
     }
@@ -1021,7 +1050,7 @@ export async function ensureProxyLogClientColumns(): Promise<boolean> {
       return proxyLogClientColumnsAvailable;
     }
     proxyLogClientColumnsAvailable = false;
-    console.warn('[db] failed to ensure proxy_logs client columns', error);
+    console.warn(`[db] failed to ensure proxy_logs client columns: ${formatDbError(error)}`);
     return false;
   }
 }
@@ -1116,7 +1145,7 @@ export async function ensureProxyLogStreamTimingColumns(): Promise<boolean> {
       return proxyLogStreamTimingColumnsAvailable;
     }
     proxyLogStreamTimingColumnsAvailable = false;
-    console.warn('[db] failed to ensure proxy_logs stream timing columns', error);
+    console.warn(`[db] failed to ensure proxy_logs stream timing columns: ${formatDbError(error)}`);
     return false;
   }
 }
