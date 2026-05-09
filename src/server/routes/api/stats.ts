@@ -4,7 +4,6 @@ import { and, desc, eq, gte, lt, sql } from "drizzle-orm";
 import { config } from "../../config.js";
 import { refreshModelsForAccount } from "../../services/modelService.js";
 import * as routeRefreshWorkflow from "../../services/routeRefreshWorkflow.js";
-import { buildModelAnalysis } from "../../services/modelAnalysisService.js";
 import {
   fetchModelPricingCatalog,
 } from "../../services/modelPricingService.js";
@@ -37,7 +36,6 @@ import {
   formatLocalDateTime,
   formatUtcSqlDateTime,
   getLocalDayRangeUtc,
-  getLocalRangeStartDayKey,
   getLocalRangeStartUtc,
   parseStoredUtcDateTime,
   type StoredUtcDateTimeInput,
@@ -49,9 +47,7 @@ import {
   getDashboardSummarySnapshot,
 } from "../../services/dashboardSnapshotService.js";
 import { getSiteStatsSnapshot } from "../../services/siteStatsSnapshotService.js";
-import {
-  runUsageAggregationProjectionPass,
-} from "../../services/usageAggregationService.js";
+import { getModelBySiteSnapshot } from "../../services/modelBySiteSnapshotService.js";
 
 function parseBooleanFlag(raw?: string): boolean {
   if (!raw) return false;
@@ -2050,57 +2046,23 @@ export async function statsRoutes(app: FastifyInstance) {
   );
 
   // Model stats by site
-  app.get<{ Querystring: { siteId?: string; days?: string } }>(
+  app.get<{ Querystring: { siteId?: string; days?: string; refresh?: string } }>(
     "/api/stats/model-by-site",
     async (request) => {
-      const siteId = request.query.siteId
+      const parsedSiteId = request.query.siteId
         ? parseInt(request.query.siteId, 10)
         : null;
+      const siteId =
+        parsedSiteId != null && Number.isFinite(parsedSiteId)
+          ? parsedSiteId
+          : null;
       const days = Math.max(1, parseInt(request.query.days || "7", 10));
-      await runUsageAggregationProjectionPass();
-      const sinceDay = getLocalRangeStartDayKey(days);
-      const rows = siteId != null && Number.isFinite(siteId)
-        ? await db
-            .select()
-            .from(schema.modelDayUsage)
-            .where(
-              and(
-                gte(schema.modelDayUsage.localDay, sinceDay),
-                eq(schema.modelDayUsage.siteId, siteId),
-              ),
-            )
-            .all()
-        : await db
-            .select()
-            .from(schema.modelDayUsage)
-            .where(gte(schema.modelDayUsage.localDay, sinceDay))
-            .all();
-
-      const modelMap: Record<
-        string,
-        { calls: number; spend: number; tokens: number }
-      > = {};
-
-      for (const row of rows) {
-        const model = row.model || "unknown";
-
-        if (!modelMap[model])
-          modelMap[model] = { calls: 0, spend: 0, tokens: 0 };
-        modelMap[model].calls += Number(row.totalCalls || 0);
-        modelMap[model].tokens += Number(row.totalTokens || 0);
-        modelMap[model].spend += Number(row.totalSpend || 0);
-      }
-
-      const models = Object.entries(modelMap)
-        .map(([model, stats]) => ({
-          model,
-          calls: stats.calls,
-          spend: Math.round(stats.spend * 1_000_000) / 1_000_000,
-          tokens: stats.tokens,
-        }))
-        .sort((a, b) => b.calls - a.calls);
-
-      return { models };
+      const snapshot = await getModelBySiteSnapshot({
+        days,
+        siteId,
+        forceRefresh: parseBooleanFlag(request.query.refresh),
+      });
+      return { models: snapshot.payload.models };
     },
   );
 }
