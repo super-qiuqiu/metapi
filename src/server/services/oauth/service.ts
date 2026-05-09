@@ -1009,6 +1009,30 @@ export async function listOauthConnections(options: {
     modelMap.set(row.accountId, list);
   }
 
+  const usageRows = await db.select({
+    accountId: schema.proxyLogs.accountId,
+    totalRequests: sql<number>`COUNT(*)`,
+    totalTokens: sql<number>`coalesce(sum(coalesce(${schema.proxyLogs.totalTokens}, 0)), 0)`,
+    totalCost: sql<number>`coalesce(sum(coalesce(${schema.proxyLogs.estimatedCost}, 0)), 0)`,
+  }).from(schema.proxyLogs)
+    .where(inArray(schema.proxyLogs.accountId, accountIds))
+    .groupBy(schema.proxyLogs.accountId)
+    .all();
+  const usageByAccount = new Map<number, {
+    totalRequests: number;
+    totalTokens: number;
+    totalCost: number;
+  }>();
+  for (const row of usageRows) {
+    const accountId = Number(row.accountId || 0);
+    if (!Number.isFinite(accountId) || accountId <= 0) continue;
+    usageByAccount.set(accountId, {
+      totalRequests: Number(row.totalRequests || 0),
+      totalTokens: Number(row.totalTokens || 0),
+      totalCost: Math.round(Number(row.totalCost || 0) * 1_000_000) / 1_000_000,
+    });
+  }
+
   const routeParticipationByAccount = await listOauthRouteUnitsByAccountIds(accountIds);
   const routeUnitIds = Array.from(new Set(
     Array.from(routeParticipationByAccount.values())
@@ -1077,6 +1101,11 @@ export async function listOauthConnections(options: {
       routeChannelCount: routeUnit?.kind === 'route_unit'
         ? (routeChannelCountByRouteUnit.get(routeUnit.id) || 0)
         : (routeChannelCountByAccount.get(row.accounts.id) || 0),
+      usage: usageByAccount.get(row.accounts.id) || {
+        totalRequests: 0,
+        totalTokens: 0,
+        totalCost: 0,
+      },
       lastModelSyncAt: oauth.lastModelSyncAt,
       lastModelSyncError: oauth.lastModelSyncError,
       proxyUrl: getProxyUrlFromExtraConfig(row.accounts.extraConfig),

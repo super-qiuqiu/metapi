@@ -706,6 +706,12 @@ export type OAuthQuotaInfo = {
   lastLimitResetAt?: string | null;
 };
 
+export type OAuthConnectionUsageSummary = {
+  totalRequests: number;
+  totalTokens: number;
+  totalCost: number;
+};
+
 export type OAuthConnectionInfo = {
   accountId: number;
   siteId: number;
@@ -719,6 +725,7 @@ export type OAuthConnectionInfo = {
   modelsPreview: string[];
   status: "healthy" | "abnormal";
   quota?: OAuthQuotaInfo | null;
+  usage?: OAuthConnectionUsageSummary;
   routeChannelCount?: number;
   lastModelSyncAt?: string | null;
   lastModelSyncError?: string | null;
