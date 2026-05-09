@@ -452,6 +452,16 @@ function formatResetLabel(value?: string | null): string {
   return `${Math.max(1, diffMinutes)}m`;
 }
 
+function formatInteger(value: number | null | undefined): string {
+  const safe = Number.isFinite(value) ? Number(value) : 0;
+  return Math.max(0, Math.trunc(safe)).toLocaleString();
+}
+
+function formatUsd(value: number | null | undefined): string {
+  const safe = Number.isFinite(value) ? Number(value) : 0;
+  return `$${safe.toFixed(4)}`;
+}
+
 function resolveQuotaWindowRemainingPercent(window?: OAuthQuotaWindowInfo | null): number | null {
   if (!window?.supported) return null;
   if (typeof window.remaining === 'number' && typeof window.limit === 'number' && window.limit > 0) {
@@ -1958,6 +1968,7 @@ export default function OAuthManagement() {
           const sitePlatform = asTrimmedString(connection.site?.platform);
           const modelSyncDetail = resolveModelSyncDetail(connection);
           const quotaSyncDetail = resolveQuotaSyncDetail(quota);
+          const usage = connection.usage;
           return (
             <tr key={connection.accountId}>
               <td>
@@ -2059,6 +2070,9 @@ export default function OAuthManagement() {
                             {quota.windows?.sevenDay?.supported !== false ? <QuotaWindowRow label="7d" window={quota.windows?.sevenDay} /> : null}
                           </>
                       }
+                      <div className="oauth-cell-tertiary">
+                        请求 {formatInteger(usage?.totalRequests)} · Tokens {formatInteger(usage?.totalTokens)} · 消耗 {formatUsd(usage?.totalCost)}
+                      </div>
                     </div>
                   ) : (
                     <span className="oauth-cell-secondary">--</span>
@@ -2126,6 +2140,7 @@ export default function OAuthManagement() {
     <div className="mobile-card-list oauth-mobile-list">
       {filteredConnections.map((connection) => {
         const quota = connection.quota;
+        const usage = connection.usage;
         return (
           <MobileCard
             key={connection.accountId}
@@ -2207,6 +2222,9 @@ export default function OAuthManagement() {
                         {quota.windows?.sevenDay?.supported !== false ? <QuotaWindowRow label="7d" window={quota.windows?.sevenDay} /> : null}
                       </>
                   }
+                  <div className="oauth-cell-tertiary">
+                    请求 {formatInteger(usage?.totalRequests)} · Tokens {formatInteger(usage?.totalTokens)} · 消耗 {formatUsd(usage?.totalCost)}
+                  </div>
                 </>
               ) : (
                 <div className="oauth-cell-secondary">--</div>
