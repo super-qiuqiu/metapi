@@ -238,6 +238,15 @@ export default function Dashboard({
   >({});
   const [trendDays, setTrendDays] = useState(7);
   const [showInactiveSites, setShowInactiveSites] = useState(false);
+  const [modelAnalysisDays, setModelAnalysisDays] = useState(7);
+  const [modelRangeMode, setModelRangeMode] = useState<"preset" | "custom">(
+    "preset",
+  );
+  const [modelDateFrom, setModelDateFrom] = useState("");
+  const [modelDateTo, setModelDateTo] = useState("");
+  const [modelFilter, setModelFilter] = useState<
+    { mode: "preset"; days: number } | { mode: "custom"; from: string; to: string }
+  >({ mode: "preset", days: 7 });
   const toast = useToast();
   const normalizedAdminName = (adminName || "").trim() || "\u7ba1\u7406\u5458";
 
@@ -273,17 +282,19 @@ export default function Dashboard({
   const loadInsights = useCallback(async (forceRefresh = false) => {
     setInsightsLoading(true);
     try {
-      const result = await api.getDashboardInsights(
-        forceRefresh ? { refresh: true } : undefined,
-      );
+      const result = await api.getDashboardInsights({
+        ...(forceRefresh ? { refresh: true } : {}),
+        ...(modelFilter.mode === "custom"
+          ? { modelFrom: modelFilter.from, modelTo: modelFilter.to }
+          : { modelDays: modelFilter.days }),
+      });
       setInsightsData(result);
     } catch (err) {
       console.error("Failed to load dashboard insights:", err);
     } finally {
       setInsightsLoading(false);
     }
-  }, []);
-
+  }, [modelFilter]);
   const loadSiteStats = useCallback(
     async (forceRefresh = false) => {
       setSiteLoading(true);
@@ -317,6 +328,16 @@ export default function Dashboard({
   useEffect(() => {
     loadSiteStats();
   }, [loadSiteStats]);
+
+  useEffect(() => {
+    if (modelDateFrom && modelDateTo) return;
+    const now = new Date();
+    const to = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    const fromDate = new Date(now.getTime() - 6 * 24 * 60 * 60 * 1000);
+    const from = `${fromDate.getFullYear()}-${String(fromDate.getMonth() + 1).padStart(2, "0")}-${String(fromDate.getDate()).padStart(2, "0")}`;
+    setModelDateFrom(from);
+    setModelDateTo(to);
+  }, [modelDateFrom, modelDateTo]);
 
   useEffect(() => {
     let timer: ReturnType<typeof setInterval> | null = null;
@@ -980,8 +1001,10 @@ export default function Dashboard({
             style={{
               display: "flex",
               alignItems: "center",
+              justifyContent: "space-between",
               gap: 12,
               marginBottom: 14,
+              flexWrap: "wrap",
             }}
           >
             <div
@@ -1009,6 +1032,101 @@ export default function Dashboard({
                 />
               </svg>
               模型数据分析
+            </div>
+            <div
+              style={{
+                display: "flex",
+                gap: 6,
+                alignItems: "center",
+                flexWrap: "wrap",
+                justifyContent: "flex-end",
+              }}
+            >
+              {[7, 30, 90].map((d) => (
+                <button
+                  key={d}
+                  onClick={() => {
+                    setModelRangeMode("preset");
+                    setModelAnalysisDays(d);
+                    setModelFilter({ mode: "preset", days: d });
+                  }}
+                  style={{
+                    padding: "4px 10px",
+                    borderRadius: 6,
+                    fontSize: 12,
+                    fontWeight: 500,
+                    border: "none",
+                    cursor: "pointer",
+                    background:
+                      modelRangeMode === "preset" && modelAnalysisDays === d
+                        ? "var(--color-primary)"
+                        : "var(--color-bg)",
+                    color:
+                      modelRangeMode === "preset" && modelAnalysisDays === d
+                        ? "white"
+                        : "var(--color-text-secondary)",
+                  }}
+                >
+                  {d}天
+                </button>
+              ))}
+              <input
+                type="date"
+                value={modelDateFrom}
+                onChange={(e) => {
+                  setModelRangeMode("custom");
+                  setModelDateFrom(e.target.value);
+                }}
+                style={{
+                  padding: "4px 8px",
+                  borderRadius: 6,
+                  border: "1px solid var(--color-border)",
+                  fontSize: 12,
+                  background: "var(--color-bg-elevated)",
+                  color: "var(--color-text-primary)",
+                }}
+              />
+              <span style={{ fontSize: 12, color: "var(--color-text-muted)" }}>
+                至
+              </span>
+              <input
+                type="date"
+                value={modelDateTo}
+                onChange={(e) => {
+                  setModelRangeMode("custom");
+                  setModelDateTo(e.target.value);
+                }}
+                style={{
+                  padding: "4px 8px",
+                  borderRadius: 6,
+                  border: "1px solid var(--color-border)",
+                  fontSize: 12,
+                  background: "var(--color-bg-elevated)",
+                  color: "var(--color-text-primary)",
+                }}
+              />
+              <button
+                onClick={() => {
+                  if (!modelDateFrom || !modelDateTo) {
+                    toast.error("请选择起止日期");
+                    return;
+                  }
+                  if (modelDateFrom > modelDateTo) {
+                    toast.error("开始日期不能晚于结束日期");
+                    return;
+                  }
+                  setModelRangeMode("custom");
+                  setModelFilter({
+                    mode: "custom",
+                    from: modelDateFrom,
+                    to: modelDateTo,
+                  });
+                }}
+                className="btn btn-ghost"
+                style={{ fontSize: 12, padding: "4px 10px" }}
+              >
+                应用
+              </button>
             </div>
           </div>
           {insightsLoading && !insightsData ? (

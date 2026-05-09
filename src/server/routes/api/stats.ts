@@ -68,6 +68,19 @@ function normalizeDashboardView(raw?: string) {
   return "full";
 }
 
+function normalizeDashboardModelDays(raw?: string): number {
+  const parsed = Number.parseInt((raw || "").trim(), 10);
+  if (!Number.isFinite(parsed)) return 7;
+  return Math.max(1, Math.min(365, parsed));
+}
+
+function normalizeDashboardDayKey(raw?: string): string | null {
+  const value = (raw || "").trim();
+  if (!value) return null;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+  return value;
+}
+
 function normalizeProxyLogsView(raw?: string) {
   const normalized = (raw || "").trim().toLowerCase();
   if (normalized === "query" || normalized === "meta") {
@@ -648,11 +661,14 @@ export async function statsRoutes(app: FastifyInstance) {
   const proxyLogModelAnalysisFields = buildProxyLogModelAnalysisSelectFields();
   const proxyLogSiteTrendFields = buildProxyLogSiteTrendSelectFields();
 
-  app.get<{ Querystring: { refresh?: string; view?: string } }>(
+  app.get<{ Querystring: { refresh?: string; view?: string; modelDays?: string; modelFrom?: string; modelTo?: string } }>(
     "/api/stats/dashboard",
     async (request, reply) => {
       const forceRefresh = parseBooleanFlag(request.query.refresh);
       const view = normalizeDashboardView(request.query.view);
+      const modelDays = normalizeDashboardModelDays(request.query.modelDays);
+      const modelFromDay = normalizeDashboardDayKey(request.query.modelFrom);
+      const modelToDay = normalizeDashboardDayKey(request.query.modelTo);
       if (view === "summary") {
         const snapshot = await getDashboardSummarySnapshot({ forceRefresh });
         reply.header("x-dashboard-summary-cache", snapshot.cacheStatus);
@@ -662,7 +678,12 @@ export async function statsRoutes(app: FastifyInstance) {
         };
       }
       if (view === "insights") {
-        const snapshot = await getDashboardInsightsSnapshot({ forceRefresh });
+        const snapshot = await getDashboardInsightsSnapshot({
+          forceRefresh,
+          modelDays,
+          modelFromDay,
+          modelToDay,
+        });
         reply.header("x-dashboard-insights-cache", snapshot.cacheStatus);
         return {
           generatedAt: snapshot.generatedAt,
@@ -672,7 +693,12 @@ export async function statsRoutes(app: FastifyInstance) {
 
       const [summary, insights] = await Promise.all([
         getDashboardSummarySnapshot({ forceRefresh }),
-        getDashboardInsightsSnapshot({ forceRefresh }),
+        getDashboardInsightsSnapshot({
+          forceRefresh,
+          modelDays,
+          modelFromDay,
+          modelToDay,
+        }),
       ]);
       reply.header("x-dashboard-summary-cache", summary.cacheStatus);
       reply.header("x-dashboard-insights-cache", insights.cacheStatus);

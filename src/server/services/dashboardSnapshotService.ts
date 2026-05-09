@@ -3,6 +3,7 @@ import { db, schema } from "../db/index.js";
 import { buildModelAnalysisFromDailyUsage } from "./modelAnalysisService.js";
 import { parseCheckinRewardAmount } from "./checkinRewardParser.js";
 import {
+  formatLocalDate,
   formatUtcSqlDateTime,
   getLocalDayRangeUtc,
   getLocalHourAnchor,
@@ -59,11 +60,12 @@ const dashboardSummaryPersistence =
     namespace: "dashboard-summary",
     key: "default",
   });
-const dashboardInsightsPersistence =
-  createAdminSnapshotPersistence<DashboardInsightsPayload>({
+function createDashboardInsightsPersistence(cacheKey: string) {
+  return createAdminSnapshotPersistence<DashboardInsightsPayload>({
     namespace: "dashboard-insights",
-    key: "default",
+    key: cacheKey,
   });
+}
 
 async function loadDashboardSummaryPayload(): Promise<DashboardSummaryPayload> {
   await runUsageAggregationProjectionPass();
@@ -247,13 +249,24 @@ async function loadDashboardSummaryPayload(): Promise<DashboardSummaryPayload> {
   };
 }
 
-async function loadDashboardInsightsPayload(): Promise<DashboardInsightsPayload> {
+async function loadDashboardInsightsPayload(input: {
+  modelDays: number;
+  modelFromDay?: string | null;
+  modelToDay?: string | null;
+}): Promise<DashboardInsightsPayload> {
   const siteAvailabilityNow = getLocalHourAnchor();
   const siteAvailabilitySinceUtc = getLocalHourRangeStartUtc(
     SITE_AVAILABILITY_BUCKET_COUNT,
     siteAvailabilityNow,
   );
-  const modelAnalysisSinceDay = getLocalRangeStartDayKey(7);
+  const todayDayKey = formatLocalDate(new Date());
+  const fromDay = (input.modelFromDay || "").trim();
+  const toDay = (input.modelToDay || "").trim();
+  const hasCustomRange = fromDay.length > 0 && toDay.length > 0 && fromDay <= toDay;
+  const modelAnalysisSinceDay = hasCustomRange
+    ? fromDay
+    : getLocalRangeStartDayKey(input.modelDays);
+  const modelAnalysisToDay = hasCustomRange ? toDay : todayDayKey;
   await runUsageAggregationProjectionPass();
 
   const [activeSites, siteAvailabilityRows, modelDayRows] =
@@ -278,7 +291,12 @@ async function loadDashboardInsightsPayload(): Promise<DashboardInsightsPayload>
       db
         .select()
         .from(schema.modelDayUsage)
-        .where(gte(schema.modelDayUsage.localDay, modelAnalysisSinceDay))
+        .where(
+          and(
+            gte(schema.modelDayUsage.localDay, modelAnalysisSinceDay),
+            lt(schema.modelDayUsage.localDay, `${modelAnalysisToDay}~`),
+          ),
+        )
         .all(),
     ]);
 
@@ -323,7 +341,18 @@ async function loadDashboardInsightsPayload(): Promise<DashboardInsightsPayload>
           totalSpend: row.totalSpend,
           totalLatencyMs: row.totalLatencyMs,
         })),
-      { days: 7 },
+      {
+        days: hasCustomRange
+          ? Math.max(
+              1,
+              Math.floor(
+                (new Date(`${modelAnalysisToDay}T00:00:00`).getTime() -
+                  new Date(`${modelAnalysisSinceDay}T00:00:00`).getTime()) /
+                  (24 * 60 * 60 * 1000),
+              ) + 1,
+            )
+          : input.modelDays,
+      },
     ),
   };
 }
@@ -343,13 +372,36 @@ export async function getDashboardSummarySnapshot(options?: {
 
 export async function getDashboardInsightsSnapshot(options?: {
   forceRefresh?: boolean;
+  modelDays?: number;
+  modelFromDay?: string | null;
+  modelToDay?: string | null;
 }): Promise<SnapshotEnvelope<DashboardInsightsPayload>> {
+  const modelDays = Number.isFinite(options?.modelDays)
+    ? Math.max(1, Math.min(365, Math.floor(options?.modelDays || 7)))
+    : 7;
+  const modelFromDay = (options?.modelFromDay || "").trim() || null;
+  const modelToDay = (options?.modelToDay || "").trim() || null;
+  const hasCustomRange = !!(
+    modelFromDay &&
+    modelToDay &&
+    modelFromDay <= modelToDay
+  );
+
+  const cacheKey = hasCustomRange
+    ? `model-range:${modelFromDay}:${modelToDay}`
+    : `model-days:${modelDays}`;
+
   return readSnapshotCache({
     namespace: "dashboard-insights",
-    key: "default",
+    key: cacheKey,
     ttlMs: DASHBOARD_INSIGHTS_TTL_MS,
     forceRefresh: options?.forceRefresh,
-    persistence: dashboardInsightsPersistence,
-    loader: loadDashboardInsightsPayload,
+    persistence: createDashboardInsightsPersistence(cacheKey),
+    loader: () =>
+      loadDashboardInsightsPayload({
+        modelDays,
+        modelFromDay,
+        modelToDay,
+      }),
   });
 }
