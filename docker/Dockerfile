@@ -1,4 +1,4 @@
-FROM node:25-bookworm-slim AS builder
+FROM oven/bun:1.3.13-debian AS builder
 
 WORKDIR /app
 
@@ -8,15 +8,13 @@ RUN apt-get update \
 
 ENV PYTHON=/usr/bin/python3
 
-COPY package.json package-lock.json ./
-RUN npm ci --ignore-scripts --no-audit --no-fund
-RUN npm rebuild esbuild sharp better-sqlite3 --no-audit --no-fund
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile
 
 COPY . .
-RUN npm run build:web && npm run build:server
-RUN npm prune --omit=dev --no-audit --no-fund
+RUN bun run build:web && bun run build:server
 
-FROM node:25-bookworm-slim
+FROM oven/bun:1.3.13-debian
 
 WORKDIR /app
 
@@ -45,9 +43,10 @@ RUN apt-get update \
   && chmod +x /usr/local/bin/helm \
   && rm -rf /tmp/helm.tgz "/tmp/linux-${ARCH}" /var/lib/apt/lists/*
 
+COPY package.json bun.lock ./
+RUN bun install --production --frozen-lockfile
+
 COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/package.json ./
 COPY --from=builder /app/drizzle ./drizzle
 
 RUN mkdir -p /app/data
@@ -57,4 +56,4 @@ EXPOSE 4000
 ENV NODE_ENV=production
 ENV DATA_DIR=/app/data
 
-CMD ["sh", "-c", "node dist/server/db/migrate.js && node dist/server/index.js"]
+CMD ["sh", "-c", "bun dist/server/db/migrate.js && bun dist/server/index.js"]

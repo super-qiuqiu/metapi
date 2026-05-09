@@ -1,4 +1,4 @@
-import Database from 'better-sqlite3';
+import { createRequire } from 'node:module';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 import { migrate } from 'drizzle-orm/better-sqlite3/migrator';
 import { config } from '../config.js';
@@ -6,6 +6,8 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+type BetterSqliteDatabase = any;
 
 type MigrationJournalEntry = {
   tag: string;
@@ -106,24 +108,24 @@ function resolveMigrationsFolder(): string {
   return resolve(dirname(fileURLToPath(import.meta.url)), '../../../drizzle');
 }
 
-function tableExists(sqlite: Database.Database, table: string): boolean {
+function tableExists(sqlite: BetterSqliteDatabase, table: string): boolean {
   const row = sqlite.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1").get(table);
   return !!row;
 }
 
-function columnExists(sqlite: Database.Database, table: string, column: string): boolean {
+function columnExists(sqlite: BetterSqliteDatabase, table: string, column: string): boolean {
   if (!tableExists(sqlite, table)) return false;
   const rows = sqlite.prepare(`PRAGMA table_info("${table}")`).all() as Array<{ name?: string }>;
   return rows.some((row) => row.name === column);
 }
 
-function hasRecordedDrizzleMigrations(sqlite: Database.Database): boolean {
+function hasRecordedDrizzleMigrations(sqlite: BetterSqliteDatabase): boolean {
   if (!tableExists(sqlite, '__drizzle_migrations')) return false;
   const row = sqlite.prepare('SELECT 1 FROM __drizzle_migrations LIMIT 1').get();
   return !!row;
 }
 
-function hasVerifiedLegacySchema(sqlite: Database.Database): boolean {
+function hasVerifiedLegacySchema(sqlite: BetterSqliteDatabase): boolean {
   return VERIFIED_SCHEMA_MARKERS.every((marker) => (
     marker.column
       ? columnExists(sqlite, marker.table, marker.column)
@@ -263,7 +265,7 @@ function readRecoveryMigrations(migrationsFolder: string): RecoveryMigration[] {
   });
 }
 
-function ensureDrizzleMigrationsTable(sqlite: Database.Database): void {
+function ensureDrizzleMigrationsTable(sqlite: BetterSqliteDatabase): void {
   sqlite.exec(`
     CREATE TABLE IF NOT EXISTS "__drizzle_migrations" (
       id SERIAL PRIMARY KEY,
@@ -273,7 +275,7 @@ function ensureDrizzleMigrationsTable(sqlite: Database.Database): void {
   `);
 }
 
-function markMigrationRecordIfMissing(sqlite: Database.Database, record: MigrationRecord): boolean {
+function markMigrationRecordIfMissing(sqlite: BetterSqliteDatabase, record: MigrationRecord): boolean {
   ensureDrizzleMigrationsTable(sqlite);
   const existing = sqlite
     .prepare('SELECT rowid, "created_at" FROM "__drizzle_migrations" WHERE "hash" = ? ORDER BY "created_at" DESC LIMIT 1')
@@ -296,7 +298,7 @@ function markMigrationRecordIfMissing(sqlite: Database.Database, record: Migrati
   return true;
 }
 
-function hasMigrationRecord(sqlite: Database.Database, record: MigrationRecord): boolean {
+function hasMigrationRecord(sqlite: BetterSqliteDatabase, record: MigrationRecord): boolean {
   if (!tableExists(sqlite, '__drizzle_migrations')) return false;
   const row = sqlite
     .prepare('SELECT 1 FROM "__drizzle_migrations" WHERE "hash" = ? LIMIT 1')
@@ -377,7 +379,7 @@ function isOauthIdentityUniqueConflictError(error: unknown): boolean {
     === normalizeSqlForMatch('CREATE UNIQUE INDEX `accounts_oauth_identity_unique` ON `accounts` (`oauth_provider`,`oauth_account_key`,`oauth_project_id`);');
 }
 
-function replayMigrationStatements(sqlite: Database.Database, statements: string[]): void {
+function replayMigrationStatements(sqlite: BetterSqliteDatabase, statements: string[]): void {
   for (const statement of statements) {
     try {
       sqlite.exec(statement);
@@ -416,7 +418,7 @@ function replayMigrationStatements(sqlite: Database.Database, statements: string
 }
 
 function recoverMigrationSequence(
-  sqlite: Database.Database,
+  sqlite: BetterSqliteDatabase,
   migrationsFolder: string,
   failedMigrationTag: string,
 ): number {
@@ -444,7 +446,7 @@ function recoverMigrationSequence(
   return recoveredCount;
 }
 
-function backfillMissingRecordedMigrations(sqlite: Database.Database, migrationsFolder: string): number {
+function backfillMissingRecordedMigrations(sqlite: BetterSqliteDatabase, migrationsFolder: string): number {
   if (!tableExists(sqlite, '__drizzle_migrations')) return 0;
 
   let recoveredCount = 0;
@@ -469,13 +471,27 @@ function backfillMissingRecordedMigrations(sqlite: Database.Database, migrations
   return recoveredCount;
 }
 
+function applyAllMigrationsFromFiles(sqlite: BetterSqliteDatabase, migrationsFolder: string): number {
+  ensureDrizzleMigrationsTable(sqlite);
+  let appliedCount = 0;
+  for (const migration of readRecoveryMigrations(migrationsFolder)) {
+    if (!hasMigrationRecord(sqlite, migration)) {
+      replayMigrationStatements(sqlite, migration.statements);
+    }
+    if (markMigrationRecordIfMissing(sqlite, migration)) {
+      appliedCount += 1;
+    }
+  }
+  return appliedCount;
+}
+
 type DuplicateColumnRecoveryResult = {
   tag: string;
   recoveredCount: number;
 };
 
 function recoverDuplicateColumnMigrationError(
-  sqlite: Database.Database,
+  sqlite: BetterSqliteDatabase,
   migrationsFolder: string,
   error: unknown,
 ): DuplicateColumnRecoveryResult | null {
@@ -566,7 +582,7 @@ function runSqliteMigrationRecoveryLoop(input: SqliteMigrationRecoveryLoopInput)
 }
 
 function tryRecoverDuplicateColumnMigrationError(
-  sqlite: Database.Database,
+  sqlite: BetterSqliteDatabase,
   migrationsFolder: string,
   error: unknown,
 ): boolean {
@@ -575,7 +591,7 @@ function tryRecoverDuplicateColumnMigrationError(
 }
 
 function rewriteDownstreamSiteWeightMultipliers(
-  sqlite: Database.Database,
+  sqlite: BetterSqliteDatabase,
   siteIdMapping: Map<number, number>,
 ): void {
   if (siteIdMapping.size <= 0) return;
@@ -620,7 +636,7 @@ function rewriteDownstreamSiteWeightMultipliers(
   }
 }
 
-function deduplicateLegacySitesForUniqueIndex(sqlite: Database.Database): boolean {
+function deduplicateLegacySitesForUniqueIndex(sqlite: BetterSqliteDatabase): boolean {
   const duplicateGroups = sqlite.prepare(`
     SELECT platform, url
     FROM sites
@@ -675,7 +691,7 @@ function deduplicateLegacySitesForUniqueIndex(sqlite: Database.Database): boolea
   return siteIdMapping.size > 0;
 }
 
-function deduplicateLegacyOauthAccountsForUniqueIndex(sqlite: Database.Database): number {
+function deduplicateLegacyOauthAccountsForUniqueIndex(sqlite: BetterSqliteDatabase): number {
   const columns = sqlite.pragma('table_info(accounts)') as Array<{ name: string }>;
   const hasOauthProvider = columns.some((col) => col.name === 'oauth_provider');
   const hasOauthAccountKey = columns.some((col) => col.name === 'oauth_account_key');
@@ -754,7 +770,7 @@ export const __migrateTestUtils = {
   sqliteMigrationRecoveryRetryBudget: SQLITE_MIGRATION_RECOVERY_RETRY_BUDGET,
 };
 
-function bootstrapLegacyDrizzleMigrations(sqlite: Database.Database, migrationsFolder: string): boolean {
+function bootstrapLegacyDrizzleMigrations(sqlite: BetterSqliteDatabase, migrationsFolder: string): boolean {
   if (hasRecordedDrizzleMigrations(sqlite)) return false;
   if (!hasVerifiedLegacySchema(sqlite)) return false;
 
@@ -781,6 +797,17 @@ function bootstrapLegacyDrizzleMigrations(sqlite: Database.Database, migrationsF
   return true;
 }
 
+function createSqliteMigrationConnection(dbPath: string): BetterSqliteDatabase {
+  const runtimeBun = (globalThis as { Bun?: unknown }).Bun;
+  const require = createRequire(import.meta.url);
+  if (runtimeBun) {
+    const bunSqlite = require('bun:sqlite') as { Database: new (path: string) => BetterSqliteDatabase };
+    return new bunSqlite.Database(dbPath);
+  }
+  const BetterSqlite3 = require('better-sqlite3') as (new (path: string) => BetterSqliteDatabase);
+  return new BetterSqlite3(dbPath);
+}
+
 export function runSqliteMigrations(): void {
   const dbPath = resolveSqliteDbPath();
   const migrationsFolder = resolveMigrationsFolder();
@@ -788,9 +815,18 @@ export function runSqliteMigrations(): void {
     mkdirSync(dirname(dbPath), { recursive: true });
   }
 
-  const sqlite = new Database(dbPath);
+  const sqlite = createSqliteMigrationConnection(dbPath);
   bootstrapLegacyDrizzleMigrations(sqlite, migrationsFolder);
   backfillMissingRecordedMigrations(sqlite, migrationsFolder);
+
+  const runtimeBun = (globalThis as { Bun?: unknown }).Bun;
+  if (runtimeBun) {
+    const appliedCount = applyAllMigrationsFromFiles(sqlite, migrationsFolder);
+    console.log(`[db] Bun runtime detected: applied ${appliedCount} migration record(s) via SQL file replay.`);
+    sqlite.close();
+    console.log('Migration complete.');
+    return;
+  }
 
   runSqliteMigrationRecoveryLoop({
     runMigrate: () => {
