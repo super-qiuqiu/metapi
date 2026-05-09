@@ -119,6 +119,36 @@ describe('responses conversion single source of truth', () => {
       }),
     ]);
   });
+
+  it('flattens object image_url blocks into string responses input urls', () => {
+    const normalized = normalizeResponsesInputForCompatibility([
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'image_url',
+            image_url: {
+              url: 'https://example.com/object-image.png',
+              detail: 'high',
+            },
+          },
+        ],
+      },
+    ]);
+
+    expect(normalized).toEqual([
+      expect.objectContaining({
+        type: 'message',
+        role: 'user',
+        content: [
+          expect.objectContaining({
+            type: 'input_image',
+            image_url: 'https://example.com/object-image.png',
+          }),
+        ],
+      }),
+    ]);
+  });
 });
 
 describe('sanitizeResponsesBodyForProxy', () => {

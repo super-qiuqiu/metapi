@@ -75,7 +75,7 @@ function normalizeImageUrlValue(value: unknown): string | Record<string, unknown
   if (typeof value === 'string' && value.trim().length > 0) return value;
   if (!isRecord(value)) return null;
   const url = asTrimmedString(value.url);
-  if (url) return { ...value, url };
+  if (url) return url;
   const imageUrl = asTrimmedString(value.image_url);
   if (imageUrl) return imageUrl;
   return Object.keys(value).length > 0 ? value : null;
