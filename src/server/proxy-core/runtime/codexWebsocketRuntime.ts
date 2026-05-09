@@ -292,6 +292,12 @@ async function sendSessionRequestAttempt(
         const parsed = JSON.parse(String(payload));
         if (!isRecord(parsed)) return;
         events.push(parsed);
+        try {
+          input.onEvent?.(parsed);
+        } catch {
+          // Ignore downstream stream callback failures; runtime terminal handling
+          // is governed by websocket protocol terminal events.
+        }
         if (!isTerminalEvent(parsed)) return;
         if (settled) return;
         if (

@@ -48,6 +48,16 @@ export async function dispatchCodexWebsocketRequest(
       } : {}),
     };
 
+    if (isStream) {
+      return buildCodexWsStreamingResponse({
+        wsSessionId,
+        requestUrl,
+        runtimeHeaders,
+        body: endpointRequest.body as Record<string, unknown>,
+        agent: wsAgent,
+      });
+    }
+
     const result = await codexWsBridgeRuntime.sendRequest({
       sessionId: wsSessionId,
       requestUrl,
@@ -158,5 +168,70 @@ function buildCodexWsResponse(
   return new Response(JSON.stringify(finalEvent), {
     status,
     headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+function buildCodexWsStreamingResponse(input: {
+  wsSessionId: string;
+  requestUrl: string;
+  runtimeHeaders: Record<string, string>;
+  body: Record<string, unknown>;
+  agent?: unknown;
+}): Response {
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream({
+    async start(controller) {
+      const sendSse = (event: Record<string, unknown>) => {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+      };
+
+      try {
+        await codexWsBridgeRuntime.sendRequest({
+          sessionId: input.wsSessionId,
+          requestUrl: input.requestUrl,
+          headers: input.runtimeHeaders,
+          body: input.body,
+          agent: input.agent,
+          onEvent: sendSse,
+        });
+      } catch (error) {
+        const runtimeError = error instanceof CodexWebsocketRuntimeError
+          ? error
+          : new CodexWebsocketRuntimeError(
+            error instanceof Error
+              ? error.message || 'upstream websocket request failed'
+              : 'upstream websocket request failed',
+            {
+              payload: error && typeof error === 'object'
+                ? {
+                  raw_error_type: (error as { name?: unknown }).name ?? null,
+                  raw_error_message: (error as { message?: unknown }).message ?? null,
+                  raw_error_stack: (error as { stack?: unknown }).stack ?? null,
+                }
+                : null,
+            },
+          );
+        const errorEvent = runtimeError.events && runtimeError.events.length > 0
+          ? runtimeError.events[runtimeError.events.length - 1]
+          : {
+            type: 'error',
+            status: runtimeError.status || 502,
+            error: {
+              message: runtimeError.message,
+              raw_error_type: runtimeError.name,
+              payload: runtimeError.payload ?? null,
+            },
+          };
+        sendSse(errorEvent);
+      }
+
+      controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+      controller.close();
+    },
+  });
+
+  return new Response(stream, {
+    status: 200,
+    headers: { 'Content-Type': 'text/event-stream' },
   });
 }

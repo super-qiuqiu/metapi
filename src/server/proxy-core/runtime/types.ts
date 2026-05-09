@@ -6,6 +6,7 @@ export type CodexWebsocketRuntimeSendInput = {
   headers: Record<string, string>;
   body: Record<string, unknown>;
   agent?: unknown;
+  onEvent?: (event: Record<string, unknown>) => void;
 };
 
 export type CodexWebsocketRuntimeResult = {

@@ -599,10 +599,23 @@ export async function handleChatSurfaceRequest(
       const upstream = endpointResult.upstream;
       const successfulUpstreamPath = endpointResult.upstreamPath;
       const firstByteLatencyMs = getObservedResponseMeta(upstream)?.firstByteLatencyMs ?? null;
+      const upstreamContentType = (upstream.headers.get('content-type') || '').toLowerCase();
+      request.log.info({
+        event: 'chat_surface_stream_probe',
+        requestedModel,
+        actualModel: modelName,
+        downstreamPath,
+        upstreamPath: successfulUpstreamPath,
+        downstreamStreamRequested: isStream,
+        upstreamContentType,
+      }, '[proxy/chat] stream probe');
 
       if (isStream) {
-        const upstreamContentType = (upstream.headers.get('content-type') || '').toLowerCase();
         let streamStarted = false;
+        const shouldTreatAsStreamingTransport = (
+          upstreamContentType.includes('text/event-stream')
+          || (upstreamContentType.length === 0 && successfulUpstreamPath.endsWith('/responses'))
+        );
         const startSseResponse = () => {
           if (streamStarted) return;
           streamStarted = true;
@@ -677,7 +690,7 @@ export async function handleChatSurfaceRequest(
           },
         });
         let rawText = '';
-        if (!upstreamContentType.includes('text/event-stream')) {
+        if (!shouldTreatAsStreamingTransport) {
           const fallbackText = await readRuntimeResponseText(upstream);
           rawText = fallbackText;
           if (looksLikeResponsesSseText(fallbackText)) {
@@ -924,7 +937,6 @@ export async function handleChatSurfaceRequest(
         return;
       }
 
-      const upstreamContentType = (upstream.headers.get('content-type') || '').toLowerCase();
       let rawText = '';
       let upstreamData: unknown;
       if (upstreamContentType.includes('text/event-stream') && successfulUpstreamPath.endsWith('/responses')) {
