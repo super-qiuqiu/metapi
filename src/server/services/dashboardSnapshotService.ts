@@ -1,17 +1,12 @@
 import { and, eq, gte, lt, sql } from "drizzle-orm";
 import { db, schema } from "../db/index.js";
-import {
-  buildModelAnalysis,
-  buildModelAnalysisFromDailyUsage,
-} from "./modelAnalysisService.js";
+import { buildModelAnalysis } from "./modelAnalysisService.js";
 import { parseCheckinRewardAmount } from "./checkinRewardParser.js";
 import {
-  formatLocalDate,
   formatUtcSqlDateTime,
   getLocalDayRangeUtc,
   getLocalHourAnchor,
   getLocalHourRangeStartUtc,
-  getLocalRangeStartDayKey,
 } from "./localTimeService.js";
 import {
   readSnapshotCache,
@@ -52,7 +47,7 @@ export type DashboardInsightsPayload = {
   siteAvailability: ReturnType<
     typeof buildSiteAvailabilitySummariesFromHourlyAggregates
   >;
-  modelAnalysis: ReturnType<typeof buildModelAnalysisFromDailyUsage>;
+  modelAnalysis: ReturnType<typeof buildModelAnalysis>;
 };
 
 const DASHBOARD_SUMMARY_TTL_MS = 12_000;
@@ -263,21 +258,29 @@ async function loadDashboardInsightsPayload(input: {
     SITE_AVAILABILITY_BUCKET_COUNT,
     siteAvailabilityNow,
   );
-  const todayDayKey = formatLocalDate(new Date());
+
   const fromDay = (input.modelFromDay || "").trim();
   const toDay = (input.modelToDay || "").trim();
   const hasCustomRange = fromDay.length > 0 && toDay.length > 0 && fromDay <= toDay;
-  const modelAnalysisSinceDay = hasCustomRange
-    ? fromDay
-    : getLocalRangeStartDayKey(input.modelDays);
-  const modelAnalysisToDay = hasCustomRange ? toDay : todayDayKey;
   const modelHours = Number.isFinite(input.modelHours)
     ? Math.max(1, Math.min(24 * 365, Math.floor(input.modelHours || 0)))
     : null;
+
+  const modelFromUtc = modelHours
+    ? formatUtcSqlDateTime(new Date(Date.now() - modelHours * 60 * 60 * 1000))
+    : hasCustomRange
+      ? formatUtcSqlDateTime(new Date(`${fromDay}T00:00:00`))
+      : formatUtcSqlDateTime(
+          new Date(new Date().getTime() - Math.max(1, input.modelDays) * 24 * 60 * 60 * 1000),
+        );
+
+  const modelToUtc = hasCustomRange
+    ? formatUtcSqlDateTime(new Date(new Date(`${toDay}T00:00:00`).getTime() + 24 * 60 * 60 * 1000))
+    : formatUtcSqlDateTime(new Date());
+
   await runUsageAggregationProjectionPass();
 
-  const [activeSites, siteAvailabilityRows, modelDayRows, modelLogRows] =
-    await Promise.all([
+  const [activeSites, siteAvailabilityRows, modelLogRows] = await Promise.all([
       db
         .select({
           id: schema.sites.id,
@@ -296,45 +299,29 @@ async function loadDashboardInsightsPayload(input: {
         .where(gte(schema.siteHourUsage.bucketStartUtc, siteAvailabilitySinceUtc))
         .all(),
       db
-        .select()
-        .from(schema.modelDayUsage)
+        .select({
+          createdAt: schema.proxyLogs.createdAt,
+          modelActual: schema.proxyLogs.modelActual,
+          modelRequested: schema.proxyLogs.modelRequested,
+          status: schema.proxyLogs.status,
+          latencyMs: schema.proxyLogs.latencyMs,
+          totalTokens: schema.proxyLogs.totalTokens,
+          estimatedCost: proxyCostSqlExpression(),
+        })
+        .from(schema.proxyLogs)
+        .innerJoin(
+          schema.accounts,
+          eq(schema.proxyLogs.accountId, schema.accounts.id),
+        )
+        .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
         .where(
           and(
-            gte(schema.modelDayUsage.localDay, modelAnalysisSinceDay),
-            lt(schema.modelDayUsage.localDay, `${modelAnalysisToDay}~`),
+            eq(schema.sites.status, "active"),
+            gte(schema.proxyLogs.createdAt, modelFromUtc),
+            lt(schema.proxyLogs.createdAt, modelToUtc),
           ),
         )
         .all(),
-      modelHours
-        ? db
-            .select({
-              createdAt: schema.proxyLogs.createdAt,
-              modelActual: schema.proxyLogs.modelActual,
-              modelRequested: schema.proxyLogs.modelRequested,
-              status: schema.proxyLogs.status,
-              latencyMs: schema.proxyLogs.latencyMs,
-              totalTokens: schema.proxyLogs.totalTokens,
-              estimatedCost: proxyCostSqlExpression(),
-            })
-            .from(schema.proxyLogs)
-            .innerJoin(
-              schema.accounts,
-              eq(schema.proxyLogs.accountId, schema.accounts.id),
-            )
-            .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
-            .where(
-              and(
-                eq(schema.sites.status, "active"),
-                gte(
-                  schema.proxyLogs.createdAt,
-                  formatUtcSqlDateTime(
-                    new Date(Date.now() - modelHours * 60 * 60 * 1000),
-                  ),
-                ),
-              ),
-            )
-            .all()
-        : Promise.resolve([]),
     ]);
 
   const sortedSites = activeSites.sort(
@@ -366,35 +353,20 @@ async function loadDashboardInsightsPayload(input: {
         })),
       siteAvailabilityNow,
     ),
-    modelAnalysis: modelHours
-      ? buildModelAnalysis(modelLogRows, {
-          days: Math.max(1, Math.ceil(modelHours / 24)),
-        })
-      : buildModelAnalysisFromDailyUsage(
-          modelDayRows
-            .filter((row) => activeSiteIdSet.has(row.siteId))
-            .map((row) => ({
-              localDay: row.localDay,
-              model: row.model,
-              totalCalls: row.totalCalls,
-              successCalls: row.successCalls,
-              totalTokens: row.totalTokens,
-              totalSpend: row.totalSpend,
-              totalLatencyMs: row.totalLatencyMs,
-            })),
-          {
-            days: hasCustomRange
-              ? Math.max(
-                  1,
-                  Math.floor(
-                    (new Date(`${modelAnalysisToDay}T00:00:00`).getTime() -
-                      new Date(`${modelAnalysisSinceDay}T00:00:00`).getTime()) /
-                      (24 * 60 * 60 * 1000),
-                  ) + 1,
-                )
-              : input.modelDays,
-          },
-        ),
+    modelAnalysis: buildModelAnalysis(modelLogRows, {
+      days: modelHours
+        ? Math.max(1, Math.ceil(modelHours / 24))
+        : hasCustomRange
+          ? Math.max(
+              1,
+              Math.floor(
+                (new Date(`${toDay}T00:00:00`).getTime() -
+                  new Date(`${fromDay}T00:00:00`).getTime()) /
+                  (24 * 60 * 60 * 1000),
+              ) + 1,
+            )
+          : input.modelDays,
+    }),
   };
 }
 
