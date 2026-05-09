@@ -238,15 +238,12 @@ export default function Dashboard({
   >({});
   const [trendDays, setTrendDays] = useState(7);
   const [showInactiveSites, setShowInactiveSites] = useState(false);
-  const [modelAnalysisDays, setModelAnalysisDays] = useState(7);
-  const [modelRangeMode, setModelRangeMode] = useState<"preset" | "custom">(
-    "preset",
-  );
   const [modelDateFrom, setModelDateFrom] = useState("");
   const [modelDateTo, setModelDateTo] = useState("");
   const [modelFilter, setModelFilter] = useState<
-    { mode: "preset"; days: number } | { mode: "custom"; from: string; to: string }
-  >({ mode: "preset", days: 7 });
+    | { mode: "preset"; unit: "hours" | "days"; value: number }
+    | { mode: "custom"; from: string; to: string }
+  >({ mode: "preset", unit: "hours", value: 1 });
   const toast = useToast();
   const normalizedAdminName = (adminName || "").trim() || "\u7ba1\u7406\u5458";
 
@@ -286,7 +283,9 @@ export default function Dashboard({
         ...(forceRefresh ? { refresh: true } : {}),
         ...(modelFilter.mode === "custom"
           ? { modelFrom: modelFilter.from, modelTo: modelFilter.to }
-          : { modelDays: modelFilter.days }),
+          : modelFilter.unit === "hours"
+            ? { modelHours: modelFilter.value }
+            : { modelDays: modelFilter.value }),
       });
       setInsightsData(result);
     } catch (err) {
@@ -1042,39 +1041,47 @@ export default function Dashboard({
                 justifyContent: "flex-end",
               }}
             >
-              {[7, 30, 90].map((d) => (
-                <button
-                  key={d}
-                  onClick={() => {
-                    setModelRangeMode("preset");
-                    setModelAnalysisDays(d);
-                    setModelFilter({ mode: "preset", days: d });
-                  }}
-                  style={{
-                    padding: "4px 10px",
-                    borderRadius: 6,
-                    fontSize: 12,
-                    fontWeight: 500,
-                    border: "none",
-                    cursor: "pointer",
-                    background:
-                      modelRangeMode === "preset" && modelAnalysisDays === d
+              {[
+                { label: "1h", unit: "hours" as const, value: 1 },
+                { label: "24h", unit: "hours" as const, value: 24 },
+                { label: "7天", unit: "days" as const, value: 7 },
+                { label: "30天", unit: "days" as const, value: 30 },
+              ].map((preset) => {
+                const active =
+                  modelFilter.mode === "preset" &&
+                  modelFilter.unit === preset.unit &&
+                  modelFilter.value === preset.value;
+                return (
+                  <button
+                    key={`${preset.unit}-${preset.value}`}
+                    onClick={() => {
+                      setModelFilter({
+                        mode: "preset",
+                        unit: preset.unit,
+                        value: preset.value,
+                      });
+                    }}
+                    style={{
+                      padding: "4px 10px",
+                      borderRadius: 6,
+                      fontSize: 12,
+                      fontWeight: 500,
+                      border: "none",
+                      cursor: "pointer",
+                      background: active
                         ? "var(--color-primary)"
                         : "var(--color-bg)",
-                    color:
-                      modelRangeMode === "preset" && modelAnalysisDays === d
-                        ? "white"
-                        : "var(--color-text-secondary)",
-                  }}
-                >
-                  {d}天
-                </button>
-              ))}
+                      color: active ? "white" : "var(--color-text-secondary)",
+                    }}
+                  >
+                    {preset.label}
+                  </button>
+                );
+              })}
               <input
                 type="date"
                 value={modelDateFrom}
                 onChange={(e) => {
-                  setModelRangeMode("custom");
                   setModelDateFrom(e.target.value);
                 }}
                 style={{
@@ -1093,7 +1100,6 @@ export default function Dashboard({
                 type="date"
                 value={modelDateTo}
                 onChange={(e) => {
-                  setModelRangeMode("custom");
                   setModelDateTo(e.target.value);
                 }}
                 style={{
@@ -1115,7 +1121,6 @@ export default function Dashboard({
                     toast.error("开始日期不能晚于结束日期");
                     return;
                   }
-                  setModelRangeMode("custom");
                   setModelFilter({
                     mode: "custom",
                     from: modelDateFrom,

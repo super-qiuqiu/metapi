@@ -74,6 +74,12 @@ function normalizeDashboardModelDays(raw?: string): number {
   return Math.max(1, Math.min(365, parsed));
 }
 
+function normalizeDashboardModelHours(raw?: string): number | null {
+  const parsed = Number.parseInt((raw || "").trim(), 10);
+  if (!Number.isFinite(parsed)) return null;
+  return Math.max(1, Math.min(24 * 365, parsed));
+}
+
 function normalizeDashboardDayKey(raw?: string): string | null {
   const value = (raw || "").trim();
   if (!value) return null;
@@ -661,12 +667,13 @@ export async function statsRoutes(app: FastifyInstance) {
   const proxyLogModelAnalysisFields = buildProxyLogModelAnalysisSelectFields();
   const proxyLogSiteTrendFields = buildProxyLogSiteTrendSelectFields();
 
-  app.get<{ Querystring: { refresh?: string; view?: string; modelDays?: string; modelFrom?: string; modelTo?: string } }>(
+  app.get<{ Querystring: { refresh?: string; view?: string; modelDays?: string; modelHours?: string; modelFrom?: string; modelTo?: string } }>(
     "/api/stats/dashboard",
     async (request, reply) => {
       const forceRefresh = parseBooleanFlag(request.query.refresh);
       const view = normalizeDashboardView(request.query.view);
       const modelDays = normalizeDashboardModelDays(request.query.modelDays);
+      const modelHours = normalizeDashboardModelHours(request.query.modelHours);
       const modelFromDay = normalizeDashboardDayKey(request.query.modelFrom);
       const modelToDay = normalizeDashboardDayKey(request.query.modelTo);
       if (view === "summary") {
@@ -681,6 +688,7 @@ export async function statsRoutes(app: FastifyInstance) {
         const snapshot = await getDashboardInsightsSnapshot({
           forceRefresh,
           modelDays,
+          modelHours: modelHours ?? undefined,
           modelFromDay,
           modelToDay,
         });
@@ -696,6 +704,7 @@ export async function statsRoutes(app: FastifyInstance) {
         getDashboardInsightsSnapshot({
           forceRefresh,
           modelDays,
+          modelHours: modelHours ?? undefined,
           modelFromDay,
           modelToDay,
         }),

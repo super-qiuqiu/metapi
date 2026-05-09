@@ -1,6 +1,9 @@
 import { and, eq, gte, lt, sql } from "drizzle-orm";
 import { db, schema } from "../db/index.js";
-import { buildModelAnalysisFromDailyUsage } from "./modelAnalysisService.js";
+import {
+  buildModelAnalysis,
+  buildModelAnalysisFromDailyUsage,
+} from "./modelAnalysisService.js";
 import { parseCheckinRewardAmount } from "./checkinRewardParser.js";
 import {
   formatLocalDate,
@@ -251,6 +254,7 @@ async function loadDashboardSummaryPayload(): Promise<DashboardSummaryPayload> {
 
 async function loadDashboardInsightsPayload(input: {
   modelDays: number;
+  modelHours?: number | null;
   modelFromDay?: string | null;
   modelToDay?: string | null;
 }): Promise<DashboardInsightsPayload> {
@@ -267,9 +271,12 @@ async function loadDashboardInsightsPayload(input: {
     ? fromDay
     : getLocalRangeStartDayKey(input.modelDays);
   const modelAnalysisToDay = hasCustomRange ? toDay : todayDayKey;
+  const modelHours = Number.isFinite(input.modelHours)
+    ? Math.max(1, Math.min(24 * 365, Math.floor(input.modelHours || 0)))
+    : null;
   await runUsageAggregationProjectionPass();
 
-  const [activeSites, siteAvailabilityRows, modelDayRows] =
+  const [activeSites, siteAvailabilityRows, modelDayRows, modelLogRows] =
     await Promise.all([
       db
         .select({
@@ -298,6 +305,36 @@ async function loadDashboardInsightsPayload(input: {
           ),
         )
         .all(),
+      modelHours
+        ? db
+            .select({
+              createdAt: schema.proxyLogs.createdAt,
+              modelActual: schema.proxyLogs.modelActual,
+              modelRequested: schema.proxyLogs.modelRequested,
+              status: schema.proxyLogs.status,
+              latencyMs: schema.proxyLogs.latencyMs,
+              totalTokens: schema.proxyLogs.totalTokens,
+              estimatedCost: proxyCostSqlExpression(),
+            })
+            .from(schema.proxyLogs)
+            .innerJoin(
+              schema.accounts,
+              eq(schema.proxyLogs.accountId, schema.accounts.id),
+            )
+            .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
+            .where(
+              and(
+                eq(schema.sites.status, "active"),
+                gte(
+                  schema.proxyLogs.createdAt,
+                  formatUtcSqlDateTime(
+                    new Date(Date.now() - modelHours * 60 * 60 * 1000),
+                  ),
+                ),
+              ),
+            )
+            .all()
+        : Promise.resolve([]),
     ]);
 
   const sortedSites = activeSites.sort(
@@ -329,31 +366,35 @@ async function loadDashboardInsightsPayload(input: {
         })),
       siteAvailabilityNow,
     ),
-    modelAnalysis: buildModelAnalysisFromDailyUsage(
-      modelDayRows
-        .filter((row) => activeSiteIdSet.has(row.siteId))
-        .map((row) => ({
-          localDay: row.localDay,
-          model: row.model,
-          totalCalls: row.totalCalls,
-          successCalls: row.successCalls,
-          totalTokens: row.totalTokens,
-          totalSpend: row.totalSpend,
-          totalLatencyMs: row.totalLatencyMs,
-        })),
-      {
-        days: hasCustomRange
-          ? Math.max(
-              1,
-              Math.floor(
-                (new Date(`${modelAnalysisToDay}T00:00:00`).getTime() -
-                  new Date(`${modelAnalysisSinceDay}T00:00:00`).getTime()) /
-                  (24 * 60 * 60 * 1000),
-              ) + 1,
-            )
-          : input.modelDays,
-      },
-    ),
+    modelAnalysis: modelHours
+      ? buildModelAnalysis(modelLogRows, {
+          days: Math.max(1, Math.ceil(modelHours / 24)),
+        })
+      : buildModelAnalysisFromDailyUsage(
+          modelDayRows
+            .filter((row) => activeSiteIdSet.has(row.siteId))
+            .map((row) => ({
+              localDay: row.localDay,
+              model: row.model,
+              totalCalls: row.totalCalls,
+              successCalls: row.successCalls,
+              totalTokens: row.totalTokens,
+              totalSpend: row.totalSpend,
+              totalLatencyMs: row.totalLatencyMs,
+            })),
+          {
+            days: hasCustomRange
+              ? Math.max(
+                  1,
+                  Math.floor(
+                    (new Date(`${modelAnalysisToDay}T00:00:00`).getTime() -
+                      new Date(`${modelAnalysisSinceDay}T00:00:00`).getTime()) /
+                      (24 * 60 * 60 * 1000),
+                  ) + 1,
+                )
+              : input.modelDays,
+          },
+        ),
   };
 }
 
@@ -373,6 +414,7 @@ export async function getDashboardSummarySnapshot(options?: {
 export async function getDashboardInsightsSnapshot(options?: {
   forceRefresh?: boolean;
   modelDays?: number;
+  modelHours?: number;
   modelFromDay?: string | null;
   modelToDay?: string | null;
 }): Promise<SnapshotEnvelope<DashboardInsightsPayload>> {
@@ -381,15 +423,21 @@ export async function getDashboardInsightsSnapshot(options?: {
     : 7;
   const modelFromDay = (options?.modelFromDay || "").trim() || null;
   const modelToDay = (options?.modelToDay || "").trim() || null;
+  const modelHours = Number.isFinite(options?.modelHours)
+    ? Math.max(1, Math.min(24 * 365, Math.floor(options?.modelHours || 0)))
+    : null;
   const hasCustomRange = !!(
+    !modelHours &&
     modelFromDay &&
     modelToDay &&
     modelFromDay <= modelToDay
   );
 
-  const cacheKey = hasCustomRange
-    ? `model-range:${modelFromDay}:${modelToDay}`
-    : `model-days:${modelDays}`;
+  const cacheKey = modelHours
+    ? `model-hours:${modelHours}`
+    : hasCustomRange
+      ? `model-range:${modelFromDay}:${modelToDay}`
+      : `model-days:${modelDays}`;
 
   return readSnapshotCache({
     namespace: "dashboard-insights",
@@ -400,6 +448,7 @@ export async function getDashboardInsightsSnapshot(options?: {
     loader: () =>
       loadDashboardInsightsPayload({
         modelDays,
+        modelHours,
         modelFromDay,
         modelToDay,
       }),

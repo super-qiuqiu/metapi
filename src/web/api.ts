@@ -1063,6 +1063,7 @@ export const api = {
   getDashboardInsights: (options?: {
     refresh?: boolean;
     modelDays?: number;
+    modelHours?: number;
     modelFrom?: string;
     modelTo?: string;
   }) =>
@@ -1072,6 +1073,9 @@ export const api = {
         ...(options?.refresh ? { refresh: 1 } : {}),
         ...(typeof options?.modelDays === "number"
           ? { modelDays: Math.max(1, Math.min(365, Math.floor(options.modelDays))) }
+          : {}),
+        ...(typeof options?.modelHours === "number"
+          ? { modelHours: Math.max(1, Math.min(24 * 365, Math.floor(options.modelHours))) }
           : {}),
         ...(options?.modelFrom ? { modelFrom: options.modelFrom } : {}),
         ...(options?.modelTo ? { modelTo: options.modelTo } : {}),
