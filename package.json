@@ -28,6 +28,8 @@
   "scripts": {
     "dev:server": "tsx scripts/dev/run-server.ts --watch",
     "dev": "concurrently \"npm run dev:server\" \"vite\"",
+    "dev:termux": "HOST=127.0.0.1 concurrently \"npm run dev:server\" \"vite --host 127.0.0.1 --port 5173\"", 
+    "dev:termux:nvm": "bash -lc 'export NVM_DIR=\"$HOME/.nvm\"; . \"$NVM_DIR/nvm.sh\"; nvm use 25 >/dev/null; HOST=127.0.0.1 bun run dev:termux'",  
     "dev:desktop": "concurrently \"npm run dev:server\" \"vite\" \"tsc -p tsconfig.desktop.json --watch --preserveWatchOutput\" \"wait-on tcp:127.0.0.1:4000 http://127.0.0.1:5173 file:dist/desktop/main.js && cross-env METAPI_DESKTOP_DEV_SERVER_URL=http://127.0.0.1:5173 METAPI_DESKTOP_EXTERNAL_SERVER_URL=http://127.0.0.1:4000 electron dist/desktop/main.js\"",
     "desktop:icons": "node scripts/desktop/generate-icons.mjs",
     "build:web": "npm run desktop:icons && vite build",
