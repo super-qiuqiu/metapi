@@ -43,10 +43,10 @@ RUN apt-get update \
   && chmod +x /usr/local/bin/helm \
   && rm -rf /tmp/helm.tgz "/tmp/linux-${ARCH}" /var/lib/apt/lists/*
 
-COPY package.json bun.lock ./
-RUN bun install --production --frozen-lockfile
-
+COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/package.json ./package.json
+COPY --from=builder /app/bun.lock ./bun.lock
 COPY --from=builder /app/drizzle ./drizzle
 
 RUN mkdir -p /app/data
