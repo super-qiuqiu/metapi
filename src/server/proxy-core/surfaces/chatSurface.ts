@@ -56,6 +56,7 @@ import { getRuntimeResponseReader, readRuntimeResponseText } from '../executors/
 import { detectDownstreamClientContext } from '../downstreamClientContext.js';
 import { getProxyMaxChannelRetries } from '../../services/proxyChannelRetry.js';
 import { shouldAbortSameSiteEndpointFallback } from '../../services/proxyRetryPolicy.js';
+import { resolveChannelProxyUrl } from '../../services/siteProxy.js';
 import {
   acquireSurfaceChannelLease,
   bindSurfaceStickyChannel,
@@ -69,6 +70,7 @@ import {
   selectSurfaceChannelForAttempt,
   trySurfaceOauthRefreshRecovery,
 } from './sharedSurface.js';
+import { dispatchCodexWebsocketRequest } from './codexWsBridge.js';
 import { runWithSiteApiEndpointPool, SiteApiEndpointRequestError } from '../../services/siteApiEndpointService.js';
 import {
   buildSurfaceProxyDebugResponseHeaders,
@@ -362,11 +364,32 @@ export async function handleChatSurfaceRequest(
           runtime: endpointRequest.runtime,
         };
       };
-      const dispatchRequest = createSurfaceDispatchRequest({
+      const baseDispatchRequest = createSurfaceDispatchRequest({
         site: selected.site,
         siteUrl: siteApiBaseUrl,
         accountExtraConfig: selected.account.extraConfig,
       });
+      const codexWsProxyUrl = resolveChannelProxyUrl(selected.site, selected.account.extraConfig);
+      const dispatchRequest = (
+        endpointRequest: BuiltEndpointRequest,
+        targetUrl?: string,
+      ) => {
+        if (!isCodexSite || !endpointRequest.path.startsWith('/responses')) {
+          return baseDispatchRequest(endpointRequest, targetUrl);
+        }
+        const modelLower = (modelName || '').trim().toLowerCase();
+        if (modelLower === 'gpt-5.5' && config.codexUpstreamWebsocketEnabled) {
+          return dispatchCodexWebsocketRequest(
+            endpointRequest,
+            targetUrl,
+            siteApiBaseUrl,
+            isStream || forceResponsesUpstreamStream,
+            codexSessionCacheKey || '',
+            codexWsProxyUrl,
+          ) as unknown as ReturnType<typeof baseDispatchRequest>;
+        }
+        return baseDispatchRequest(endpointRequest, targetUrl);
+      };
       const endpointStrategy = downstreamTransformer.compatibility.createEndpointStrategy({
         downstreamFormat,
         endpointCandidates,
