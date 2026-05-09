@@ -41,6 +41,7 @@ import {
   createSingleChunkStreamReader,
   looksLikeResponsesSseText,
 } from '../runtime/responsesSseFinal.js';
+import { dispatchCodexWebsocketRequest } from './codexWsBridge.js';
 import {
   createGeminiCliStreamReader,
   unwrapGeminiCliPayload,
@@ -68,6 +69,7 @@ import {
 import { detectDownstreamClientContext } from '../downstreamClientContext.js';
 import { getProxyMaxChannelRetries } from '../../services/proxyChannelRetry.js';
 import { shouldAbortSameSiteEndpointFallback } from '../../services/proxyRetryPolicy.js';
+import { resolveChannelProxyUrl } from '../../services/siteProxy.js';
 import {
   acquireSurfaceChannelLease,
   bindSurfaceStickyChannel,
@@ -580,12 +582,24 @@ export async function handleOpenAiResponsesSurfaceRequest(
           siteUrl: siteApiBaseUrl,
           accountExtraConfig: selected.account.extraConfig,
         });
+        const codexWsProxyUrl = resolveChannelProxyUrl(selected.site, selected.account.extraConfig);
         const dispatchRequest = (
           endpointRequest: BuiltEndpointRequest,
           targetUrl?: string,
         ) => {
           if (!isCodexSite || !endpointRequest.path.startsWith('/responses')) {
             return baseDispatchRequest(endpointRequest, targetUrl);
+          }
+          const modelLower = (modelName || '').trim().toLowerCase();
+          if (modelLower === 'gpt-5.5' && config.codexUpstreamWebsocketEnabled) {
+            return dispatchCodexWebsocketRequest(
+              endpointRequest,
+              targetUrl,
+              siteApiBaseUrl,
+              isStream || forceResponsesUpstreamStream,
+              codexSessionStoreKey || codexSessionId || '',
+              codexWsProxyUrl,
+            ) as unknown as ReturnType<typeof baseDispatchRequest>;
           }
           const sessionId = getCodexSessionHeaderValue(endpointRequest.headers);
           return runCodexHttpSessionTask(

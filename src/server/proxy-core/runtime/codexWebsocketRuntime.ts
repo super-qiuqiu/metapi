@@ -243,6 +243,7 @@ async function ensureSessionSocket(
 
   const nextSocket = new WebSocket(requestUrl, {
     headers: buildCodexWebsocketHandshakeHeaders(input.headers),
+    agent: input.agent as never,
   });
   await waitForSocketOpen(nextSocket);
   session.socket = nextSocket;
