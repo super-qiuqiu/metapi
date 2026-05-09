@@ -62,6 +62,29 @@ This single habit prevents most "forgot to update X" bugs.
 
 ---
 
+## Repository Branch Policy (Termux/Desktop Dual-Track)
+
+**Activation condition (important):**
+- Apply this policy **only** when the user explicitly indicates Termux/proot mobile workflow,
+  or when current branch context is explicitly `dev-termux`.
+- For normal desktop workflow, do **not** assume Termux constraints by default.
+
+When activated, use the following constraints:
+
+- Default development branch: `dev-termux` (track `origin/dev-termux`)
+- Push full mobile/termux development history to `origin/dev-termux`
+- Only after explicit user approval, sync **functional commits** to `main`
+- Keep `main` desktop-friendly:
+  - do not include termux-only scripts (`dev:termux*`)
+  - do not include mobile-only runtime workarounds
+  - do not include unrelated lockfile/cache churn
+
+Commit split rule:
+- Functional commits: allowed to enter `main`
+- Environment commits (termux/nvm/local bootstrap): keep on `dev-termux` only
+
+---
+
 ## How to Use This Directory
 
 1. **Before coding**: Skim the relevant thinking guide

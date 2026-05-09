@@ -218,10 +218,16 @@ python3 ./.trellis/scripts/task.py create "<title>" --slug <task-name>
        - 允许出现必要英文单词（如模块名、协议名、接口名），但应尽量少
        - scope 使用英文短词（如 routing、proxy、settings）
 
-6. Record session (one command)
+6. Push strategy (this repository)
+   --> Default working branch: dev-termux (track origin/dev-termux)
+   --> Push to origin/dev-termux for full mobile/termux development history
+   --> Only after explicit user approval, cherry-pick functional commits to main and push origin/main
+   --> main must stay desktop-friendly: do not include termux-only scripts, env hacks, or platform-specific lockfile noise
+
+7. Record session (one command)
    --> python3 ./.trellis/scripts/add_session.py --title "Title" --commit "hash"
 
-7. Finish task (clear current)
+8. Finish task (clear current)
    --> python3 ./.trellis/scripts/task.py finish
    --> Only when the task is fully done; otherwise leave it set so the
        next session resumes where you left off
@@ -386,6 +392,20 @@ python3 ./.trellis/scripts/task.py list-archive    # List archived tasks
 ```bash
 git commit -m "type(scope): 中文描述" -m "<中文 body>"
 ```
+
+### Branch & Merge Convention (Termux/Desktop Dual-Track)
+
+- 日常开发分支固定为 `dev-termux`，并保持跟踪 `origin/dev-termux`
+- 提交时必须拆分：
+  - **功能提交**：可进入 `main`
+  - **环境提交**（termux/nvm/本机脚本）：仅保留在 `dev-termux`
+- 推送流程：
+  1. 先推 `origin/dev-termux`（保留完整开发记录）
+  2. 经用户明确允许后，再将功能提交同步到 `main`
+- `main` 禁止混入：
+  - termux 专用脚本（如 `dev:termux*`）
+  - 仅手机环境需要的运行时 workaround
+  - 与功能无关的锁文件/缓存扰动
 
 **格式**: `type(scope): description + body`
 **Type**: `feat`、`fix`、`docs`、`refactor`、`test`、`chore`
