@@ -480,6 +480,31 @@ export const siteHourUsage = sqliteTable('site_hour_usage', {
   ),
 }));
 
+export const modelHourUsage = sqliteTable('model_hour_usage', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  bucketStartUtc: text('bucket_start_utc').notNull(),
+  siteId: integer('site_id').notNull().references(() => sites.id, { onDelete: 'cascade' }),
+  model: text('model').notNull(),
+  totalCalls: integer('total_calls').notNull().default(0),
+  successCalls: integer('success_calls').notNull().default(0),
+  failedCalls: integer('failed_calls').notNull().default(0),
+  totalTokens: integer('total_tokens').notNull().default(0),
+  totalSpend: real('total_spend').notNull().default(0),
+  totalLatencyMs: integer('total_latency_ms').notNull().default(0),
+  latencyCount: integer('latency_count').notNull().default(0),
+  createdAt: text('created_at').default(sql`(datetime('now'))`),
+  updatedAt: text('updated_at').default(sql`(datetime('now'))`),
+}, (table) => ({
+  hourSiteModelUnique: uniqueIndex('model_hour_usage_hour_site_model_unique').on(table.bucketStartUtc, table.siteId, table.model),
+  hourIdx: index('model_hour_usage_hour_idx').on(table.bucketStartUtc),
+  siteIdx: index('model_hour_usage_site_id_idx').on(table.siteId),
+  modelIdx: index('model_hour_usage_model_idx').on(table.model),
+  nonNegative: check(
+    'model_hour_usage_non_negative',
+    sql`${table.totalCalls} >= 0 and ${table.successCalls} >= 0 and ${table.failedCalls} >= 0 and ${table.totalTokens} >= 0 and ${table.totalSpend} >= 0 and ${table.totalLatencyMs} >= 0 and ${table.latencyCount} >= 0`,
+  ),
+}));
+
 export const modelDayUsage = sqliteTable('model_day_usage', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   localDay: text('local_day').notNull(),

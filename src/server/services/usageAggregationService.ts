@@ -82,10 +82,24 @@ type ModelDayUsageDeltaRow = {
   latencyCount: number;
 };
 
+type ModelHourUsageDeltaRow = {
+  bucketStartUtc: string;
+  siteId: number;
+  model: string;
+  totalCalls: number;
+  successCalls: number;
+  failedCalls: number;
+  totalTokens: number;
+  totalSpend: number;
+  totalLatencyMs: number;
+  latencyCount: number;
+};
+
 type ProjectionBatchDelta = {
   siteDayRows: SiteDayUsageDeltaRow[];
   siteHourRows: SiteHourUsageDeltaRow[];
   modelDayRows: ModelDayUsageDeltaRow[];
+  modelHourRows: ModelHourUsageDeltaRow[];
 };
 
 export type ProjectionPassResult = {
@@ -412,6 +426,7 @@ function buildProjectionBatchDelta(rows: ProxyLogProjectionRow[]): ProjectionBat
   const siteDayMap = new Map<string, SiteDayUsageDeltaRow>();
   const siteHourMap = new Map<string, SiteHourUsageDeltaRow>();
   const modelDayMap = new Map<string, ModelDayUsageDeltaRow>();
+  const modelHourMap = new Map<string, ModelHourUsageDeltaRow>();
 
   for (const row of rows) {
     const siteId = typeof row.siteId === 'number' && row.siteId > 0 ? row.siteId : null;
@@ -509,12 +524,35 @@ function buildProjectionBatchDelta(rows: ProxyLogProjectionRow[]): ProjectionBat
     modelDay.totalLatencyMs += latencyMs;
     modelDay.latencyCount += latencyCount;
     modelDayMap.set(modelDayKey, modelDay);
+
+    const modelHourKey = `${bucketStartUtc}:${siteId}:${model}`;
+    const modelHour = modelHourMap.get(modelHourKey) || {
+      bucketStartUtc,
+      siteId,
+      model,
+      totalCalls: 0,
+      successCalls: 0,
+      failedCalls: 0,
+      totalTokens: 0,
+      totalSpend: 0,
+      totalLatencyMs: 0,
+      latencyCount: 0,
+    };
+    modelHour.totalCalls += 1;
+    modelHour.successCalls += isSuccess ? 1 : 0;
+    modelHour.failedCalls += isSuccess ? 0 : 1;
+    modelHour.totalTokens += totalTokens;
+    modelHour.totalSpend += modelSpend;
+    modelHour.totalLatencyMs += latencyMs;
+    modelHour.latencyCount += latencyCount;
+    modelHourMap.set(modelHourKey, modelHour);
   }
 
   return {
     siteDayRows: Array.from(siteDayMap.values()),
     siteHourRows: Array.from(siteHourMap.values()),
     modelDayRows: Array.from(modelDayMap.values()),
+    modelHourRows: Array.from(modelHourMap.values()),
   };
 }
 
@@ -622,6 +660,56 @@ async function upsertSiteHourUsage(tx: typeof db, row: SiteHourUsageDeltaRow, up
     .run();
 }
 
+async function upsertModelHourUsage(tx: typeof db, row: ModelHourUsageDeltaRow, updatedAt: string) {
+  const values = {
+    bucketStartUtc: row.bucketStartUtc,
+    siteId: row.siteId,
+    model: row.model,
+    totalCalls: row.totalCalls,
+    successCalls: row.successCalls,
+    failedCalls: row.failedCalls,
+    totalTokens: row.totalTokens,
+    totalSpend: row.totalSpend,
+    totalLatencyMs: row.totalLatencyMs,
+    latencyCount: row.latencyCount,
+    updatedAt,
+  };
+
+  if (runtimeDbDialect === 'mysql') {
+    await (tx.insert(schema.modelHourUsage).values(values) as any)
+      .onDuplicateKeyUpdate({
+        set: {
+          totalCalls: sql`${schema.modelHourUsage.totalCalls} + ${row.totalCalls}`,
+          successCalls: sql`${schema.modelHourUsage.successCalls} + ${row.successCalls}`,
+          failedCalls: sql`${schema.modelHourUsage.failedCalls} + ${row.failedCalls}`,
+          totalTokens: sql`${schema.modelHourUsage.totalTokens} + ${row.totalTokens}`,
+          totalSpend: sql`${schema.modelHourUsage.totalSpend} + ${row.totalSpend}`,
+          totalLatencyMs: sql`${schema.modelHourUsage.totalLatencyMs} + ${row.totalLatencyMs}`,
+          latencyCount: sql`${schema.modelHourUsage.latencyCount} + ${row.latencyCount}`,
+          updatedAt,
+        },
+      })
+      .run();
+    return;
+  }
+
+  await (tx.insert(schema.modelHourUsage).values(values) as any)
+    .onConflictDoUpdate({
+      target: [schema.modelHourUsage.bucketStartUtc, schema.modelHourUsage.siteId, schema.modelHourUsage.model],
+      set: {
+        totalCalls: sql`${schema.modelHourUsage.totalCalls} + ${row.totalCalls}`,
+        successCalls: sql`${schema.modelHourUsage.successCalls} + ${row.successCalls}`,
+        failedCalls: sql`${schema.modelHourUsage.failedCalls} + ${row.failedCalls}`,
+        totalTokens: sql`${schema.modelHourUsage.totalTokens} + ${row.totalTokens}`,
+        totalSpend: sql`${schema.modelHourUsage.totalSpend} + ${row.totalSpend}`,
+        totalLatencyMs: sql`${schema.modelHourUsage.totalLatencyMs} + ${row.totalLatencyMs}`,
+        latencyCount: sql`${schema.modelHourUsage.latencyCount} + ${row.latencyCount}`,
+        updatedAt,
+      },
+    })
+    .run();
+}
+
 async function upsertModelDayUsage(tx: typeof db, row: ModelDayUsageDeltaRow, updatedAt: string) {
   const values = {
     localDay: row.localDay,
@@ -707,6 +795,9 @@ async function applyProjectionBatch(
     for (const row of delta.modelDayRows) {
       await upsertModelDayUsage(tx as typeof db, row, updatedAt);
     }
+    for (const row of delta.modelHourRows) {
+      await upsertModelHourUsage(tx as typeof db, row, updatedAt);
+    }
     await writeProjectionCheckpoint(tx as typeof db, nextCheckpoint);
   });
 
@@ -777,6 +868,7 @@ async function applyPendingRecompute(checkpoint: ProjectionCheckpointRow) {
     await tx.delete(schema.siteDayUsage).where(gte(schema.siteDayUsage.localDay, affectedDay)).run();
     await tx.delete(schema.siteHourUsage).where(gte(schema.siteHourUsage.bucketStartUtc, affectedDayStartUtc)).run();
     await tx.delete(schema.modelDayUsage).where(gte(schema.modelDayUsage.localDay, affectedDay)).run();
+    await tx.delete(schema.modelHourUsage).where(gte(schema.modelHourUsage.bucketStartUtc, affectedDayStartUtc)).run();
     await writeProjectionCheckpoint(tx as typeof db, nextCheckpoint as any);
   });
 
