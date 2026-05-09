@@ -593,7 +593,6 @@ export default function Dashboard({
             onClick={() => {
               void load(true);
               void loadInsights(true);
-              void loadSiteStats(true);
             }}
             disabled={refreshing}
             className="topbar-icon-btn"
@@ -968,285 +967,6 @@ export default function Dashboard({
         </div>
       </div>
 
-      {/* 站点级分析 */}
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          marginBottom: 12,
-          marginTop: 8,
-        }}
-      >
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 6,
-            fontSize: 14,
-            fontWeight: 600,
-            color: "var(--color-text-primary)",
-          }}
-        >
-          <svg
-            width="16"
-            height="16"
-            fill="none"
-            viewBox="0 0 24 24"
-            stroke="currentColor"
-          >
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              strokeWidth={2}
-              d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"
-            />
-          </svg>
-          站点分析
-        </div>
-        <div style={{ display: "flex", gap: 4 }}>
-          {[7, 30, 90].map((d) => (
-            <button
-              key={d}
-              onClick={() => setTrendDays(d)}
-              style={{
-                padding: "4px 12px",
-                borderRadius: 6,
-                fontSize: 12,
-                fontWeight: 500,
-                border: "none",
-                cursor: "pointer",
-                background:
-                  trendDays === d ? "var(--color-primary)" : "var(--color-bg)",
-                color:
-                  trendDays === d ? "white" : "var(--color-text-secondary)",
-                transition: "all 0.2s ease",
-              }}
-            >
-              {d}天
-            </button>
-          ))}
-        </div>
-      </div>
-
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr",
-          gap: 16,
-          marginBottom: 24,
-        }}
-      >
-        <div className="chart-panel-enter animate-slide-up stagger-6">
-          <Suspense fallback={<ChartFallback height={320} />}>
-            <SiteDistributionChart
-              data={siteDistribution}
-              loading={siteLoading}
-            />
-          </Suspense>
-        </div>
-        <div className="chart-panel-enter animate-slide-up stagger-7">
-          <Suspense fallback={<ChartFallback height={320} />}>
-            <SiteTrendChart data={siteTrend} loading={siteLoading} />
-          </Suspense>
-        </div>
-      </div>
-
-      <div className="chart-container animate-slide-up stagger-8 site-observability-panel">
-        <div className="site-observability-header">
-          <div>
-            <div className="site-observability-title">
-              <svg
-                width="16"
-                height="16"
-                fill="none"
-                viewBox="0 0 24 24"
-                stroke="currentColor"
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth={2}
-                  d="M3 12h4l3 8 4-16 3 8h4"
-                />
-              </svg>
-              站点可用性观测
-              <span className="site-observability-count-badge">
-                {activeSites.length}/{rawSiteAvailability.length}
-              </span>
-            </div>
-            <div className="site-observability-subtitle">
-              最近 24 小时 · 每色块 = 1h · 按使用量排序
-            </div>
-          </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-            <div className="site-observability-legend">
-              <span className="site-observability-legend-text">低</span>
-              <span
-                className="site-observability-legend-chip"
-                style={{ background: getAvailabilityColor(0) }}
-              />
-              <span
-                className="site-observability-legend-chip"
-                style={{ background: getAvailabilityColor(50) }}
-              />
-              <span
-                className="site-observability-legend-chip"
-                style={{ background: getAvailabilityColor(100) }}
-              />
-              <span className="site-observability-legend-text">高</span>
-            </div>
-            {inactiveSites.length > 0 && (
-              <button
-                className="site-observability-toggle-btn"
-                onClick={() => setShowInactiveSites((v) => !v)}
-              >
-                {showInactiveSites
-                  ? "隐藏未使用"
-                  : `显示未使用 (${inactiveSites.length})`}
-              </button>
-            )}
-          </div>
-        </div>
-
-        {insightsLoading && rawSiteAvailability.length === 0 ? (
-          <div style={{ display: "grid", gap: 12 }}>
-            {[...Array(4)].map((_, index) => (
-              <div
-                key={index}
-                className="card"
-                style={{ minHeight: 88, padding: 16 }}
-              >
-                <div
-                  className="skeleton"
-                  style={{ width: 160, height: 14, marginBottom: 10 }}
-                />
-                <div
-                  className="skeleton"
-                  style={{ width: "100%", height: 12, marginBottom: 8 }}
-                />
-                <div
-                  className="skeleton"
-                  style={{ width: "100%", height: 18, borderRadius: 8 }}
-                />
-              </div>
-            ))}
-          </div>
-        ) : siteAvailability.length > 0 ? (
-          <div className="site-observability-grid">
-            {siteAvailability.map((site) => (
-              <div
-                key={site.siteId}
-                className={`site-observability-card${site.totalRequests > 0 ? "" : " site-observability-card--inactive"}`}
-              >
-                <div className="site-observability-card-top">
-                  <div className="site-observability-card-title">
-                    <span className="site-observability-site-name">
-                      {site.siteName}
-                    </span>
-                    {site.platform && (
-                      <span className="site-observability-platform-badge">
-                        {site.platform}
-                      </span>
-                    )}
-                  </div>
-                  <Link
-                    to={buildSiteLast24hLogsRoute(site.siteId)}
-                    className="site-observability-log-link-compact"
-                    title="查看日志"
-                  >
-                    <svg
-                      width="14"
-                      height="14"
-                      fill="none"
-                      viewBox="0 0 24 24"
-                      stroke="currentColor"
-                    >
-                      <path
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        strokeWidth={2}
-                        d="M9 5l7 7-7 7"
-                      />
-                    </svg>
-                  </Link>
-                </div>
-                <div className="site-observability-card-metrics">
-                  <span
-                    className="site-observability-metric-main"
-                    style={{
-                      color: getAvailabilityColor(site.availabilityPercent),
-                    }}
-                  >
-                    {formatAvailabilityPercent(site.availabilityPercent)}
-                  </span>
-                  <span className="site-observability-metric-sep">·</span>
-                  <span
-                    style={
-                      site.averageLatencyMs != null
-                        ? { color: getLatencyColor(site.averageLatencyMs) }
-                        : undefined
-                    }
-                  >
-                    {site.averageLatencyMs != null
-                      ? `${site.averageLatencyMs}ms`
-                      : "—"}
-                  </span>
-                  <span className="site-observability-metric-sep">·</span>
-                  <span>{Math.round(site.totalRequests || 0)} 次</span>
-                </div>
-                <div className="site-availability-strip-compact">
-                  {site.buckets.map((bucket, index) => (
-                    <Link
-                      key={`${site.siteId}-${index}`}
-                      to={buildAvailabilityBucketLogsRoute(site.siteId, bucket)}
-                      className="site-availability-cell site-availability-cell-link site-availability-cell-pill"
-                      style={{
-                        background: getAvailabilityColor(
-                          bucket.availabilityPercent,
-                        ),
-                        opacity: bucket.totalRequests > 0 ? 1 : 0.3,
-                      }}
-                      data-tooltip={[
-                        `时间：${formatAvailabilityBucketLabel(bucket)}`,
-                        bucket.totalRequests > 0
-                          ? `可用性：${formatAvailabilityPercent(bucket.availabilityPercent)}`
-                          : "可用性：无请求",
-                        `请求：${bucket.totalRequests} 次`,
-                        `成功/失败：${bucket.successCount}/${bucket.failedCount}`,
-                        bucket.averageLatencyMs != null
-                          ? `平均响应：${bucket.averageLatencyMs}ms`
-                          : "平均响应：—",
-                      ].join(" · ")}
-                      data-tooltip-align="start"
-                      title={[
-                        formatAvailabilityBucketLabel(bucket),
-                        bucket.totalRequests > 0
-                          ? `可用性 ${formatAvailabilityPercent(bucket.availabilityPercent)}`
-                          : "无请求",
-                        `${bucket.successCount} 成功 / ${bucket.failedCount} 失败`,
-                        bucket.averageLatencyMs != null
-                          ? `平均响应 ${bucket.averageLatencyMs}ms`
-                          : "平均响应 —",
-                      ].join(" | ")}
-                      aria-label={`${site.siteName} ${formatAvailabilityBucketLabel(bucket)} 使用日志`}
-                    />
-                  ))}
-                </div>
-              </div>
-            ))}
-          </div>
-        ) : (
-          <div className="site-observability-empty">
-            <div className="site-observability-empty-title">
-              暂无站点观测数据
-            </div>
-            <div className="site-observability-empty-note">
-              有代理请求后，这里会自动生成每个站点的可用性条和平均响应速度。
-            </div>
-          </div>
-        )}
-      </div>
 
       <div
         style={{
@@ -1302,7 +1022,12 @@ export default function Dashboard({
 
         <div
           className="chart-container animate-slide-up stagger-9"
-          style={{ display: "flex", flexDirection: "column" }}
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            height: isMobile ? "auto" : "520px",
+            minHeight: 0,
+          }}
         >
           <div
             style={{
@@ -1388,20 +1113,31 @@ export default function Dashboard({
               flex: 1,
               display: "flex",
               flexDirection: "column",
-              gap: 10,
+              minHeight: 0,
             }}
           >
-            {sites.length > 0 ? (
-              sites.map((site: any, idx: number) => (
-                <div
-                  key={site.id || idx}
-                  style={{
-                    padding: "10px 12px",
-                    border: "1px solid var(--color-border-light)",
-                    borderRadius: "var(--radius-md)",
-                    background: "var(--color-bg)",
-                  }}
-                >
+            <div
+              style={{
+                flex: 1,
+                minHeight: 0,
+                overflowY: "auto",
+                display: "flex",
+                flexDirection: "column",
+                gap: 10,
+                paddingRight: 4,
+              }}
+            >
+              {sites.length > 0 ? (
+                sites.map((site: any, idx: number) => (
+                  <div
+                    key={site.id || idx}
+                    style={{
+                      padding: "10px 12px",
+                      border: "1px solid var(--color-border-light)",
+                      borderRadius: "var(--radius-md)",
+                      background: "var(--color-bg)",
+                    }}
+                  >
                   <div
                     style={{
                       display: "flex",
@@ -1505,19 +1241,20 @@ export default function Dashboard({
                     {site.url}
                   </a>
                 </div>
-              ))
-            ) : (
-              <div
-                style={{
-                  flex: 1,
-                  display: "flex",
-                  flexDirection: "column",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  gap: 8,
-                  padding: 20,
-                }}
-              >
+                ))
+              ) : (
+                <div
+                  style={{
+                    flex: 1,
+                    display: "flex",
+                    flexDirection: "column",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    gap: 8,
+                    padding: 20,
+                    minHeight: 180,
+                  }}
+                >
                 <div style={{ width: 60, height: 60, opacity: 0.25 }}>
                   <svg
                     fill="none"
@@ -1564,13 +1301,15 @@ export default function Dashboard({
                   </code>{" "}
                   访问
                 </div>
-              </div>
-            )}
+                </div>
+              )}
+            </div>
             <div
               style={{
-                marginTop: "auto",
+                marginTop: 8,
                 paddingTop: 8,
                 borderTop: "1px solid var(--color-border-light)",
+                flexShrink: 0,
               }}
             >
               <div
