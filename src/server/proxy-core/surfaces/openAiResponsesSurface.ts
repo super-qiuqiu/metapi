@@ -23,6 +23,10 @@ import {
 } from '../../services/upstreamEndpointRuntimeMemory.js';
 import { ensureModelAllowedForDownstreamKey, getDownstreamRoutingPolicy, recordDownstreamCostUsage } from '../../routes/proxy/downstreamPolicy.js';
 import { executeEndpointFlow, type BuiltEndpointRequest } from '../orchestration/endpointFlow.js';
+import {
+  dropUnsupportedParameterFromBody,
+  extractUnsupportedParameterName,
+} from '../orchestration/unsupportedParameterRecovery.js';
 import { detectProxyFailure } from '../../services/proxyFailureJudge.js';
 import { getProxyAuthContext, getProxyResourceOwner } from '../../middleware/auth.js';
 import { normalizeInputFileBlock } from '../../transformers/shared/inputFile.js';
@@ -590,8 +594,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
           if (!isCodexSite || !endpointRequest.path.startsWith('/responses')) {
             return baseDispatchRequest(endpointRequest, targetUrl);
           }
-          const modelLower = (modelName || '').trim().toLowerCase();
-          if (modelLower === 'gpt-5.5' && config.codexUpstreamWebsocketEnabled) {
+          if (config.codexUpstreamWebsocketEnabled) {
             return dispatchCodexWebsocketRequest(
               endpointRequest,
               targetUrl,
@@ -724,6 +727,42 @@ export async function handleOpenAiResponsesSurfaceRequest(
             ctx.request = recoveredRequest;
             ctx.response = recoveredResponse;
             ctx.rawErrText = await readRuntimeResponseText(recoveredResponse).catch(() => 'unknown error');
+          }
+
+          const unsupportedParameter = extractUnsupportedParameterName(ctx.rawErrText);
+          if (
+            ctx.response.status === 400
+            && unsupportedParameter
+            && isRecord(ctx.request.body)
+          ) {
+            const recoveredBody = dropUnsupportedParameterFromBody(ctx.request.body, unsupportedParameter);
+            if (recoveredBody) {
+              console.warn(
+                '[responses] removed unsupported upstream parameter and retried once',
+                {
+                  model: selected.actualModel || requestedModel || '',
+                  platform: selected.site.platform || '',
+                  parameter: unsupportedParameter,
+                  endpoint: ctx.request.path,
+                },
+              );
+              const recoveredRequest = {
+                ...ctx.request,
+                body: recoveredBody,
+              };
+              const recoveredResponse = await dispatchRequest(recoveredRequest, ctx.targetUrl);
+              if (recoveredResponse.ok) {
+                return {
+                  upstream: recoveredResponse,
+                  upstreamPath: recoveredRequest.path,
+                  request: recoveredRequest,
+                  targetUrl: ctx.targetUrl,
+                };
+              }
+              ctx.request = recoveredRequest;
+              ctx.response = recoveredResponse;
+              ctx.rawErrText = await readRuntimeResponseText(recoveredResponse).catch(() => 'unknown error');
+            }
           }
           return endpointStrategy.tryRecover(ctx);
         };

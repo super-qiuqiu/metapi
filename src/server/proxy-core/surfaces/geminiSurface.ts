@@ -15,6 +15,10 @@ import { resolveChannelProxyUrl, withSiteRecordProxyRequestInit } from '../../se
 import * as routeRefreshWorkflow from '../../services/routeRefreshWorkflow.js';
 import { getDownstreamRoutingPolicy } from '../../routes/proxy/downstreamPolicy.js';
 import { executeEndpointFlow, type BuiltEndpointRequest } from '../orchestration/endpointFlow.js';
+import {
+  dropUnsupportedParameterFromBody,
+  extractUnsupportedParameterName,
+} from '../orchestration/unsupportedParameterRecovery.js';
 import { composeProxyLogMessage } from '../../services/proxyLogMessage.js';
 import {
   buildUpstreamEndpointRequest,
@@ -1269,6 +1273,46 @@ export async function geminiProxyRoute(app: FastifyInstance) {
           ),
           dispatchRequest,
         });
+        const tryRecover = async (ctx: Parameters<NonNullable<typeof endpointStrategy.tryRecover>>[0]) => {
+          const unsupportedParameter = extractUnsupportedParameterName(ctx.rawErrText);
+          if (
+            ctx.response.status === 400
+            && unsupportedParameter
+            && !!ctx.request.body
+            && typeof ctx.request.body === 'object'
+            && !Array.isArray(ctx.request.body)
+          ) {
+            const recoveredBody = dropUnsupportedParameterFromBody(ctx.request.body, unsupportedParameter);
+            if (recoveredBody) {
+              console.warn(
+                '[gemini] removed unsupported upstream parameter and retried once',
+                {
+                  model: selected.actualModel || requestedModel || '',
+                  platform: selected.site.platform || '',
+                  parameter: unsupportedParameter,
+                  endpoint: ctx.request.path,
+                },
+              );
+              const recoveredRequest = {
+                ...ctx.request,
+                body: recoveredBody,
+              };
+              const recoveredResponse = await dispatchRequest(recoveredRequest, ctx.targetUrl);
+              if (recoveredResponse.ok) {
+                return {
+                  upstream: recoveredResponse,
+                  upstreamPath: recoveredRequest.path,
+                  request: recoveredRequest,
+                  targetUrl: ctx.targetUrl,
+                };
+              }
+              ctx.request = recoveredRequest;
+              ctx.response = recoveredResponse;
+              ctx.rawErrText = await readRuntimeResponseText(recoveredResponse).catch(() => 'unknown error');
+            }
+          }
+          return endpointStrategy.tryRecover(ctx);
+        };
         const debugAttemptBase = reserveSurfaceProxyDebugAttemptBase(debugTrace, endpointCandidates.length);
         const endpointResult = await executeEndpointFlow({
           siteUrl: selected.site.url,
@@ -1277,7 +1321,7 @@ export async function geminiProxyRoute(app: FastifyInstance) {
           endpointCandidates,
           buildRequest: (endpoint) => buildEndpointRequest(endpoint),
           dispatchRequest,
-          tryRecover: endpointStrategy.tryRecover,
+          tryRecover,
           shouldAbortRemainingEndpoints: (ctx) => shouldAbortSameSiteEndpointFallback(
             ctx.response.status,
             ctx.rawErrText || ctx.errText,

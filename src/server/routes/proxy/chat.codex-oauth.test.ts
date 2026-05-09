@@ -437,4 +437,84 @@ describe('chat proxy codex oauth compatibility', () => {
     expect(secondOptions.headers.Authorization).toBe('Bearer fresh-access-token');
     expect(response.json()?.choices?.[0]?.message?.content).toBe('ok after forbidden refresh');
   });
+
+  it('drops unsupported parameters and retries chat request once', async () => {
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        detail: 'Unsupported parameter: temperature',
+      }), {
+        status: 400,
+        headers: { 'content-type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        id: 'chatcmpl_param_recovered',
+        object: 'chat.completion',
+        created: 1706000000,
+        model: 'gpt-4o-mini',
+        choices: [
+          {
+            index: 0,
+            message: { role: 'assistant', content: 'ok after dropping temperature' },
+            finish_reason: 'stop',
+          },
+        ],
+        usage: { prompt_tokens: 4, completion_tokens: 2, total_tokens: 6 },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'gpt-4o-mini',
+        temperature: 0.7,
+        messages: [{ role: 'user', content: 'hello oauth' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const [, firstOptions] = fetchMock.mock.calls[0] as [string, any];
+    const [, secondOptions] = fetchMock.mock.calls[1] as [string, any];
+    const firstBody = JSON.parse(firstOptions.body);
+    const secondBody = JSON.parse(secondOptions.body);
+    expect(firstBody.temperature).toBe(0.7);
+    expect(secondBody.temperature).toBeUndefined();
+  });
+
+  it('retries unsupported-parameter recovery at most once for chat', async () => {
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        detail: 'Unsupported parameter: temperature',
+      }), {
+        status: 400,
+        headers: { 'content-type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        detail: 'Unsupported parameter: top_p',
+      }), {
+        status: 400,
+        headers: { 'content-type': 'application/json' },
+      }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'gpt-4o-mini',
+        temperature: 0.7,
+        top_p: 0.8,
+        messages: [{ role: 'user', content: 'hello oauth' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const [, secondOptions] = fetchMock.mock.calls[1] as [string, any];
+    const secondBody = JSON.parse(secondOptions.body);
+    expect(secondBody.temperature).toBeUndefined();
+    expect(secondBody.top_p).toBe(0.8);
+  });
 });

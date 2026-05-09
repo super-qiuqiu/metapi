@@ -23,6 +23,10 @@ import {
   recordDownstreamCostUsage,
 } from '../../routes/proxy/downstreamPolicy.js';
 import { executeEndpointFlow, type BuiltEndpointRequest } from '../orchestration/endpointFlow.js';
+import {
+  dropUnsupportedParameterFromBody,
+  extractUnsupportedParameterName,
+} from '../orchestration/unsupportedParameterRecovery.js';
 import { detectProxyFailure } from '../../services/proxyFailureJudge.js';
 import { openAiChatTransformer } from '../../transformers/openai/chat/index.js';
 import { anthropicMessagesTransformer } from '../../transformers/anthropic/messages/index.js';
@@ -377,8 +381,7 @@ export async function handleChatSurfaceRequest(
         if (!isCodexSite || !endpointRequest.path.startsWith('/responses')) {
           return baseDispatchRequest(endpointRequest, targetUrl);
         }
-        const modelLower = (modelName || '').trim().toLowerCase();
-        if (modelLower === 'gpt-5.5' && config.codexUpstreamWebsocketEnabled) {
+        if (config.codexUpstreamWebsocketEnabled) {
           return dispatchCodexWebsocketRequest(
             endpointRequest,
             targetUrl,
@@ -441,6 +444,41 @@ export async function handleChatSurfaceRequest(
             const recoveredRequest = {
               ...ctx.request,
               body: previousResponseRecovery.body,
+            };
+            const recoveredResponse = await dispatchRequest(recoveredRequest, ctx.targetUrl);
+            if (recoveredResponse.ok) {
+              return {
+                upstream: recoveredResponse,
+                upstreamPath: recoveredRequest.path,
+                request: recoveredRequest,
+                targetUrl: ctx.targetUrl,
+              };
+            }
+            ctx.request = recoveredRequest;
+            ctx.response = recoveredResponse;
+            ctx.rawErrText = await readRuntimeResponseText(recoveredResponse).catch(() => 'unknown error');
+          }
+        }
+        const unsupportedParameter = extractUnsupportedParameterName(ctx.rawErrText);
+        if (
+          ctx.response.status === 400
+          && unsupportedParameter
+          && isRecord(ctx.request.body)
+        ) {
+          const recoveredBody = dropUnsupportedParameterFromBody(ctx.request.body, unsupportedParameter);
+          if (recoveredBody) {
+            console.warn(
+              '[chat] removed unsupported upstream parameter and retried once',
+              {
+                model: selected.actualModel || requestedModel || '',
+                platform: selected.site.platform || '',
+                parameter: unsupportedParameter,
+                endpoint: ctx.request.path,
+              },
+            );
+            const recoveredRequest = {
+              ...ctx.request,
+              body: recoveredBody,
             };
             const recoveredResponse = await dispatchRequest(recoveredRequest, ctx.targetUrl);
             if (recoveredResponse.ok) {
