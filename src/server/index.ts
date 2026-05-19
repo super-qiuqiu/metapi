@@ -35,6 +35,10 @@ import { ensureDefaultSitesSeeded } from './services/defaultSiteSeedService.js';
 import { ensureOauthIdentityBackfill } from './services/oauth/oauthIdentityBackfill.js';
 import { ensureOauthProviderSitesExist } from './services/oauth/oauthSiteRegistry.js';
 import { startOAuthLoopbackCallbackServers, stopOAuthLoopbackCallbackServers } from './services/oauth/localCallbackServer.js';
+import {
+  startOauthTokenRefreshScheduler,
+  stopOauthTokenRefreshScheduler,
+} from './services/oauth/oauthRefreshScheduler.js';
 import { startSiteAnnouncementPolling, stopSiteAnnouncementPolling } from './services/siteAnnouncementPollingService.js';
 import {
   startModelAvailabilityProbeScheduler,
@@ -275,6 +279,7 @@ startUpdateCenterPolling();
 startUsageAggregationProjectorScheduler();
 startChannelBanditPricingSyncScheduler();
 startAdminSnapshotWarmScheduler();
+startOauthTokenRefreshScheduler();
 try {
   await startOAuthLoopbackCallbackServers();
 } catch (error) {
@@ -293,6 +298,7 @@ app.addHook('onClose', async () => {
   await stopChannelBanditPricingSyncScheduler();
   await stopAdminSnapshotWarmScheduler();
   await stopSub2ApiManagedRefreshScheduler();
+  await stopOauthTokenRefreshScheduler();
   await stopOAuthLoopbackCallbackServers();
 });
 
