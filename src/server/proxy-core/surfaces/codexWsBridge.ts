@@ -164,7 +164,15 @@ function buildCodexWsResponse(
     return type === 'response.completed' || type === 'error';
   }) || events[events.length - 1] || { type: 'error', error: { message: 'empty response' } };
 
-  const status = statusOverride || 200;
+  const inferredErrorStatus = (
+    typeof finalEvent.status === 'number'
+    && Number.isFinite(finalEvent.status)
+    && finalEvent.status >= 100
+    && finalEvent.status <= 599
+      ? Math.trunc(finalEvent.status)
+      : null
+  );
+  const status = statusOverride || inferredErrorStatus || 200;
   return new Response(JSON.stringify(finalEvent), {
     status,
     headers: { 'Content-Type': 'application/json' },

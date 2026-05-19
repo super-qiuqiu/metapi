@@ -24,7 +24,11 @@ export function extractUnsupportedParameterName(rawErrText: string): string | nu
   for (const candidate of candidates) {
     const matched = candidate.match(/unsupported\s+parameter\s*:\s*["'`]?([a-zA-Z0-9_.-]+)/i);
     if (matched?.[1]) {
-      return matched[1].trim();
+      const normalized = matched[1]
+        .trim()
+        .replace(/^["'`]+|["'`]+$/g, '')
+        .replace(/[.,;:!?]+$/g, '');
+      if (normalized) return normalized;
     }
   }
 

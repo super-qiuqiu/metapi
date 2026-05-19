@@ -245,15 +245,16 @@ export function normalizeResponsesMessageItem(item: Record<string, unknown>): Re
 
   const role = asTrimmedString(item.role).toLowerCase() || 'user';
   const normalizedContent = normalizeResponsesMessageContent(
-    firstMeaningfulValue(item.content, item.text),
+    firstMeaningfulValue(item.content, item.text, item.input),
     role,
   );
+  const ensuredContent = normalizedContent === undefined ? [] : normalizedContent;
 
   if (type === 'message') {
     return withNormalizedResponsesInputStatus({
       ...item,
       role,
-      content: normalizedContent,
+      content: ensuredContent,
     });
   }
 
@@ -262,7 +263,7 @@ export function normalizeResponsesMessageItem(item: Record<string, unknown>): Re
       ...item,
       type: 'message',
       role,
-      content: normalizedContent,
+      content: ensuredContent,
     });
   }
 

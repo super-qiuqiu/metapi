@@ -56,6 +56,57 @@ describe('responses conversion single source of truth', () => {
     ]);
   });
 
+  it('normalizes role-based input aliases into content blocks', () => {
+    expect(normalizeResponsesInputForCompatibility([
+      {
+        type: 'message',
+        role: 'user',
+        input: 'ping',
+      },
+    ])).toEqual([
+      {
+        type: 'message',
+        role: 'user',
+        input: 'ping',
+        content: [{ type: 'input_text', text: 'ping' }],
+      },
+    ]);
+  });
+
+  it('keeps content field on role-based message items even when payload omits content', () => {
+    expect(normalizeResponsesInputForCompatibility([
+      {
+        role: 'assistant',
+        tool_calls: [
+          {
+            id: 'call_1',
+            type: 'function',
+            function: {
+              name: 'lookup_weather',
+              arguments: '{}',
+            },
+          },
+        ],
+      },
+    ])).toEqual([
+      {
+        type: 'message',
+        role: 'assistant',
+        content: [],
+        tool_calls: [
+          {
+            id: 'call_1',
+            type: 'function',
+            function: {
+              name: 'lookup_weather',
+              arguments: '{}',
+            },
+          },
+        ],
+      },
+    ]);
+  });
+
   it('filters whitespace-only string entries from normalized responses input arrays', () => {
     expect(normalizeResponsesInputForCompatibility([
       'hello',

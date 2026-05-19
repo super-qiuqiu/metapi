@@ -179,6 +179,32 @@ function toResponseInputArray(value: unknown): unknown[] {
   return Array.isArray(value) ? cloneJsonObject(value) : [];
 }
 
+function dedupeResponsesInputItemsById(items: unknown[]): unknown[] {
+  const dedupedReversed: unknown[] = [];
+  const seenItemIds = new Set<string>();
+
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (!isRecord(item)) {
+      dedupedReversed.push(item);
+      continue;
+    }
+    const itemId = asTrimmedString(item.id);
+    if (!itemId) {
+      dedupedReversed.push(item);
+      continue;
+    }
+    if (seenItemIds.has(itemId)) {
+      continue;
+    }
+    seenItemIds.add(itemId);
+    dedupedReversed.push(item);
+  }
+
+  dedupedReversed.reverse();
+  return dedupedReversed;
+}
+
 function normalizeResponsesWebsocketRequest(
   parsed: Record<string, unknown>,
   lastRequest: Record<string, unknown> | null,
@@ -208,7 +234,7 @@ function normalizeResponsesWebsocketRequest(
       delete next.generate;
     }
     next.stream = true;
-    if (!Array.isArray(next.input)) next.input = [];
+    next.input = dedupeResponsesInputItemsById(toResponseInputArray(next.input));
     const modelName = asTrimmedString(next.model);
     if (!modelName) {
       return {
@@ -256,7 +282,7 @@ function normalizeResponsesWebsocketRequest(
     ...cloneJsonObject(parsed.input),
   ];
   delete next.previous_response_id;
-  next.input = mergedInput;
+  next.input = dedupeResponsesInputItemsById(mergedInput);
 
   return {
     ok: true,

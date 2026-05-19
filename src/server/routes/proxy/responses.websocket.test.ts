@@ -1621,6 +1621,97 @@ describe('responses websocket transport', () => {
     });
   });
 
+  it('deduplicates repeated output item ids when merging non-incremental websocket follow-up turns', async () => {
+    const selectedChannel = createSelectedChannel({
+      sitePlatform: 'openai',
+      actualModel: 'gpt-4.1',
+    });
+    selectChannelMock.mockReturnValue(selectedChannel);
+    previewSelectedChannelMock.mockResolvedValue(selectedChannel);
+    fetchMock
+      .mockResolvedValueOnce(createSseResponse([
+        'event: response.completed\n',
+        'data: {"type":"response.completed","response":{"id":"resp_ws_dup_1","model":"gpt-4.1","status":"completed","output":[{"id":"rs_dup_1","type":"reasoning","summary":[{"type":"summary_text","text":"reasoning-1"}]},{"id":"msg_dup_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"step-1"}]}],"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}\n\n',
+        'data: [DONE]\n\n',
+      ]))
+      .mockResolvedValueOnce(createSseResponse([
+        'event: response.completed\n',
+        'data: {"type":"response.completed","response":{"id":"resp_ws_dup_2","model":"gpt-4.1","status":"completed","output":[{"id":"rs_dup_1","type":"reasoning","summary":[{"type":"summary_text","text":"reasoning-1"}]},{"id":"msg_dup_2","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"step-2"}]}],"usage":{"input_tokens":5,"output_tokens":1,"total_tokens":6}}}\n\n',
+        'data: [DONE]\n\n',
+      ]))
+      .mockResolvedValueOnce(createSseResponse([
+        'event: response.completed\n',
+        'data: {"type":"response.completed","response":{"id":"resp_ws_dup_3","model":"gpt-4.1","status":"completed","output":[{"id":"msg_dup_3","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"step-3"}]}],"usage":{"input_tokens":7,"output_tokens":1,"total_tokens":8}}}\n\n',
+        'data: [DONE]\n\n',
+      ]));
+
+    const socket = createClientSocket(baseUrl);
+    await waitForSocketOpen(socket);
+
+    const firstResponsePromise = waitForSocketMessageMatching(
+      socket,
+      (message) => message?.type === 'response.completed' && message?.response?.id === 'resp_ws_dup_1',
+    );
+    socket.send(JSON.stringify({
+      type: 'response.create',
+      model: 'gpt-4.1',
+      instructions: 'be helpful',
+      input: [
+        {
+          id: 'msg_user_dup_1',
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'start' }],
+        },
+      ],
+    }));
+    await firstResponsePromise;
+
+    const secondResponsePromise = waitForSocketMessageMatching(
+      socket,
+      (message) => message?.type === 'response.completed' && message?.response?.id === 'resp_ws_dup_2',
+    );
+    socket.send(JSON.stringify({
+      type: 'response.create',
+      previous_response_id: 'resp_ws_dup_1',
+      input: [
+        {
+          id: 'tool_out_dup_1',
+          type: 'function_call_output',
+          call_id: 'call_dup_1',
+          output: 'tool result 1',
+        },
+      ],
+    }));
+    await secondResponsePromise;
+
+    const thirdResponsePromise = waitForSocketMessageMatching(
+      socket,
+      (message) => message?.type === 'response.completed' && message?.response?.id === 'resp_ws_dup_3',
+    );
+    socket.send(JSON.stringify({
+      type: 'response.create',
+      previous_response_id: 'resp_ws_dup_2',
+      input: [
+        {
+          id: 'tool_out_dup_2',
+          type: 'function_call_output',
+          call_id: 'call_dup_2',
+          output: 'tool result 2',
+        },
+      ],
+    }));
+    await thirdResponsePromise;
+    socket.close();
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    const [, thirdOptions] = fetchMock.mock.calls[2] as [string, RequestInit];
+    const thirdBody = JSON.parse(String(thirdOptions.body));
+    const duplicatedReasoningItems = (Array.isArray(thirdBody.input) ? thirdBody.input : [])
+      .filter((item: any) => item?.id === 'rs_dup_1');
+    expect(duplicatedReasoningItems).toHaveLength(1);
+  });
+
   it('keeps streamed output items for follow-up turns when the terminal HTTP fallback payload has an empty output array', async () => {
     const selectedChannel = createSelectedChannel({
       sitePlatform: 'openai',
