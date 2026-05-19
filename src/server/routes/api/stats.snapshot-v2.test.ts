@@ -168,6 +168,20 @@ describe("stats snapshot v2 routes", () => {
     };
     expect(siteTrend.trend.length).toBeGreaterThan(0);
 
+    const modelBySiteResponse = await app.inject({
+      method: "GET",
+      url: `/api/stats/model-by-site?days=7&siteId=${site.id}&refresh=1`,
+    });
+    expect(modelBySiteResponse.statusCode).toBe(200);
+    const modelBySite = modelBySiteResponse.json() as {
+      models: Array<{ model: string; calls: number }>;
+    };
+    expect(modelBySite.models).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ model: "gpt-4o", calls: 1 }),
+      ]),
+    );
+
     const sitesResponse = await app.inject({
       method: "GET",
       url: "/api/sites",

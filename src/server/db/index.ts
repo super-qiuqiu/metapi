@@ -1,4 +1,4 @@
-import Database from 'better-sqlite3';
+import { createRequire } from 'module';
 import mysql from 'mysql2/promise';
 import pg from 'pg';
 import { drizzle as drizzleSqliteProxy } from 'drizzle-orm/sqlite-proxy';
@@ -47,13 +47,62 @@ const TABLES_WITH_NUMERIC_ID = new Set([
 
 export let runtimeDbDialect: RuntimeDbDialect = config.dbType;
 
-let sqliteConnection: Database.Database | null = null;
+type SqliteRunResult = {
+  changes?: number | bigint;
+  lastInsertRowid?: number | bigint;
+};
+
+type SqliteStatement = {
+  run: (...params: unknown[]) => SqliteRunResult;
+  get: (...params: unknown[]) => unknown;
+  all: (...params: unknown[]) => unknown;
+  raw?: () => SqliteStatement;
+  values?: (...params: unknown[]) => unknown;
+};
+
+type SqliteConnection = {
+  prepare: (sql: string) => SqliteStatement;
+  pragma?: (text: string) => unknown;
+  exec: (sql: string) => unknown;
+  close: () => unknown;
+};
+
+let sqliteConnection: SqliteConnection | null = null;
 let mysqlPool: mysql.Pool | null = null;
 let pgPool: pg.Pool | null = null;
 let proxyLogBillingDetailsColumnAvailable: boolean | null = null;
 let proxyLogDownstreamApiKeyIdColumnAvailable: boolean | null = null;
 let proxyLogClientColumnsAvailable: boolean | null = null;
 let proxyLogStreamTimingColumnsAvailable: boolean | null = null;
+
+const DB_ERROR_LOG_MAX_LEN = 280;
+
+function sanitizeDbErrorMessage(message: string): string {
+  const compact = message.replace(/\s+/g, ' ').trim();
+  const redacted = compact
+    .replace(/(accessToken|apiToken|refreshToken|idToken|authorization|cookie)\s*[:=]\s*['\"]?[^,'\"\s}]{6,}/gi, '$1=[REDACTED]')
+    .replace(/\b(sk-[A-Za-z0-9_-]{8,})\b/g, '[REDACTED_SK]')
+    .replace(/\b(rt_[A-Za-z0-9._-]{8,})\b/g, '[REDACTED_RT]');
+  if (redacted.length <= DB_ERROR_LOG_MAX_LEN) return redacted;
+  return `${redacted.slice(0, DB_ERROR_LOG_MAX_LEN)}...`;
+}
+
+function formatDbError(error: unknown): string {
+  if (!error) return 'unknown error';
+  if (typeof error === 'string') return sanitizeDbErrorMessage(error);
+  if (typeof error === 'object') {
+    const message = (error as { message?: unknown }).message;
+    const code = (error as { code?: unknown }).code;
+    const sqlState = (error as { sqlState?: unknown }).sqlState;
+    const parts = [
+      typeof code === 'string' ? code : null,
+      typeof sqlState === 'string' ? sqlState : null,
+      typeof message === 'string' ? sanitizeDbErrorMessage(message) : null,
+    ].filter(Boolean);
+    if (parts.length > 0) return parts.join(' | ');
+  }
+  return 'unknown error';
+}
 
 function buildMysqlPoolOptions(
   connectionString = config.dbUrl,
@@ -135,7 +184,7 @@ function resolveVitestSqlitePath(): string | null {
   return resolve(tmpdir(), `metapi-vitest-${workerTag}`, 'hub.db');
 }
 
-function requireSqliteConnection(): Database.Database {
+function requireSqliteConnection(): SqliteConnection {
   if (!sqliteConnection) {
     throw new Error('SQLite connection is not initialized');
   }
@@ -762,7 +811,7 @@ export async function ensureProxyLogBillingDetailsColumn(): Promise<boolean> {
       return true;
     }
     proxyLogBillingDetailsColumnAvailable = false;
-    console.warn('[db] failed to ensure proxy_logs.billing_details column', error);
+    console.warn(`[db] failed to ensure proxy_logs.billing_details column: ${formatDbError(error)}`);
     return false;
   }
 }
@@ -828,7 +877,7 @@ export async function ensureProxyLogDownstreamApiKeyIdColumn(): Promise<boolean>
       return true;
     }
     proxyLogDownstreamApiKeyIdColumnAvailable = false;
-    console.warn('[db] failed to ensure proxy_logs.downstream_api_key_id column', error);
+    console.warn(`[db] failed to ensure proxy_logs.downstream_api_key_id column: ${formatDbError(error)}`);
     return false;
   }
 }
@@ -947,7 +996,7 @@ export async function ensureProxyLogClientColumns(): Promise<boolean> {
         }
       } catch (error) {
         if (!isDuplicateIndexError(error)) {
-          console.warn(`[db] failed to ensure ${requiredIndex.name}`, error);
+          console.warn(`[db] failed to ensure ${requiredIndex.name}: ${formatDbError(error)}`);
         }
       }
     }
@@ -1001,7 +1050,7 @@ export async function ensureProxyLogClientColumns(): Promise<boolean> {
       return proxyLogClientColumnsAvailable;
     }
     proxyLogClientColumnsAvailable = false;
-    console.warn('[db] failed to ensure proxy_logs client columns', error);
+    console.warn(`[db] failed to ensure proxy_logs client columns: ${formatDbError(error)}`);
     return false;
   }
 }
@@ -1096,7 +1145,7 @@ export async function ensureProxyLogStreamTimingColumns(): Promise<boolean> {
       return proxyLogStreamTimingColumnsAvailable;
     }
     proxyLogStreamTimingColumnsAvailable = false;
-    console.warn('[db] failed to ensure proxy_logs stream timing columns', error);
+    console.warn(`[db] failed to ensure proxy_logs stream timing columns: ${formatDbError(error)}`);
     return false;
   }
 }
@@ -1120,12 +1169,25 @@ async function sqliteProxyQuery(sqlText: string, params: unknown[], method: SqlM
     };
   }
 
+  const runtimeBun = !!(globalThis as { Bun?: unknown }).Bun;
+  if (runtimeBun && typeof statement.values === 'function') {
+    const rows = statement.values(...params) as unknown[][];
+    if (method === 'get') {
+      return { rows: rows[0] as any };
+    }
+    return { rows: Array.isArray(rows) ? rows : [] };
+  }
+
+  const rawStatement = typeof statement.raw === 'function' ? statement.raw() : statement;
   if (method === 'get') {
-    const row = statement.raw().get(...params) as unknown[] | undefined;
+    const row = (rawStatement as SqliteStatement).get(...params) as unknown[] | undefined;
     return { rows: row as any };
   }
 
-  const rows = statement.raw().all(...params) as unknown[][];
+  const allResult = typeof (rawStatement as SqliteStatement).all === 'function'
+    ? (rawStatement as SqliteStatement).all(...params)
+    : (typeof (rawStatement as SqliteStatement).values === 'function' ? (rawStatement as SqliteStatement).values!(...params) : []);
+  const rows = Array.isArray(allResult) ? allResult as unknown[][] : [];
   return { rows };
 }
 
@@ -1345,16 +1407,34 @@ function wrapDbClient<T extends object>(
   }) as T;
 }
 
+function loadSqliteConnectionFactory(): (path: string) => SqliteConnection {
+  const require = createRequire(import.meta.url);
+  const runtimeBun = (globalThis as { Bun?: unknown }).Bun;
+  if (runtimeBun) {
+    const bunSqliteModule = require('bun:sqlite') as { Database: new (path: string) => SqliteConnection };
+    return (path: string) => new bunSqliteModule.Database(path);
+  }
+
+  const betterSqlite3 = require('better-sqlite3') as (new (path: string) => SqliteConnection);
+  return (path: string) => new betterSqlite3(path);
+}
+
 function initSqliteDb() {
   const sqlitePath = resolveSqlitePath();
   if (sqlitePath !== ':memory:') {
     mkdirSync(dirname(sqlitePath), { recursive: true });
   }
 
-  const sqlite = new Database(sqlitePath);
+  const sqliteFactory = loadSqliteConnectionFactory();
+  const sqlite = sqliteFactory(sqlitePath);
   sqliteConnection = sqlite;
-  sqlite.pragma('journal_mode = WAL');
-  sqlite.pragma('foreign_keys = ON');
+  if (typeof sqlite.pragma === 'function') {
+    sqlite.pragma('journal_mode = WAL');
+    sqlite.pragma('foreign_keys = ON');
+  } else {
+    sqlite.exec('PRAGMA journal_mode = WAL');
+    sqlite.exec('PRAGMA foreign_keys = ON');
+  }
 
   ensureTokenManagementSchema();
   ensureSiteStatusSchema();

@@ -44,6 +44,36 @@ type ReadSnapshotOptions<T> = {
 const SNAPSHOT_CACHE_MAX_ENTRIES = 64;
 const snapshotCache = new Map<string, SnapshotCacheEntry<unknown>>();
 
+const MAX_PERSISTENCE_ERROR_MESSAGE_LENGTH = 280;
+
+function sanitizePersistenceMessage(message: string): string {
+  const compact = message.replace(/\s+/g, " ").trim();
+  const redacted = compact
+    .replace(/(accessToken|apiToken|refreshToken|idToken|authorization|cookie)\s*[:=]\s*['\"]?[^,'\"\s}]{6,}/gi, "$1=[REDACTED]")
+    .replace(/\b(sk-[A-Za-z0-9_-]{8,})\b/g, "[REDACTED_SK]")
+    .replace(/\b(rt_[A-Za-z0-9._-]{8,})\b/g, "[REDACTED_RT]");
+
+  if (redacted.length <= MAX_PERSISTENCE_ERROR_MESSAGE_LENGTH) return redacted;
+  return `${redacted.slice(0, MAX_PERSISTENCE_ERROR_MESSAGE_LENGTH)}...`;
+}
+
+function formatPersistenceError(error: unknown): string {
+  if (!error) return "unknown error";
+  if (typeof error === "string") return sanitizePersistenceMessage(error);
+  if (typeof error === "object") {
+    const message = (error as { message?: unknown }).message;
+    const code = (error as { code?: unknown }).code;
+    const sqlState = (error as { sqlState?: unknown }).sqlState;
+    const parts = [
+      typeof code === "string" ? code : null,
+      typeof sqlState === "string" ? sqlState : null,
+      typeof message === "string" ? sanitizePersistenceMessage(message) : null,
+    ].filter(Boolean);
+    if (parts.length > 0) return parts.join(" | ");
+  }
+  return "unknown error";
+}
+
 function getSnapshotCacheEntry<T>(cacheKey: string) {
   const cached = snapshotCache.get(cacheKey) as SnapshotCacheEntry<T> | undefined;
   if (!cached) return undefined;
@@ -107,8 +137,7 @@ async function loadAndStoreSnapshot<T>(
       await persistence.write(persistedRecord);
     } catch (error) {
       console.warn(
-        `[snapshotCache] persistence write failed for ${cacheKey}:`,
-        error,
+        `[snapshotCache] persistence write failed for ${cacheKey}: ${formatPersistenceError(error)}`,
       );
     }
   }
@@ -160,8 +189,7 @@ export async function readSnapshotCache<T>(
       }
     } catch (error) {
       console.warn(
-        `[snapshotCache] persistence read failed for ${cacheKey}; falling back to loader:`,
-        error,
+        `[snapshotCache] persistence read failed for ${cacheKey}; falling back to loader: ${formatPersistenceError(error)}`,
       );
     }
   }

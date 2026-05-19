@@ -12,6 +12,10 @@ type AdminSnapshotIdentity = {
 
 type AdminSnapshotRow = typeof schema.adminSnapshots.$inferSelect;
 
+const MYSQL_TEXT_SAFE_BYTES = 60 * 1024;
+const OVERSIZE_LOG_THROTTLE_MS = 5 * 60 * 1000;
+const oversizeLogState = new Map<string, number>();
+
 function serializeSnapshotKey(key: string) {
   return JSON.stringify(key);
 }
@@ -71,6 +75,23 @@ export async function writeAdminSnapshot<T>(
   record: PersistedSnapshotRecord<T>,
 ): Promise<void> {
   const payload = JSON.stringify(record.payload);
+
+  if (runtimeDbDialect === "mysql") {
+    const payloadBytes = Buffer.byteLength(payload, "utf8");
+    if (payloadBytes > MYSQL_TEXT_SAFE_BYTES) {
+      const logKey = `${identity.namespace}:${identity.key}`;
+      const now = Date.now();
+      const previous = oversizeLogState.get(logKey) || 0;
+      if (now - previous >= OVERSIZE_LOG_THROTTLE_MS) {
+        oversizeLogState.set(logKey, now);
+        console.warn(
+          `[snapshotCache] skip persistence for ${identity.namespace}:${identity.key} because payload is too large for mysql TEXT (${payloadBytes} bytes)`,
+        );
+      }
+      return;
+    }
+  }
+
   const values = {
     namespace: identity.namespace,
     snapshotKey: serializeSnapshotKey(identity.key),
