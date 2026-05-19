@@ -44,7 +44,7 @@ import { fingerprintKey, type OauthFingerprint } from './oauthIdentityResolver.j
 export type OauthImportStreamItem = {
   index: number;
   name: string;
-  status: 'imported' | 'updated' | 'failed';
+  status: 'imported' | 'updated' | 'skipped' | 'failed';
   provider?: string;
   accountId?: number;
   message?: string;
@@ -56,7 +56,17 @@ export type OauthImportStreamCallbacks = {
   onRefreshed: (data: { index: number; accountId: number; modelCount: number; provider: string }) => void;
   onQuotaRefreshed: (data: { index: number; accountId: number; success: boolean; provider: string }) => void;
   onError: (data: { index: number; accountId?: number; provider?: string; message: string; phase: 'upsert' | 'refresh' }) => void;
-  onDone: (data: { imported: number; updated: number; skipped: number; parseFailed: number; refreshFailed: number; quotaRefreshFailed: number }) => void;
+  onDone: (data: {
+    imported: number;
+    updated: number;
+    skipped: number;
+    skippedDuplicateInBatch: number;
+    skippedExpiredMissing: number;
+    skippedExpiredNotNewer: number;
+    parseFailed: number;
+    refreshFailed: number;
+    quotaRefreshFailed: number;
+  }) => void;
   signal?: { aborted: boolean };
 };
 
@@ -136,12 +146,15 @@ async function serialUpsert(input: {
   updated: number;
   failed: number;
   skipped: number;
+  skippedDuplicateInBatch: number;
+  skippedExpiredMissing: number;
+  skippedExpiredNotNewer: number;
 }> {
   const { payloadItems, proxyUrl, useSystemProxy, siteCache, callbacks } = input;
 
   // 批内 fingerprint 去重
   const dedupedPayloads = new Map<string, ImportedNativeOauthJson>();
-  const skippedInBatch: Array<{ name: string; provider?: string }> = [];
+  const skippedInBatch: Array<{ name: string; provider?: string; reason: 'duplicate_in_batch' | 'incoming_expired_missing' | 'incoming_expired_not_newer' }> = [];
   const earlyFailItems: OauthImportStreamItem[] = [];
 
   for (const rawPayload of payloadItems) {
@@ -158,7 +171,7 @@ async function serialUpsert(input: {
       };
       const key = fingerprintKey(fp);
       if (dedupedPayloads.has(key)) {
-        skippedInBatch.push({ name: resolvedIdentity.name, provider: resolvedIdentity.provider });
+        skippedInBatch.push({ name: resolvedIdentity.name, provider: resolvedIdentity.provider, reason: 'duplicate_in_batch' });
       }
       dedupedPayloads.set(key, payload);
     } catch (error: any) {
@@ -201,10 +214,17 @@ async function serialUpsert(input: {
         useSystemProxy,
         persistedStatus: resolvedIdentity.disabled ? 'disabled' : 'active',
         preResolvedSite,
+        importDecisionMode: 'expired_only',
       });
 
       if (persisted.created) {
         imported += 1;
+      } else if (persisted.skipped) {
+        skippedInBatch.push({
+          name: resolvedIdentity.name,
+          provider: resolvedIdentity.provider,
+          reason: persisted.skipReason,
+        });
       } else {
         updated += 1;
       }
@@ -213,16 +233,28 @@ async function serialUpsert(input: {
       const provider = resolvedIdentity.provider;
       const projectId = resolvedIdentity.exchange.projectId ?? null;
 
+      const reconcileMessage = persisted.importReconcileInfo && persisted.importReconcileInfo.disabledAccountIds.length > 0
+        ? `已自动收敛同邮箱多身份（primary=${persisted.importReconcileInfo.primaryAccountId}，disabled=${persisted.importReconcileInfo.disabledAccountIds.join(',')}）`
+        : undefined;
       const item: OauthImportStreamItem = {
         index: itemIndex,
         name: resolvedIdentity.name,
-        status: persisted.created ? 'imported' : 'updated',
+        status: persisted.skipped ? 'skipped' : (persisted.created ? 'imported' : 'updated'),
         provider,
         accountId,
+        ...((persisted.skipped || reconcileMessage)
+          ? {
+              message: persisted.skipped
+                ? (persisted.skipReason === 'incoming_expired_missing'
+                  ? '跳过：导入项缺少有效 expired'
+                  : `跳过：导入 expired 不晚于现有账号（incoming=${persisted.skipDecision?.incomingTokenExpiresAt ?? 'n/a'}，existing=${persisted.skipDecision?.existingTokenExpiresAt ?? 'n/a'}，matchedAccountId=${persisted.skipDecision?.matchedAccountId ?? 'n/a'}）`)
+                : reconcileMessage
+            }
+          : {}),
       };
       callbacks.onItem(item);
 
-      if (accountId) {
+      if (accountId && !persisted.skipped) {
         upsertedAccounts.push({
           accountId,
           provider,
@@ -271,7 +303,20 @@ async function serialUpsert(input: {
 
   callbacks.onCheckpoint({ upsertedAccountIds, pendingRefreshIds });
 
-  return { upsertedAccounts, imported, updated, failed, skipped };
+  const skippedDuplicateInBatch = skippedInBatch.filter((item) => item.reason === 'duplicate_in_batch').length;
+  const skippedExpiredMissing = skippedInBatch.filter((item) => item.reason === 'incoming_expired_missing').length;
+  const skippedExpiredNotNewer = skippedInBatch.filter((item) => item.reason === 'incoming_expired_not_newer').length;
+
+  return {
+    upsertedAccounts,
+    imported,
+    updated,
+    failed,
+    skipped,
+    skippedDuplicateInBatch,
+    skippedExpiredMissing,
+    skippedExpiredNotNewer,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -682,6 +727,9 @@ export async function importOauthConnectionsStream(input: {
     imported: phase1Result.imported,
     updated: phase1Result.updated,
     skipped: phase1Result.skipped,
+    skippedDuplicateInBatch: phase1Result.skippedDuplicateInBatch,
+    skippedExpiredMissing: phase1Result.skippedExpiredMissing,
+    skippedExpiredNotNewer: phase1Result.skippedExpiredNotNewer,
     parseFailed: phase1Result.failed,
     refreshFailed: refreshFailed,
     quotaRefreshFailed,

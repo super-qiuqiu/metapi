@@ -940,6 +940,84 @@ describe('responses proxy codex oauth refresh', () => {
     expect(secondBody.input).toEqual(firstBody.input);
   });
 
+  it('drops unsupported parameters and retries responses request once', async () => {
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        detail: 'Unsupported parameter: temperature',
+      }), {
+        status: 400,
+        headers: { 'content-type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        id: 'resp_codex_param_recovered',
+        object: 'response',
+        model: 'gpt-5.3-codex',
+        status: 'completed',
+        output_text: 'recovered after dropping unsupported temperature',
+        usage: { input_tokens: 6, output_tokens: 2, total_tokens: 8 },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      payload: {
+        model: 'gpt-5.3-codex',
+        input: 'hello',
+        temperature: 0.7,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    const [, firstOptions] = fetchMock.mock.calls[0] as [string, any];
+    const [, secondOptions] = fetchMock.mock.calls[1] as [string, any];
+    const firstBody = JSON.parse(firstOptions.body);
+    const secondBody = JSON.parse(secondOptions.body);
+
+    expect(firstBody.temperature).toBe(0.7);
+    expect(secondBody.temperature).toBeUndefined();
+    expect(secondBody.input).toEqual(firstBody.input);
+  });
+
+  it('retries unsupported-parameter recovery at most once', async () => {
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        detail: 'Unsupported parameter: temperature',
+      }), {
+        status: 400,
+        headers: { 'content-type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        detail: 'Unsupported parameter: top_p',
+      }), {
+        status: 400,
+        headers: { 'content-type': 'application/json' },
+      }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      payload: {
+        model: 'gpt-5.3-codex',
+        input: 'hello',
+        temperature: 0.7,
+        top_p: 0.8,
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    const [, secondOptions] = fetchMock.mock.calls[1] as [string, any];
+    const secondBody = JSON.parse(secondOptions.body);
+    expect(secondBody.temperature).toBeUndefined();
+    expect(secondBody.top_p).toBe(0.8);
+  });
+
   it('strips generic downstream headers before forwarding codex responses upstream', async () => {
     fetchMock.mockResolvedValue(new Response(JSON.stringify({
       id: 'resp_codex_header_filter',

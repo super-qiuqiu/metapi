@@ -106,13 +106,19 @@ function openAiContentToCanonicalParts(content: unknown): CanonicalContentPart[]
       if (text) parts.push({ type: 'text', text, thought: true });
       continue;
     }
-    if (type === 'image_url' && isRecord(item.image_url)) {
-      const url = asTrimmedString(item.image_url.url);
+    if (type === 'image_url') {
+      const url = asTrimmedString(
+        (isRecord(item.image_url) ? item.image_url.url : item.image_url)
+        ?? item.url,
+      );
       if (url) parts.push({ type: 'image', url });
       continue;
     }
-    if (type === 'input_image' && isRecord(item.image_url)) {
-      const url = asTrimmedString(item.image_url.url);
+    if (type === 'input_image') {
+      const url = asTrimmedString(
+        (isRecord(item.image_url) ? item.image_url.url : item.image_url)
+        ?? item.url,
+      );
       if (url) parts.push({ type: 'image', url });
       continue;
     }

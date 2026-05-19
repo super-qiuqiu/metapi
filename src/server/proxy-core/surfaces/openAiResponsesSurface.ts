@@ -23,6 +23,10 @@ import {
 } from '../../services/upstreamEndpointRuntimeMemory.js';
 import { ensureModelAllowedForDownstreamKey, getDownstreamRoutingPolicy, recordDownstreamCostUsage } from '../../routes/proxy/downstreamPolicy.js';
 import { executeEndpointFlow, type BuiltEndpointRequest } from '../orchestration/endpointFlow.js';
+import {
+  dropUnsupportedParameterFromBody,
+  extractUnsupportedParameterName,
+} from '../orchestration/unsupportedParameterRecovery.js';
 import { detectProxyFailure } from '../../services/proxyFailureJudge.js';
 import { getProxyAuthContext, getProxyResourceOwner } from '../../middleware/auth.js';
 import { normalizeInputFileBlock } from '../../transformers/shared/inputFile.js';
@@ -41,6 +45,7 @@ import {
   createSingleChunkStreamReader,
   looksLikeResponsesSseText,
 } from '../runtime/responsesSseFinal.js';
+import { dispatchCodexWebsocketRequest } from './codexWsBridge.js';
 import {
   createGeminiCliStreamReader,
   unwrapGeminiCliPayload,
@@ -68,6 +73,7 @@ import {
 import { detectDownstreamClientContext } from '../downstreamClientContext.js';
 import { getProxyMaxChannelRetries } from '../../services/proxyChannelRetry.js';
 import { shouldAbortSameSiteEndpointFallback } from '../../services/proxyRetryPolicy.js';
+import { resolveChannelProxyUrl } from '../../services/siteProxy.js';
 import {
   acquireSurfaceChannelLease,
   bindSurfaceStickyChannel,
@@ -79,6 +85,7 @@ import {
   getSurfaceStickyPreferredChannelId,
   recordSurfaceSuccess,
   selectSurfaceChannelForAttempt,
+  trySurfaceOauthPreRefresh,
   trySurfaceOauthRefreshRecovery,
 } from './sharedSurface.js';
 import {
@@ -512,10 +519,14 @@ export async function handleOpenAiResponsesSurfaceRequest(
         })
       );
       const executeEndpointResultForSiteApiBaseUrl = async (siteApiBaseUrl: string) => {
+        if (oauth) {
+          await trySurfaceOauthPreRefresh({ selected });
+        }
         const forceResponsesUpstreamStream = shouldForceResponsesUpstreamStream({
           sitePlatform: selected.site.platform,
           isCompactRequest,
         });
+        const normalizedSitePlatform = String(selected.site.platform || '').trim().toLowerCase();
         const buildEndpointRequest = (endpoint: 'chat' | 'messages' | 'responses') => {
           const upstreamStream = isStream || (forceResponsesUpstreamStream && endpoint === 'responses');
           const responsesOriginalBody = (
@@ -553,12 +564,24 @@ export async function handleOpenAiResponsesSurfaceRequest(
               ? `${endpointRequest.path}/compact`
               : endpointRequest.path
           );
-          const requestBody = (
+          const baseRequestBody = (
             isCompactRequest && endpoint === 'responses'
               ? sanitizeCompactResponsesRequestBody(endpointRequest.body as Record<string, unknown>, {
                 sitePlatform: selected.site.platform,
               })
               : endpointRequest.body as Record<string, unknown>
+          );
+          const requestBody = (
+            endpoint === 'responses' && normalizedSitePlatform === 'codex' && isRecord(baseRequestBody)
+              ? (() => {
+                const nextBody: Record<string, unknown> = { ...baseRequestBody };
+                delete nextBody.temperature;
+                delete nextBody.top_p;
+                delete nextBody.frequency_penalty;
+                delete nextBody.presence_penalty;
+                return nextBody;
+              })()
+              : baseRequestBody
           );
           const requestHeaders = (
             isCompactRequest && endpoint === 'responses'
@@ -580,12 +603,23 @@ export async function handleOpenAiResponsesSurfaceRequest(
           siteUrl: siteApiBaseUrl,
           accountExtraConfig: selected.account.extraConfig,
         });
+        const codexWsProxyUrl = resolveChannelProxyUrl(selected.site, selected.account.extraConfig);
         const dispatchRequest = (
           endpointRequest: BuiltEndpointRequest,
           targetUrl?: string,
         ) => {
           if (!isCodexSite || !endpointRequest.path.startsWith('/responses')) {
             return baseDispatchRequest(endpointRequest, targetUrl);
+          }
+          if (config.codexUpstreamWebsocketEnabled) {
+            return dispatchCodexWebsocketRequest(
+              endpointRequest,
+              targetUrl,
+              siteApiBaseUrl,
+              isStream || forceResponsesUpstreamStream,
+              codexSessionStoreKey || codexSessionId || '',
+              codexWsProxyUrl,
+            ) as unknown as ReturnType<typeof baseDispatchRequest>;
           }
           const sessionId = getCodexSessionHeaderValue(endpointRequest.headers);
           return runCodexHttpSessionTask(
@@ -710,6 +744,41 @@ export async function handleOpenAiResponsesSurfaceRequest(
             ctx.request = recoveredRequest;
             ctx.response = recoveredResponse;
             ctx.rawErrText = await readRuntimeResponseText(recoveredResponse).catch(() => 'unknown error');
+          }
+
+          const unsupportedParameter = extractUnsupportedParameterName(ctx.rawErrText);
+          if (
+            unsupportedParameter
+            && isRecord(ctx.request.body)
+          ) {
+            const recoveredBody = dropUnsupportedParameterFromBody(ctx.request.body, unsupportedParameter);
+            if (recoveredBody) {
+              console.warn(
+                '[responses] removed unsupported upstream parameter and retried once',
+                {
+                  model: selected.actualModel || requestedModel || '',
+                  platform: selected.site.platform || '',
+                  parameter: unsupportedParameter,
+                  endpoint: ctx.request.path,
+                },
+              );
+              const recoveredRequest = {
+                ...ctx.request,
+                body: recoveredBody,
+              };
+              const recoveredResponse = await dispatchRequest(recoveredRequest, ctx.targetUrl);
+              if (recoveredResponse.ok) {
+                return {
+                  upstream: recoveredResponse,
+                  upstreamPath: recoveredRequest.path,
+                  request: recoveredRequest,
+                  targetUrl: ctx.targetUrl,
+                };
+              }
+              ctx.request = recoveredRequest;
+              ctx.response = recoveredResponse;
+              ctx.rawErrText = await readRuntimeResponseText(recoveredResponse).catch(() => 'unknown error');
+            }
           }
           return endpointStrategy.tryRecover(ctx);
         };

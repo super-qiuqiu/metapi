@@ -721,9 +721,11 @@ export type OAuthConnectionInfo = {
   accountKey?: string | null;
   planType?: string | null;
   projectId?: string | null;
+  tokenExpiresAt?: number;
   modelCount: number;
   modelsPreview: string[];
   status: "healthy" | "abnormal";
+  accountStatus?: "active" | "disabled";
   quota?: OAuthQuotaInfo | null;
   usage?: OAuthConnectionUsageSummary;
   routeChannelCount?: number;
@@ -755,11 +757,51 @@ export type OAuthQuotaBatchRefreshResponse = {
   }>;
 };
 
+export type OAuthTokenBatchRefreshResponse = {
+  success: boolean;
+  refreshed: number;
+  failed: number;
+  items: Array<{
+    accountId: number;
+    success: boolean;
+    error?: string;
+  }>;
+};
+
+export type OAuthModelsBatchRefreshResponse = {
+  success: boolean;
+  refreshed: number;
+  failed: number;
+  items: Array<{
+    accountId: number;
+    success: boolean;
+    modelCount: number;
+    modelsPreview: string[];
+    status: string;
+    errorCode: string | null;
+    errorMessage: string | null;
+  }>;
+};
+
+export type OAuthModelsBatchRefreshItem = {
+  index: number;
+  accountId: number;
+  success: boolean;
+  modelCount: number;
+  modelsPreview: string[];
+  status: string;
+  errorCode: string | null;
+  errorMessage: string | null;
+};
+
 export type OAuthImportResponse = {
   success: boolean;
   imported: number;
   updated: number;
   skipped: number;
+  skippedDuplicateInBatch?: number;
+  skippedExpiredMissing?: number;
+  skippedExpiredNotNewer?: number;
   parseFailed: number;
   refreshFailed: number;
   items: Array<{
@@ -1204,11 +1246,104 @@ export const api = {
       method: "POST",
       body: JSON.stringify({}),
     }) as Promise<{ success: true; quota: OAuthQuotaInfo }>,
-  refreshOAuthConnectionQuotaBatch: (accountIds: number[]) =>
-    request("/api/oauth/connections/quota/refresh-batch", {
+  refreshOAuthConnectionQuotaBatch: (
+    accountIds: number[],
+    handlers: {
+      onRefreshed?: (data: { index: number; accountId: number; success: boolean; quota?: OAuthQuotaInfo; error?: string }) => void;
+      onError?: (data: { message: string }) => void;
+      onDone?: (data: { success: boolean; refreshed: number; failed: number }) => void;
+      signal?: AbortSignal;
+    },
+  ) =>
+    streamSse(
+      "/api/oauth/connections/quota/refresh-batch",
+      {
+        onEvent: (eventName, payload) => {
+          switch (eventName) {
+            case "refreshed":
+              handlers.onRefreshed?.(payload as { index: number; accountId: number; success: boolean; quota?: OAuthQuotaInfo; error?: string });
+              break;
+            case "error":
+              handlers.onError?.(payload as { message: string });
+              break;
+          }
+        },
+        onDone: handlers.onDone,
+        signal: handlers.signal,
+      },
+      {
+        method: "POST",
+        body: JSON.stringify({ accountIds }),
+        timeoutMs: 300_000,
+      },
+    ),
+  refreshOAuthConnectionModelsBatch: (
+    accountIds: number[],
+    handlers: {
+      onRefreshed?: (data: OAuthModelsBatchRefreshItem) => void;
+      onError?: (data: { message: string }) => void;
+      onDone?: (data: { success: boolean; refreshed: number; failed: number }) => void;
+      signal?: AbortSignal;
+    },
+  ) =>
+    streamSse(
+      "/api/oauth/connections/models/refresh-batch",
+      {
+        onEvent: (eventName, payload) => {
+          switch (eventName) {
+            case "refreshed":
+              handlers.onRefreshed?.(payload as OAuthModelsBatchRefreshItem);
+              break;
+            case "error":
+              handlers.onError?.(payload as { message: string });
+              break;
+          }
+        },
+        onDone: handlers.onDone,
+        signal: handlers.signal,
+      },
+      {
+        method: "POST",
+        body: JSON.stringify({ accountIds }),
+        timeoutMs: 300_000,
+      },
+    ),
+  refreshOAuthConnectionToken: (accountId: number) =>
+    request(`/api/oauth/connections/${accountId}/token/refresh`, {
       method: "POST",
-      body: JSON.stringify({ accountIds }),
-    }) as Promise<OAuthQuotaBatchRefreshResponse>,
+      body: JSON.stringify({}),
+    }) as Promise<{ accountId: number; accessToken: string; accountKey?: string; extraConfig: string }>,
+  refreshOAuthConnectionTokenBatch: (
+    accountIds: number[],
+    handlers: {
+      onRefreshed?: (data: { index: number; accountId: number; success: boolean; error?: string }) => void;
+      onError?: (data: { message: string }) => void;
+      onDone?: (data: { success: boolean; refreshed: number; failed: number }) => void;
+      signal?: AbortSignal;
+    },
+  ) =>
+    streamSse(
+      "/api/oauth/connections/token/refresh-batch",
+      {
+        onEvent: (eventName, payload) => {
+          switch (eventName) {
+            case "refreshed":
+              handlers.onRefreshed?.(payload as { index: number; accountId: number; success: boolean; error?: string });
+              break;
+            case "error":
+              handlers.onError?.(payload as { message: string });
+              break;
+          }
+        },
+        onDone: handlers.onDone,
+        signal: handlers.signal,
+      },
+      {
+        method: "POST",
+        body: JSON.stringify({ accountIds }),
+        timeoutMs: 300_000,
+      },
+    ),
   updateOAuthConnectionProxy: (
     accountId: number,
     data: { proxyUrl?: string | null; useSystemProxy?: boolean },

@@ -23,6 +23,10 @@ import {
   recordDownstreamCostUsage,
 } from '../../routes/proxy/downstreamPolicy.js';
 import { executeEndpointFlow, type BuiltEndpointRequest } from '../orchestration/endpointFlow.js';
+import {
+  dropUnsupportedParameterFromBody,
+  extractUnsupportedParameterName,
+} from '../orchestration/unsupportedParameterRecovery.js';
 import { detectProxyFailure } from '../../services/proxyFailureJudge.js';
 import { openAiChatTransformer } from '../../transformers/openai/chat/index.js';
 import { anthropicMessagesTransformer } from '../../transformers/anthropic/messages/index.js';
@@ -56,6 +60,7 @@ import { getRuntimeResponseReader, readRuntimeResponseText } from '../executors/
 import { detectDownstreamClientContext } from '../downstreamClientContext.js';
 import { getProxyMaxChannelRetries } from '../../services/proxyChannelRetry.js';
 import { shouldAbortSameSiteEndpointFallback } from '../../services/proxyRetryPolicy.js';
+import { resolveChannelProxyUrl } from '../../services/siteProxy.js';
 import {
   acquireSurfaceChannelLease,
   bindSurfaceStickyChannel,
@@ -67,8 +72,10 @@ import {
   getSurfaceStickyPreferredChannelId,
   recordSurfaceSuccess,
   selectSurfaceChannelForAttempt,
+  trySurfaceOauthPreRefresh,
   trySurfaceOauthRefreshRecovery,
 } from './sharedSurface.js';
+import { dispatchCodexWebsocketRequest } from './codexWsBridge.js';
 import { runWithSiteApiEndpointPool, SiteApiEndpointRequestError } from '../../services/siteApiEndpointService.js';
 import {
   buildSurfaceProxyDebugResponseHeaders,
@@ -328,6 +335,9 @@ export async function handleChatSurfaceRequest(
       })
     );
     const executeEndpointResultForSiteApiBaseUrl = async (siteApiBaseUrl: string) => {
+      if (oauth) {
+        await trySurfaceOauthPreRefresh({ selected });
+      }
       const forceResponsesUpstreamStream = shouldForceResponsesUpstreamStream({
         sitePlatform: selected.site.platform,
         isCompactRequest: false,
@@ -362,11 +372,31 @@ export async function handleChatSurfaceRequest(
           runtime: endpointRequest.runtime,
         };
       };
-      const dispatchRequest = createSurfaceDispatchRequest({
+      const baseDispatchRequest = createSurfaceDispatchRequest({
         site: selected.site,
         siteUrl: siteApiBaseUrl,
         accountExtraConfig: selected.account.extraConfig,
       });
+      const codexWsProxyUrl = resolveChannelProxyUrl(selected.site, selected.account.extraConfig);
+      const dispatchRequest = (
+        endpointRequest: BuiltEndpointRequest,
+        targetUrl?: string,
+      ) => {
+        if (!isCodexSite || !endpointRequest.path.startsWith('/responses')) {
+          return baseDispatchRequest(endpointRequest, targetUrl);
+        }
+        if (config.codexUpstreamWebsocketEnabled) {
+          return dispatchCodexWebsocketRequest(
+            endpointRequest,
+            targetUrl,
+            siteApiBaseUrl,
+            isStream || forceResponsesUpstreamStream,
+            codexSessionCacheKey || '',
+            codexWsProxyUrl,
+          ) as unknown as ReturnType<typeof baseDispatchRequest>;
+        }
+        return baseDispatchRequest(endpointRequest, targetUrl);
+      };
       const endpointStrategy = downstreamTransformer.compatibility.createEndpointStrategy({
         downstreamFormat,
         endpointCandidates,
@@ -418,6 +448,40 @@ export async function handleChatSurfaceRequest(
             const recoveredRequest = {
               ...ctx.request,
               body: previousResponseRecovery.body,
+            };
+            const recoveredResponse = await dispatchRequest(recoveredRequest, ctx.targetUrl);
+            if (recoveredResponse.ok) {
+              return {
+                upstream: recoveredResponse,
+                upstreamPath: recoveredRequest.path,
+                request: recoveredRequest,
+                targetUrl: ctx.targetUrl,
+              };
+            }
+            ctx.request = recoveredRequest;
+            ctx.response = recoveredResponse;
+            ctx.rawErrText = await readRuntimeResponseText(recoveredResponse).catch(() => 'unknown error');
+          }
+        }
+        const unsupportedParameter = extractUnsupportedParameterName(ctx.rawErrText);
+        if (
+          unsupportedParameter
+          && isRecord(ctx.request.body)
+        ) {
+          const recoveredBody = dropUnsupportedParameterFromBody(ctx.request.body, unsupportedParameter);
+          if (recoveredBody) {
+            console.warn(
+              '[chat] removed unsupported upstream parameter and retried once',
+              {
+                model: selected.actualModel || requestedModel || '',
+                platform: selected.site.platform || '',
+                parameter: unsupportedParameter,
+                endpoint: ctx.request.path,
+              },
+            );
+            const recoveredRequest = {
+              ...ctx.request,
+              body: recoveredBody,
             };
             const recoveredResponse = await dispatchRequest(recoveredRequest, ctx.targetUrl);
             if (recoveredResponse.ok) {
@@ -576,10 +640,23 @@ export async function handleChatSurfaceRequest(
       const upstream = endpointResult.upstream;
       const successfulUpstreamPath = endpointResult.upstreamPath;
       const firstByteLatencyMs = getObservedResponseMeta(upstream)?.firstByteLatencyMs ?? null;
+      const upstreamContentType = (upstream.headers.get('content-type') || '').toLowerCase();
+      request.log.info({
+        event: 'chat_surface_stream_probe',
+        requestedModel,
+        actualModel: modelName,
+        downstreamPath,
+        upstreamPath: successfulUpstreamPath,
+        downstreamStreamRequested: isStream,
+        upstreamContentType,
+      }, '[proxy/chat] stream probe');
 
       if (isStream) {
-        const upstreamContentType = (upstream.headers.get('content-type') || '').toLowerCase();
         let streamStarted = false;
+        const shouldTreatAsStreamingTransport = (
+          upstreamContentType.includes('text/event-stream')
+          || (upstreamContentType.length === 0 && successfulUpstreamPath.endsWith('/responses'))
+        );
         const startSseResponse = () => {
           if (streamStarted) return;
           streamStarted = true;
@@ -654,7 +731,7 @@ export async function handleChatSurfaceRequest(
           },
         });
         let rawText = '';
-        if (!upstreamContentType.includes('text/event-stream')) {
+        if (!shouldTreatAsStreamingTransport) {
           const fallbackText = await readRuntimeResponseText(upstream);
           rawText = fallbackText;
           if (looksLikeResponsesSseText(fallbackText)) {
@@ -901,7 +978,6 @@ export async function handleChatSurfaceRequest(
         return;
       }
 
-      const upstreamContentType = (upstream.headers.get('content-type') || '').toLowerCase();
       let rawText = '';
       let upstreamData: unknown;
       if (upstreamContentType.includes('text/event-stream') && successfulUpstreamPath.endsWith('/responses')) {
@@ -1282,6 +1358,9 @@ export async function handleClaudeCountTokensSurfaceRequest(
       });
     }
     const oauth = getOauthInfoFromAccount(selected.account);
+    if (oauth) {
+      await trySurfaceOauthPreRefresh({ selected });
+    }
     const startTime = Date.now();
     const leaseResult = await acquireSurfaceChannelLease({
       stickySessionKey,

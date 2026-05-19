@@ -13,6 +13,8 @@ const { apiMock, openMock, focusMock, confirmMock, promptMock } = vi.hoisted(() 
     submitOAuthManualCallback: vi.fn(),
     refreshOAuthConnectionQuota: vi.fn(),
     refreshOAuthConnectionQuotaBatch: vi.fn(),
+    refreshOAuthConnectionToken: vi.fn(),
+    refreshOAuthConnectionTokenBatch: vi.fn(),
     rebindOAuthConnection: vi.fn(),
     updateOAuthConnectionProxy: vi.fn(),
     deleteOAuthConnection: vi.fn(),
@@ -185,7 +187,7 @@ describe('OAuthManagement page', () => {
     }
   });
 
-  it('renders the oauth workbench toolbar and supports batch quota refresh', async () => {
+  it('renders the oauth workbench toolbar and supports batch refresh actions', async () => {
     apiMock.getOAuthProviders.mockResolvedValue({
       providers: [
         {
@@ -252,24 +254,13 @@ describe('OAuthManagement page', () => {
         limit: 100,
         offset: 0,
       });
-    apiMock.refreshOAuthConnectionQuotaBatch.mockResolvedValue({
-      success: true,
-      refreshed: 1,
-      failed: 0,
-      items: [
-        {
-          accountId: 7,
-          success: true,
-          quota: {
-            status: 'supported',
-            source: 'reverse_engineered',
-            windows: {
-              fiveHour: { supported: false },
-              sevenDay: { supported: false },
-            },
-          },
-        },
-      ],
+    apiMock.refreshOAuthConnectionQuotaBatch.mockImplementation(async (_ids: number[], handlers: any) => {
+      if (handlers?.onRefreshed) handlers.onRefreshed({ index: 0, accountId: 7, success: true });
+      if (handlers?.onDone) handlers.onDone({ success: true, refreshed: 1, failed: 0 });
+    });
+    apiMock.refreshOAuthConnectionTokenBatch.mockImplementation(async (_ids: number[], handlers: any) => {
+      if (handlers?.onRefreshed) handlers.onRefreshed({ index: 0, accountId: 7, success: true });
+      if (handlers?.onDone) handlers.onDone({ success: true, refreshed: 1, failed: 0 });
     });
 
     let root!: WebTestRenderer;
@@ -312,8 +303,28 @@ describe('OAuthManagement page', () => {
       });
       await flushMicrotasks();
 
-      expect(apiMock.refreshOAuthConnectionQuotaBatch).toHaveBeenCalledWith([7]);
-      expect(apiMock.getOAuthConnections).toHaveBeenCalledTimes(2);
+      const batchRefreshTokenButton = root.root.find((node) => (
+        node.type === 'button'
+        && typeof node.props.onClick === 'function'
+        && collectText(node).includes('批量刷新 Token')
+      ));
+
+      await act(async () => {
+        await batchRefreshTokenButton.props.onClick();
+      });
+      await flushMicrotasks();
+
+      expect(apiMock.refreshOAuthConnectionQuotaBatch).toHaveBeenCalledWith([7], expect.objectContaining({
+        onRefreshed: expect.any(Function),
+        onDone: expect.any(Function),
+        onError: expect.any(Function),
+      }));
+      expect(apiMock.refreshOAuthConnectionTokenBatch).toHaveBeenCalledWith([7], expect.objectContaining({
+        onRefreshed: expect.any(Function),
+        onDone: expect.any(Function),
+        onError: expect.any(Function),
+      }));
+      expect(apiMock.getOAuthConnections).toHaveBeenCalledTimes(3);
     } finally {
       root?.unmount();
     }

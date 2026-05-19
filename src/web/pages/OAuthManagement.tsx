@@ -48,6 +48,7 @@ type DrawerIntent =
   | { mode: 'proxy'; account: OAuthConnectionInfo };
 
 type ColumnKey = 'identity' | 'site' | 'status' | 'quota' | 'proxy';
+type OAuthSortMode = 'expiry_asc' | 'expiry_desc' | 'quota_remaining_asc' | 'quota_remaining_desc';
 
 type OAuthImportFileLike = {
   name?: string;
@@ -179,6 +180,68 @@ function normalizeOauthMessage(value: string | null | undefined): string {
     .replace(/antigravity quota via fetchAvailableModels API/ig, '额度数据来自 fetchAvailableModels API')
     .replace(/antigravity quota has not been synced yet/ig, 'Antigravity 配额尚未同步')
     .replace(/\bfetch failed\b/ig, '网络请求失败');
+}
+
+function formatRemainingDuration(ms: number): string {
+  if (!Number.isFinite(ms)) return '--';
+  if (ms <= 0) return '已过期';
+  const totalMinutes = Math.floor(ms / 60_000);
+  if (totalMinutes < 1) return '不到 1 分钟';
+  const days = Math.floor(totalMinutes / (24 * 60));
+  const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return `${days} 天 ${hours} 小时`;
+  if (hours > 0) return `${hours} 小时 ${minutes} 分钟`;
+  return `${minutes} 分钟`;
+}
+
+function resolveTokenExpiryText(connection: OAuthConnectionInfo): { expiresAt: string; remaining: string } {
+  const expiresAt = connection.tokenExpiresAt;
+  if (!(typeof expiresAt === 'number' && Number.isFinite(expiresAt) && expiresAt > 0)) {
+    return { expiresAt: '--', remaining: '--' };
+  }
+  const now = Date.now();
+  return {
+    expiresAt: new Date(expiresAt).toLocaleString(),
+    remaining: formatRemainingDuration(expiresAt - now),
+  };
+}
+
+function resolveQuotaRemainingPercentForSort(connection: OAuthConnectionInfo): number | null {
+  const quota = connection.quota;
+  if (!quota) return null;
+
+  if (Array.isArray(quota.antigravityGroups) && quota.antigravityGroups.length > 0) {
+    const fractions = quota.antigravityGroups
+      .map((group) => (typeof group.remainingFraction === 'number' && Number.isFinite(group.remainingFraction)
+        ? Math.max(0, Math.min(1, group.remainingFraction))
+        : null))
+      .filter((value): value is number => value !== null);
+    if (fractions.length > 0) {
+      const avg = fractions.reduce((sum, value) => sum + value, 0) / fractions.length;
+      return avg * 100;
+    }
+  }
+
+  const windows: OAuthQuotaWindowInfo[] = [quota.windows?.fiveHour, quota.windows?.sevenDay]
+    .filter((window): window is OAuthQuotaWindowInfo => !!window && window.supported !== false);
+
+  const percents = windows
+    .map((window) => resolveQuotaWindowRemainingPercent(window))
+    .filter((value): value is number => value != null);
+
+  if (percents.length <= 0) return null;
+  return Math.min(...percents);
+}
+
+function resolveTotalRemainingQuotaText(connections: OAuthConnectionInfo[]): string {
+  const percents = connections
+    .map((connection) => resolveQuotaRemainingPercentForSort(connection))
+    .filter((value): value is number => value != null);
+  if (percents.length <= 0) return '--/--';
+  const totalRemaining = Math.round(percents.reduce((sum, value) => sum + value, 0));
+  const totalQuota = percents.length * 100;
+  return `${totalRemaining}%/${totalQuota}%`;
 }
 
 function listImportFiles(files: ArrayLike<OAuthImportFileLike> | null | undefined): OAuthImportFileLike[] {
@@ -708,6 +771,7 @@ export default function OAuthManagement() {
   const [providerFilter, setProviderFilter] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
   const [siteFilter, setSiteFilter] = useState('');
+  const [sortMode, setSortMode] = useState<OAuthSortMode>('expiry_asc');
   const [visibleColumns, setVisibleColumns] = useState<Record<ColumnKey, boolean>>({
     identity: true,
     site: true,
@@ -987,7 +1051,7 @@ export default function OAuthManagement() {
 
   const filteredConnections = useMemo(() => {
     const search = searchQuery.trim().toLowerCase();
-    return connections.filter((connection) => {
+    const filtered = connections.filter((connection) => {
       if (providerFilter && connection.provider !== providerFilter) return false;
       if (statusFilter && connection.status !== statusFilter) return false;
       if (siteFilter && String(connection.site?.id || '') !== siteFilter) return false;
@@ -1001,10 +1065,47 @@ export default function OAuthManagement() {
         connection.accountKey,
         connection.projectId,
         connection.modelsPreview.join(' '),
+        String(connection.accountId),
+        `#${connection.accountId}`,
       ].join(' ').toLowerCase();
       return haystack.includes(search);
     });
-  }, [connections, providerFilter, searchQuery, siteFilter, statusFilter]);
+
+    const sorted = [...filtered].sort((a, b) => {
+      if (sortMode === 'expiry_asc' || sortMode === 'expiry_desc') {
+        const aValue = typeof a.tokenExpiresAt === 'number' && Number.isFinite(a.tokenExpiresAt) ? a.tokenExpiresAt : null;
+        const bValue = typeof b.tokenExpiresAt === 'number' && Number.isFinite(b.tokenExpiresAt) ? b.tokenExpiresAt : null;
+        if (aValue == null && bValue == null) return 0;
+        if (aValue == null) return 1;
+        if (bValue == null) return -1;
+        return sortMode === 'expiry_asc' ? aValue - bValue : bValue - aValue;
+      }
+
+      const aQuota = resolveQuotaRemainingPercentForSort(a);
+      const bQuota = resolveQuotaRemainingPercentForSort(b);
+      if (aQuota == null && bQuota == null) return 0;
+      if (aQuota == null) return 1;
+      if (bQuota == null) return -1;
+      return sortMode === 'quota_remaining_asc' ? aQuota - bQuota : bQuota - aQuota;
+    });
+
+    return sorted;
+  }, [connections, providerFilter, searchQuery, siteFilter, sortMode, statusFilter]);
+
+  const visibleAccountStatusSummary = useMemo(() => {
+    let active = 0;
+    let disabled = 0;
+    for (const connection of filteredConnections) {
+      if (connection.accountStatus === 'disabled') disabled += 1;
+      else active += 1;
+    }
+    return { active, disabled };
+  }, [filteredConnections]);
+
+  const totalRemainingQuotaText = useMemo(
+    () => resolveTotalRemainingQuotaText(filteredConnections),
+    [filteredConnections],
+  );
 
   const allVisibleSelected = filteredConnections.length > 0
     && filteredConnections.every((connection) => selectedConnectionIds.includes(connection.accountId));
@@ -1317,19 +1418,126 @@ export default function OAuthManagement() {
     }
   };
 
+  const handleRefreshModels = async (accountId: number) => {
+    const actionKey = `models:${accountId}`;
+    setActionLoadingKey(actionKey);
+    const toastId = toast.startProgress(1, '刷新模型...');
+    try {
+      await api.refreshOAuthConnectionModelsBatch([accountId], {
+        onRefreshed: () => toast.progress(toastId, 1, 1),
+        onDone: (data) => {
+          if (data.failed > 0) {
+            toast.finishProgress(toastId, `模型刷新完成，成功 ${data.refreshed} 个，失败 ${data.failed} 个`, 'info');
+          } else {
+            toast.finishProgress(toastId, '模型列表已刷新');
+          }
+        },
+        onError: (data) => toast.finishProgress(toastId, data.message, 'error'),
+      });
+      await loadConnections();
+    } catch (error: any) {
+      toast.finishProgress(toastId, error?.message || '刷新模型失败', 'error');
+    } finally {
+      setActionLoadingKey('');
+    }
+  };
+
+  const handleRefreshModelsSelected = async () => {
+    if (selectedConnectionIds.length === 0) return;
+    setActionLoadingKey('models:selected');
+    const total = selectedConnectionIds.length;
+    const toastId = toast.startProgress(total, `批量刷新模型 0/${total}`);
+    let done = 0;
+    try {
+      await api.refreshOAuthConnectionModelsBatch(selectedConnectionIds, {
+        onRefreshed: () => {
+          done++;
+          toast.progress(toastId, done, total, `批量刷新模型 ${done}/${total}`);
+        },
+        onDone: (data) => {
+          if (data.failed > 0) {
+            toast.finishProgress(toastId, `批量刷新模型完成，成功 ${data.refreshed} 个，失败 ${data.failed} 个`, 'info');
+          } else {
+            toast.finishProgress(toastId, `已批量刷新 ${data.refreshed} 个 OAuth 连接的模型`);
+          }
+        },
+        onError: (data) => toast.finishProgress(toastId, data.message, 'error'),
+      });
+      await loadConnections();
+    } catch (error: any) {
+      toast.finishProgress(toastId, error?.message || '批量刷新模型失败', 'error');
+    } finally {
+      setActionLoadingKey('');
+    }
+  };
+
   const handleRefreshSelected = async () => {
     if (selectedConnectionIds.length === 0) return;
     setActionLoadingKey('quota:selected');
+    const total = selectedConnectionIds.length;
+    const toastId = toast.startProgress(total, `批量刷新额度 0/${total}`);
+    let done = 0;
     try {
-      const result = await api.refreshOAuthConnectionQuotaBatch(selectedConnectionIds);
+      await api.refreshOAuthConnectionQuotaBatch(selectedConnectionIds, {
+        onRefreshed: () => {
+          done++;
+          toast.progress(toastId, done, total, `批量刷新额度 ${done}/${total}`);
+        },
+        onDone: (data) => {
+          if (data.failed > 0) {
+            toast.finishProgress(toastId, `批量刷新额度完成，成功 ${data.refreshed} 个，失败 ${data.failed} 个`, 'info');
+          } else {
+            toast.finishProgress(toastId, `已批量刷新 ${data.refreshed} 个 OAuth 连接额度`);
+          }
+        },
+        onError: (data) => toast.finishProgress(toastId, data.message, 'error'),
+      });
       await loadConnections();
-      if (result.failed > 0) {
-        setSessionInfo(`批量刷新完成，成功 ${result.refreshed} 个，失败 ${result.failed} 个`);
-      } else {
-        setSessionSuccess(`已批量刷新 ${result.refreshed} 个 OAuth 连接`);
-      }
     } catch (error: any) {
-      setSessionError(error?.message || '批量刷新额度失败');
+      toast.finishProgress(toastId, error?.message || '批量刷新额度失败', 'error');
+    } finally {
+      setActionLoadingKey('');
+    }
+  };
+
+  const handleRefreshToken = async (accountId: number) => {
+    const actionKey = `token:${accountId}`;
+    setActionLoadingKey(actionKey);
+    try {
+      await api.refreshOAuthConnectionToken(accountId);
+      toast.success('Token 已刷新');
+      await loadConnections();
+    } catch (error: any) {
+      toast.error(error?.message || '刷新 Token 失败');
+    } finally {
+      setActionLoadingKey('');
+    }
+  };
+
+  const handleRefreshTokenSelected = async () => {
+    if (selectedConnectionIds.length === 0) return;
+    setActionLoadingKey('token:selected');
+    const total = selectedConnectionIds.length;
+    const toastId = toast.startProgress(total, `批量刷新 Token 0/${total}`);
+    let done = 0;
+    try {
+      await api.refreshOAuthConnectionTokenBatch(selectedConnectionIds, {
+        onRefreshed: () => {
+          done++;
+          toast.progress(toastId, done, total, `批量刷新 Token ${done}/${total}`);
+        },
+        onDone: (data) => {
+          if (data.failed > 0) {
+            toast.finishProgress(toastId, `批量刷新 Token 完成，成功 ${data.refreshed} 个，失败 ${data.failed} 个`, 'info');
+          } else {
+            toast.finishProgress(toastId, `已批量刷新 ${data.refreshed} 个 OAuth Token`);
+          }
+        },
+        onError: (data) => toast.finishProgress(toastId, data.message, 'error'),
+      });
+      await loadConnections();
+    } catch (error: any) {
+      toast.finishProgress(toastId, error?.message || '批量刷新 Token 失败', 'error');
     } finally {
       setActionLoadingKey('');
     }
@@ -1588,6 +1796,9 @@ export default function OAuthManagement() {
         });
 
       let imported = 0, updated = 0, skipped = 0, parseFailed = 0, refreshFailed = 0;
+      let skippedDuplicateInBatch = 0, skippedExpiredMissing = 0, skippedExpiredNotNewer = 0;
+      const skippedMessages: string[] = [];
+      const reconcileMessages: string[] = [];
 
       // 先尝试 SSE 流式导入
       try {
@@ -1597,7 +1808,19 @@ export default function OAuthManagement() {
             onItem: (item) => {
               if (item.status === 'imported') imported++;
               else if (item.status === 'updated') updated++;
+              else if (item.status === 'skipped') {
+                skipped++;
+                if (typeof item.message === 'string' && item.message.trim()) {
+                  skippedMessages.push(item.message.trim());
+                }
+              }
               else if (item.status === 'failed') parseFailed++;
+              if (typeof item.message === 'string' && item.message.includes('已自动收敛同邮箱多身份')) {
+                const msg = item.message.trim();
+                if (msg && !reconcileMessages.includes(msg)) {
+                  reconcileMessages.push(msg);
+                }
+              }
               setImportProgress(prev => ({ ...prev, current: prev.current + 1 }));
             },
             onCheckpoint: () => {
@@ -1618,6 +1841,9 @@ export default function OAuthManagement() {
               imported = data.imported;
               updated = data.updated;
               skipped = data.skipped;
+              skippedDuplicateInBatch = data.skippedDuplicateInBatch ?? 0;
+              skippedExpiredMissing = data.skippedExpiredMissing ?? 0;
+              skippedExpiredNotNewer = data.skippedExpiredNotNewer ?? 0;
               parseFailed = data.parseFailed;
               refreshFailed = data.refreshFailed;
             },
@@ -1639,6 +1865,9 @@ export default function OAuthManagement() {
           imported = fallbackResult.imported;
           updated = fallbackResult.updated;
           skipped = fallbackResult.skipped;
+          skippedDuplicateInBatch = fallbackResult.skippedDuplicateInBatch ?? 0;
+          skippedExpiredMissing = fallbackResult.skippedExpiredMissing ?? 0;
+          skippedExpiredNotNewer = fallbackResult.skippedExpiredNotNewer ?? 0;
           parseFailed = fallbackResult.parseFailed;
           refreshFailed = fallbackResult.refreshFailed;
         } else {
@@ -1651,9 +1880,20 @@ export default function OAuthManagement() {
       const parts: string[] = [];
       if (imported > 0) parts.push(`成功入库 ${imported} 个`);
       if (updated > 0) parts.push(`更新 ${updated} 个`);
-      if (skipped > 0) parts.push(`重复跳过 ${skipped} 个`);
+      if (skippedDuplicateInBatch > 0) parts.push(`批内重复跳过 ${skippedDuplicateInBatch} 个`);
+      if (skippedExpiredMissing > 0) parts.push(`expired 缺失跳过 ${skippedExpiredMissing} 个`);
+      if (skippedExpiredNotNewer > 0) parts.push(`expired 非更新跳过 ${skippedExpiredNotNewer} 个`);
+      if (skipped > 0 && skippedDuplicateInBatch + skippedExpiredMissing + skippedExpiredNotNewer === 0) {
+        parts.push(`跳过 ${skipped} 个`);
+      }
       if (parseFailed > 0) parts.push(`格式无效 ${parseFailed} 个`);
       if (refreshFailed > 0) parts.push(`模型探测失败 ${refreshFailed} 个（账户已入库，可稍后刷新模型）`);
+      if (skippedMessages.length > 0) {
+        parts.push(`示例原因：${skippedMessages[0]}`);
+      }
+      if (reconcileMessages.length > 0) {
+        parts.push(`收敛提示：${reconcileMessages[0]}`);
+      }
       const importMessage = parts.length > 0
         ? parts.join('，')
         : '没有需要导入的连接';
@@ -1837,6 +2077,20 @@ export default function OAuthManagement() {
                 placeholder="全部站点"
               />
             </div>
+            <div className="oauth-filter-slot-wide">
+              <ModernSelect
+                size="sm"
+                value={sortMode}
+                onChange={(value) => setSortMode(String(value || 'default') as OAuthSortMode)}
+                options={[
+                  { value: 'expiry_asc', label: '按到期时间：近 -> 远' },
+                  { value: 'expiry_desc', label: '按到期时间：远 -> 近' },
+                  { value: 'quota_remaining_asc', label: '按剩余额度：低 -> 高' },
+                  { value: 'quota_remaining_desc', label: '按剩余额度：高 -> 低' },
+                ]}
+                placeholder="排序"
+              />
+            </div>
           </div>
 
           <div className="oauth-toolbar-actions">
@@ -1929,6 +2183,18 @@ export default function OAuthManagement() {
       />
       <ModernSelect
         size="sm"
+        value={sortMode}
+        onChange={(value) => setSortMode(String(value || 'expiry_asc') as OAuthSortMode)}
+        options={[
+          { value: 'expiry_asc', label: '按到期时间：近 -> 远' },
+          { value: 'expiry_desc', label: '按到期时间：远 -> 近' },
+          { value: 'quota_remaining_asc', label: '按剩余额度：低 -> 高' },
+          { value: 'quota_remaining_desc', label: '按剩余额度：高 -> 低' },
+        ]}
+        placeholder="排序"
+      />
+      <ModernSelect
+        size="sm"
         value={String(autoRefreshSeconds)}
         onChange={(value) => setAutoRefreshSeconds(Number(value || 0))}
         options={AUTO_REFRESH_OPTIONS.map((seconds) => ({
@@ -1969,6 +2235,7 @@ export default function OAuthManagement() {
           const modelSyncDetail = resolveModelSyncDetail(connection);
           const quotaSyncDetail = resolveQuotaSyncDetail(quota);
           const usage = connection.usage;
+          const tokenExpiry = resolveTokenExpiryText(connection);
           return (
             <tr key={connection.accountId}>
               <td>
@@ -2001,13 +2268,19 @@ export default function OAuthManagement() {
                       <span className={`badge oauth-badge ${connection.status === 'abnormal' ? 'badge-warning' : 'badge-success'}`}>
                         {resolveConnectionStatusLabel(connection.status)}
                       </span>
+                      <span className={`badge oauth-badge ${connection.accountStatus === 'disabled' ? 'badge-muted' : 'badge-info'}`}>
+                        {connection.accountStatus === 'disabled' ? '已禁用' : '已启用'}
+                      </span>
                     </div>
                     {emailLabel && emailLabel !== primaryTitle ? (
                       <div className="oauth-cell-secondary oauth-identity-secondary" title={emailLabel}>{emailLabel}</div>
                     ) : null}
+                    <div className="oauth-cell-tertiary" title={`accountId=${connection.accountId}`}>
+                      账号ID: #{connection.accountId}
+                    </div>
                     {connection.accountKey ? (
                       <div className="oauth-cell-tertiary oauth-identity-key" title={connection.accountKey}>
-                        连接: {compactAccountKey(connection.accountKey)}
+                        连接Key: {compactAccountKey(connection.accountKey)}
                       </div>
                     ) : null}
                   </div>
@@ -2049,6 +2322,13 @@ export default function OAuthManagement() {
                       {quotaSyncDetail ? (
                         <div className="oauth-status-detail" title={quotaSyncDetail}>{quotaSyncDetail}</div>
                       ) : null}
+                    </div>
+                    <div className="oauth-status-item">
+                      <div className="oauth-status-line">
+                        <div className="oauth-status-label">Token</div>
+                        <div className="oauth-cell-tertiary oauth-status-value">剩余 {tokenExpiry.remaining}</div>
+                      </div>
+                      <div className="oauth-status-detail">到期：{tokenExpiry.expiresAt}</div>
                     </div>
                   </div>
                 </td>
@@ -2114,6 +2394,22 @@ export default function OAuthManagement() {
                   </button>
                   <button
                     type="button"
+                    className="btn btn-link btn-link-primary"
+                    onClick={() => handleRefreshToken(connection.accountId)}
+                    disabled={actionLoadingKey === `token:${connection.accountId}`}
+                  >
+                    {actionLoadingKey === `token:${connection.accountId}` ? '刷新中...' : '刷新 Token'}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-link btn-link-primary"
+                    onClick={() => handleRefreshModels(connection.accountId)}
+                    disabled={actionLoadingKey === `models:${connection.accountId}`}
+                  >
+                    {actionLoadingKey === `models:${connection.accountId}` ? '刷新中...' : '刷新模型'}
+                  </button>
+                  <button
+                    type="button"
                     className="btn btn-link btn-link-info"
                     onClick={() => openRebindDrawer(connection)}
                   >
@@ -2141,11 +2437,12 @@ export default function OAuthManagement() {
       {filteredConnections.map((connection) => {
         const quota = connection.quota;
         const usage = connection.usage;
+        const tokenExpiry = resolveTokenExpiryText(connection);
         return (
           <MobileCard
             key={connection.accountId}
             title={resolveConnectionPrimaryTitle(connection)}
-            subtitle={`${connection.provider} · ${resolveConnectionStatusLabel(connection.status)}`}
+            subtitle={`${connection.provider} · ${resolveConnectionStatusLabel(connection.status)} · ${connection.accountStatus === 'disabled' ? '已禁用' : '已启用'} · #${connection.accountId}`}
             headerActions={(
               <input
                 type="checkbox"
@@ -2160,6 +2457,8 @@ export default function OAuthManagement() {
             )}
           >
             <MobileField label="站点" value={connection.site?.name || '--'} />
+            <MobileField label="账号ID" value={`#${connection.accountId}`} />
+            <MobileField label="账号状态" value={connection.accountStatus === 'disabled' ? '已禁用' : '已启用'} />
             <MobileField label="邮箱" value={resolveConnectionEmailLabel(connection) || '--'} />
             <MobileField label="计划 / 项目" value={connection.projectId ? `${connection.planType || '--'} · ${connection.projectId}` : (connection.planType || '--')} />
             <MobileField label="路由参与" value={resolveRouteParticipationSummary(connection)} />
@@ -2201,6 +2500,13 @@ export default function OAuthManagement() {
                       <div className="oauth-status-detail">{resolveQuotaSyncDetail(quota)}</div>
                     ) : null}
                   </div>
+                  <div className="oauth-status-item">
+                    <div className="oauth-status-line">
+                      <div className="oauth-status-label">Token</div>
+                      <div className="oauth-cell-tertiary">剩余 {tokenExpiry.remaining}</div>
+                    </div>
+                    <div className="oauth-status-detail">到期：{tokenExpiry.expiresAt}</div>
+                  </div>
                 </div>
               )}
               stacked
@@ -2236,6 +2542,12 @@ export default function OAuthManagement() {
               </button>
               <button type="button" className="btn btn-link btn-link-primary" onClick={() => handleRefreshQuota(connection.accountId)}>
                 刷新额度
+              </button>
+              <button type="button" className="btn btn-link btn-link-primary" onClick={() => handleRefreshToken(connection.accountId)}>
+                刷新 Token
+              </button>
+              <button type="button" className="btn btn-link btn-link-primary" onClick={() => handleRefreshModels(connection.accountId)} disabled={actionLoadingKey === `models:${connection.accountId}`}>
+                {actionLoadingKey === `models:${connection.accountId}` ? '刷新中...' : '刷新模型'}
               </button>
               <button type="button" className="btn btn-link btn-link-info" onClick={() => openProxySettingsDrawer(connection)}>
                 代理设置
@@ -2326,7 +2638,8 @@ export default function OAuthManagement() {
           <div>
             <div className="oauth-workbench-title">OAuth 连接列表</div>
             <div className="oauth-workbench-meta">
-              已连接 {connections.length} 个 OAuth 账号，当前筛选后显示 {filteredConnections.length} 个。
+              已连接 {connections.length} 个 OAuth 账号，当前筛选后显示 {filteredConnections.length} 个（启用 {visibleAccountStatusSummary.active} / 禁用 {visibleAccountStatusSummary.disabled}）。
+              {' · '}剩余额度总量 {totalRemainingQuotaText}
             </div>
           </div>
         </div>
@@ -2340,6 +2653,22 @@ export default function OAuthManagement() {
               disabled={actionLoadingKey === 'quota:selected'}
             >
               {actionLoadingKey === 'quota:selected' ? '刷新中...' : '批量刷新额度'}
+            </button>
+            <button
+              type="button"
+              className="btn btn-ghost oauth-outline-button"
+              onClick={handleRefreshTokenSelected}
+              disabled={actionLoadingKey === 'token:selected'}
+            >
+              {actionLoadingKey === 'token:selected' ? '刷新中...' : '批量刷新 Token'}
+            </button>
+            <button
+              type="button"
+              className="btn btn-ghost oauth-outline-button"
+              onClick={handleRefreshModelsSelected}
+              disabled={actionLoadingKey === 'models:selected'}
+            >
+              {actionLoadingKey === 'models:selected' ? '刷新中...' : '批量刷新模型'}
             </button>
             <button
               type="button"
