@@ -7,7 +7,7 @@ import {
   mergeAccountExtraConfig,
   resolveProxyUrlFromExtraConfig,
 } from '../accountExtraConfig.js';
-import { refreshModelsForAccount } from '../modelService.js';
+import { refreshModelsForAccount, type ModelRefreshResult } from '../modelService.js';
 import * as routeRefreshWorkflow from '../routeRefreshWorkflow.js';
 import {
   createOauthSession,
@@ -81,6 +81,30 @@ export class OauthImportValidationError extends Error {
     super(message);
     this.name = 'OauthImportValidationError';
   }
+}
+
+export type OauthImportExpiredDecision =
+  | { allowUpdate: true }
+  | { allowUpdate: false; reason: 'incoming_expired_missing' | 'incoming_expired_not_newer' };
+
+type OauthImportSkipReason = 'duplicate_in_batch' | 'incoming_expired_missing' | 'incoming_expired_not_newer';
+
+export function decideImportOverwriteByExpired(input: {
+  incomingTokenExpiresAt?: number;
+  existingTokenExpiresAt?: number;
+}): OauthImportExpiredDecision {
+  const incoming = input.incomingTokenExpiresAt;
+  if (!(typeof incoming === 'number' && Number.isFinite(incoming) && incoming > 0)) {
+    return { allowUpdate: false, reason: 'incoming_expired_missing' };
+  }
+  const existing = input.existingTokenExpiresAt;
+  if (!(typeof existing === 'number' && Number.isFinite(existing) && existing > 0)) {
+    return { allowUpdate: true };
+  }
+  if (incoming > existing) {
+    return { allowUpdate: true };
+  }
+  return { allowUpdate: false, reason: 'incoming_expired_not_newer' };
 }
 
 function throwOauthImportValidationError(message: string): never {
@@ -473,6 +497,7 @@ async function activatePersistedOauthAccount(input: {
   useSystemProxy?: boolean;
   persistedStatus?: 'active' | 'disabled';
   activateExistingAfterRefresh?: boolean;
+  importDecisionMode?: 'always_overwrite' | 'expired_only';
 }) {
   const rollbackSnapshotByRebindAccountId = typeof input.rebindAccountId === 'number' && input.rebindAccountId > 0
     ? await db.select().from(schema.modelAvailability)
@@ -486,10 +511,15 @@ async function activatePersistedOauthAccount(input: {
     proxyUrl: input.proxyUrl,
     useSystemProxy: input.useSystemProxy,
     persistedStatus: input.persistedStatus,
+    importDecisionMode: input.importDecisionMode,
   });
 
   if (!persisted.account) {
     throw new Error('failed to persist oauth account');
+  }
+
+  if (persisted.skipped) {
+    return persisted;
   }
 
   const previousModelAvailability = rollbackSnapshotByRebindAccountId.length > 0
@@ -589,6 +619,75 @@ async function findExistingOauthAccount(input: {
   return null;
 }
 
+function isLikelyUuid(value?: string): boolean {
+  const normalized = asNonEmptyString(value);
+  if (!normalized) return false;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(normalized);
+}
+
+function pickCanonicalCodexAccount(input: {
+  candidates: Array<typeof schema.accounts.$inferSelect>;
+  preferredAccountKey?: string;
+}): typeof schema.accounts.$inferSelect | null {
+  if (input.candidates.length === 0) return null;
+  const preferredKey = asNonEmptyString(input.preferredAccountKey);
+  const sorted = [...input.candidates].sort((a, b) => {
+    const aKey = asNonEmptyString(a.oauthAccountKey);
+    const bKey = asNonEmptyString(b.oauthAccountKey);
+    const aPreferred = preferredKey && aKey === preferredKey ? 1 : 0;
+    const bPreferred = preferredKey && bKey === preferredKey ? 1 : 0;
+    if (aPreferred !== bPreferred) return bPreferred - aPreferred;
+
+    const aUuid = isLikelyUuid(aKey) ? 1 : 0;
+    const bUuid = isLikelyUuid(bKey) ? 1 : 0;
+    if (aUuid !== bUuid) return bUuid - aUuid;
+
+    const aTokenExpiresAt = getOauthInfoFromAccount(a)?.tokenExpiresAt ?? 0;
+    const bTokenExpiresAt = getOauthInfoFromAccount(b)?.tokenExpiresAt ?? 0;
+    if (aTokenExpiresAt !== bTokenExpiresAt) return bTokenExpiresAt - aTokenExpiresAt;
+
+    return b.id - a.id;
+  });
+  return sorted[0] ?? null;
+}
+
+async function reconcileCodexDuplicateAccountsByEmail(input: {
+  txDb: typeof db;
+  email?: string;
+  preferredAccountKey?: string;
+}): Promise<{ primary: typeof schema.accounts.$inferSelect; disabledAccountIds: number[] } | null> {
+  const email = asNonEmptyString(input.email);
+  if (!email) return null;
+
+  const candidates = await input.txDb.select().from(schema.accounts).where(and(
+    eq(schema.accounts.oauthProvider, 'codex'),
+    eq(schema.accounts.username, email),
+  ));
+  if (candidates.length === 0) return null;
+
+  const primary = pickCanonicalCodexAccount({
+    candidates,
+    preferredAccountKey: input.preferredAccountKey,
+  });
+  if (!primary) return null;
+
+  const secondaryIds = candidates
+    .filter((account) => account.id !== primary.id)
+    .map((account) => account.id);
+
+  if (secondaryIds.length > 0) {
+    await input.txDb.update(schema.accounts).set({
+      status: 'disabled',
+      updatedAt: new Date().toISOString(),
+    }).where(inArray(schema.accounts.id, secondaryIds)).run();
+  }
+
+  return {
+    primary,
+    disabledAccountIds: secondaryIds,
+  };
+}
+
 function isUniqueConstraintError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   const message = error.message || '';
@@ -622,6 +721,7 @@ export async function upsertOauthAccount(input: {
   persistedStatus?: 'active' | 'disabled';
   /** 若已预解析 site，跳过 ensureOauthSite 调用 */
   preResolvedSite?: { id: number; [key: string]: any };
+  importDecisionMode?: 'always_overwrite' | 'expired_only';
 }) {
   const site = input.preResolvedSite ?? await ensureOauthSite(input.definition);
 
@@ -677,6 +777,7 @@ export async function upsertOauthAccount(input: {
         site,
         created: false,
         previousAccount: existing,
+        skipped: false,
       };
     }
 
@@ -701,17 +802,35 @@ export async function upsertOauthAccount(input: {
       insertErrorMessage: `failed to create oauth account: ${input.definition.metadata.provider}`,
       loadErrorMessage: `failed to load created oauth account: ${input.definition.metadata.provider}`,
     });
-    return { account: created, site, created: true, previousAccount: null };
+    return { account: created, site, created: true, previousAccount: null, skipped: false };
   }
 
   // 非 rebind 路径：全部走事务
   return db.transaction(async (tx) => {
-    const existing = await findExistingOauthAccount({
+    let existing = await findExistingOauthAccount({
       provider: input.definition.metadata.provider,
       accountKey: input.exchange.accountKey || input.exchange.accountId,
       email: input.exchange.email,
       projectId: input.exchange.projectId,
     }, tx);
+    let importReconcileInfo: { primaryAccountId: number; disabledAccountIds: number[] } | undefined;
+
+    if (input.importDecisionMode === 'expired_only' && input.definition.metadata.provider === 'codex') {
+      const reconcileResult = await reconcileCodexDuplicateAccountsByEmail({
+        txDb: tx,
+        email: input.exchange.email,
+        preferredAccountKey: input.exchange.accountKey || input.exchange.accountId,
+      });
+      if (reconcileResult) {
+        existing = reconcileResult.primary;
+        if (reconcileResult.disabledAccountIds.length > 0) {
+          importReconcileInfo = {
+            primaryAccountId: reconcileResult.primary.id,
+            disabledAccountIds: reconcileResult.disabledAccountIds,
+          };
+        }
+      }
+    }
 
     const username = buildUsername({
       email: input.exchange.email,
@@ -752,9 +871,33 @@ export async function upsertOauthAccount(input: {
     };
 
     if (existing) {
+      if (input.importDecisionMode === 'expired_only') {
+        const incomingTokenExpiresAt = input.exchange.tokenExpiresAt;
+        const existingTokenExpiresAt = getOauthInfoFromAccount(existing)?.tokenExpiresAt;
+        const decision = decideImportOverwriteByExpired({
+          incomingTokenExpiresAt,
+          existingTokenExpiresAt,
+        });
+        if (!decision.allowUpdate) {
+          return {
+            account: existing,
+            site,
+            created: false,
+            previousAccount: existing,
+            skipped: true,
+            skipReason: decision.reason,
+            skipDecision: {
+              incomingTokenExpiresAt,
+              existingTokenExpiresAt,
+              matchedAccountId: existing.id,
+            },
+            importReconcileInfo,
+          };
+        }
+      }
       await tx.update(schema.accounts).set(updateSet).where(eq(schema.accounts.id, existing.id)).run();
       const account = await tx.select().from(schema.accounts).where(eq(schema.accounts.id, existing.id)).get();
-      return { account: account!, site, created: false, previousAccount: existing };
+      return { account: account!, site, created: false, previousAccount: existing, skipped: false, importReconcileInfo };
     }
 
     // INSERT — UNIQUE 约束兜底
@@ -781,7 +924,7 @@ export async function upsertOauthAccount(input: {
         insertErrorMessage: `failed to create oauth account: ${input.definition.metadata.provider}`,
         loadErrorMessage: `failed to load created oauth account: ${input.definition.metadata.provider}`,
       });
-      return { account, site, created: true, previousAccount: null };
+      return { account, site, created: true, previousAccount: null, skipped: false, importReconcileInfo };
     } catch (insertError: unknown) {
       // UNIQUE 约束兜底：并发插入导致冲突，回查并走 UPDATE
       if (isUniqueConstraintError(insertError)) {
@@ -794,7 +937,7 @@ export async function upsertOauthAccount(input: {
         if (conflictExisting) {
           await tx.update(schema.accounts).set(updateSet).where(eq(schema.accounts.id, conflictExisting.id)).run();
           const account = await tx.select().from(schema.accounts).where(eq(schema.accounts.id, conflictExisting.id)).get();
-          return { account: account!, site, created: false, previousAccount: conflictExisting };
+          return { account: account!, site, created: false, previousAccount: conflictExisting, skipped: false, importReconcileInfo };
         }
       }
       throw insertError;
@@ -1094,10 +1237,12 @@ export async function listOauthConnections(options: {
       accountKey: oauth.accountKey || oauth.accountId,
       planType: oauth.planType,
       projectId: oauth.projectId,
+      tokenExpiresAt: oauth.tokenExpiresAt,
       modelCount: models.length,
       modelsPreview: models.slice(0, 10),
       quota: buildQuotaSnapshotFromOauthInfo(oauth),
       status,
+      accountStatus: row.accounts.status,
       routeChannelCount: routeUnit?.kind === 'route_unit'
         ? (routeChannelCountByRouteUnit.get(routeUnit.id) || 0)
         : (routeChannelCountByAccount.get(row.accounts.id) || 0),
@@ -1178,32 +1323,142 @@ export async function refreshOauthConnectionQuota(accountId: number) {
   return { success: quota.status !== 'error', quota };
 }
 
-export async function refreshOauthConnectionQuotaBatch(accountIds: number[]) {
+export async function refreshOauthConnectionQuotaBatch(
+  accountIds: number[],
+  callbacks?: {
+    onRefreshed?: (data: { index: number; accountId: number; success: boolean; quota?: ReturnType<typeof buildQuotaSnapshotFromOauthInfo>; error?: string }) => void;
+    signal?: { get aborted(): boolean };
+  },
+) {
   const uniqueIds = Array.from(new Set(accountIds.filter((id) => Number.isFinite(id) && id > 0)));
-  const items = await mapWithConcurrency(uniqueIds, OAUTH_QUOTA_BATCH_REFRESH_CONCURRENCY, async (accountId) => {
-    try {
-      const { quota } = await refreshOauthConnectionQuota(accountId);
-      return {
-        accountId,
-        success: true,
-        quota,
-      };
-    } catch (error: any) {
-      return {
-        accountId,
-        success: false,
-        error: error?.message || 'oauth quota refresh failed',
-      };
-    }
-  }) satisfies Array<{
+  let refreshed = 0;
+  let failed = 0;
+  const items: Array<{
     accountId: number;
     success: boolean;
     quota?: ReturnType<typeof buildQuotaSnapshotFromOauthInfo>;
     error?: string;
-  }>;
+  }> = [];
 
-  const refreshed = items.filter((item) => item.success).length;
-  const failed = items.length - refreshed;
+  await mapWithConcurrency(uniqueIds, OAUTH_QUOTA_BATCH_REFRESH_CONCURRENCY, async (accountId, index) => {
+    if (callbacks?.signal?.aborted) return;
+    let item: typeof items[number];
+    try {
+      const { quota } = await refreshOauthConnectionQuota(accountId);
+      item = { accountId, success: true, quota };
+    } catch (error: any) {
+      item = { accountId, success: false, error: error?.message || 'oauth quota refresh failed' };
+    }
+    if (item.success) refreshed++;
+    else failed++;
+    items.push(item);
+    callbacks?.onRefreshed?.({ index, accountId: item.accountId, success: item.success, quota: item.quota, error: item.error });
+  });
+
+  return {
+    success: failed === 0,
+    refreshed,
+    failed,
+    items,
+  };
+}
+
+export async function refreshOauthAccessTokenBatch(
+  accountIds: number[],
+  callbacks?: {
+    onRefreshed?: (data: { index: number; accountId: number; success: boolean; error?: string }) => void;
+    signal?: { get aborted(): boolean };
+  },
+) {
+  const uniqueIds = Array.from(new Set(accountIds.filter((id) => Number.isFinite(id) && id > 0)));
+  let refreshed = 0;
+  let failed = 0;
+  const items: Array<{
+    accountId: number;
+    success: boolean;
+    error?: string;
+  }> = [];
+
+  await mapWithConcurrency(uniqueIds, OAUTH_QUOTA_BATCH_REFRESH_CONCURRENCY, async (accountId, index) => {
+    if (callbacks?.signal?.aborted) return;
+    let item: typeof items[number];
+    try {
+      await refreshOauthAccessToken(accountId);
+      item = { accountId, success: true };
+    } catch (error: any) {
+      item = { accountId, success: false, error: error?.message || 'oauth access token refresh failed' };
+    }
+    if (item.success) refreshed++;
+    else failed++;
+    items.push(item);
+    callbacks?.onRefreshed?.({ index, accountId: item.accountId, success: item.success, error: item.error });
+  });
+
+  return {
+    success: failed === 0,
+    refreshed,
+    failed,
+    items,
+  };
+}
+
+export async function refreshOauthConnectionModelsBatch(
+  accountIds: number[],
+  callbacks?: {
+    onRefreshed?: (data: { index: number; accountId: number; success: boolean; modelCount: number; modelsPreview: string[]; status: string; errorCode: string | null; errorMessage: string | null }) => void;
+    signal?: { get aborted(): boolean };
+  },
+) {
+  const uniqueIds = Array.from(new Set(accountIds.filter((id) => Number.isFinite(id) && id > 0)));
+  let refreshed = 0;
+  let failed = 0;
+  const items: Array<{
+    accountId: number;
+    success: boolean;
+    modelCount: number;
+    modelsPreview: string[];
+    status: string;
+    errorCode: string | null;
+    errorMessage: string | null;
+  }> = [];
+
+  await mapWithConcurrency(uniqueIds, OAUTH_QUOTA_BATCH_REFRESH_CONCURRENCY, async (accountId, index) => {
+    if (callbacks?.signal?.aborted) return;
+    let item: typeof items[number];
+    try {
+      const result = await refreshModelsForAccount(accountId) as ModelRefreshResult;
+      item = {
+        accountId,
+        success: result.status === 'success',
+        modelCount: result.modelCount,
+        modelsPreview: result.modelsPreview,
+        status: result.status,
+        errorCode: result.errorCode ?? null,
+        errorMessage: result.errorMessage || null,
+      };
+    } catch (error: any) {
+      item = {
+        accountId,
+        success: false,
+        modelCount: 0,
+        modelsPreview: [],
+        status: 'failed',
+        errorCode: 'unknown',
+        errorMessage: error?.message || 'model refresh failed',
+      };
+    }
+    if (item.success) refreshed++;
+    else failed++;
+    items.push(item);
+    callbacks?.onRefreshed?.({ index, accountId: item.accountId, success: item.success, modelCount: item.modelCount, modelsPreview: item.modelsPreview, status: item.status, errorCode: item.errorCode, errorMessage: item.errorMessage });
+  });
+
+  if (refreshed > 0) {
+    try {
+      await routeRefreshWorkflow.rebuildRoutesOnly();
+    } catch { /* non-blocking */ }
+  }
+
   return {
     success: failed === 0,
     refreshed,
@@ -1237,7 +1492,7 @@ export async function importOauthConnectionsFromNativeJson(input: {
 
   // 批内 fingerprint 去重
   const dedupedPayloads = new Map<string, ImportedNativeOauthJson>();
-  const skippedInBatch: Array<{ name: string; provider?: string }> = [];
+  const skippedInBatch: Array<{ name: string; provider?: string; reason: OauthImportSkipReason }> = [];
 
   for (const rawPayload of payloadItems) {
     if (!isRecord(rawPayload)) {
@@ -1255,7 +1510,7 @@ export async function importOauthConnectionsFromNativeJson(input: {
       const key = fingerprintKey(fp);
       if (dedupedPayloads.has(key)) {
         // 批内重复，跳过（保留最后一条）
-        skippedInBatch.push({ name: resolvedIdentity.name, provider: resolvedIdentity.provider });
+        skippedInBatch.push({ name: resolvedIdentity.name, provider: resolvedIdentity.provider, reason: 'duplicate_in_batch' });
       }
       dedupedPayloads.set(key, payload);
     } catch (error: any) {
@@ -1294,17 +1549,27 @@ export async function importOauthConnectionsFromNativeJson(input: {
         proxyUrl: input.proxyUrl,
         useSystemProxy: input.useSystemProxy,
         persistedStatus: resolvedIdentity.disabled ? 'disabled' : 'active',
+        importDecisionMode: 'expired_only',
       });
       if (persisted.created) {
         imported += 1;
+      } else if (persisted.skipped) {
+        // skipped 由下方统一统计
       } else {
         updated += 1;
       }
       items.push({
         name: resolvedIdentity.name,
-        status: persisted.created ? 'imported' : 'updated',
+        status: persisted.skipped ? 'skipped' : (persisted.created ? 'imported' : 'updated'),
         provider: resolvedIdentity.provider,
         accountId: persisted.account?.id,
+        ...(persisted.skipped
+          ? {
+              message: persisted.skipReason === 'incoming_expired_missing'
+                ? '跳过：导入项缺少有效 expired'
+                : `跳过：导入 expired 不晚于现有账号（incoming=${persisted.skipDecision?.incomingTokenExpiresAt ?? 'n/a'}，existing=${persisted.skipDecision?.existingTokenExpiresAt ?? 'n/a'}，matchedAccountId=${persisted.skipDecision?.matchedAccountId ?? 'n/a'}）`
+            }
+          : {}),
       });
     } catch (error: any) {
       items.push({
@@ -1330,17 +1595,28 @@ export async function importOauthConnectionsFromNativeJson(input: {
       name: skipped.name,
       status: 'skipped',
       provider: skipped.provider,
+      message: skipped.reason === 'duplicate_in_batch'
+        ? '跳过：批内重复账号（保留最后一条）'
+        : skipped.reason === 'incoming_expired_missing'
+          ? '跳过：导入项缺少有效 expired'
+          : '跳过：导入 expired 不晚于现有账号',
     });
   }
 
   const failed = items.filter((item) => item.status === 'failed').length;
   const skipped = items.filter((item) => item.status === 'skipped').length;
+  const skippedDuplicateInBatch = items.filter((item) => item.status === 'skipped' && item.message === '跳过：批内重复账号（保留最后一条）').length;
+  const skippedExpiredMissing = items.filter((item) => item.status === 'skipped' && item.message === '跳过：导入项缺少有效 expired').length;
+  const skippedExpiredNotNewer = items.filter((item) => item.status === 'skipped' && item.message === '跳过：导入 expired 不晚于现有账号').length;
 
   return {
     success: failed === 0,
     imported,
     updated,
     skipped,
+    skippedDuplicateInBatch,
+    skippedExpiredMissing,
+    skippedExpiredNotNewer,
     parseFailed: failed,
     refreshFailed: 0,
     items,

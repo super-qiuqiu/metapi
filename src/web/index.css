@@ -2730,13 +2730,25 @@ body[data-tooltip-portal="true"] [data-tooltip]::before {
   animation: toast-out 0.25s cubic-bezier(0.4, 0, 0.2, 1) both;
 }
 
-.toast-progress {
+.toast-timer-bar {
   position: absolute;
   bottom: 0;
   left: 0;
   height: 3px;
   border-radius: 0 0 var(--radius-md) var(--radius-md);
   animation: progress-bar 3s linear both;
+}
+
+.toast-success .toast-timer-bar {
+  background: #22c55e;
+}
+
+.toast-error .toast-timer-bar {
+  background: #ef4444;
+}
+
+.toast-info .toast-timer-bar {
+  background: #3b82f6;
 }
 
 .toast-success {
@@ -2751,7 +2763,7 @@ body[data-tooltip-portal="true"] [data-tooltip]::before {
   color: #86efac;
 }
 
-.toast-success .toast-progress {
+.toast-success .toast-timer-bar {
   background: #22c55e;
 }
 
@@ -2767,7 +2779,7 @@ body[data-tooltip-portal="true"] [data-tooltip]::before {
   color: #fca5a5;
 }
 
-.toast-error .toast-progress {
+.toast-error .toast-timer-bar {
   background: #ef4444;
 }
 
@@ -2783,8 +2795,66 @@ body[data-tooltip-portal="true"] [data-tooltip]::before {
   color: #93c5fd;
 }
 
-.toast-info .toast-progress {
+.toast-info .toast-timer-bar {
   background: #3b82f6;
+}
+
+.toast-progress {
+  background: rgba(239, 246, 255, 0.95);
+  border: 1px solid #bfdbfe;
+  color: #1e40af;
+}
+
+[data-theme="dark"] .toast-progress {
+  background: rgba(23, 37, 84, 0.95);
+  border-color: #1e3a5f;
+  color: #93c5fd;
+}
+
+.toast-progress .toast-progress-bar-fill {
+  background: #3b82f6;
+}
+
+.toast-spinner-icon {
+  animation: toast-spin 1s linear infinite;
+}
+
+@keyframes toast-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.toast-progress-detail {
+  margin-top: 6px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.toast-progress-bar-track {
+  flex: 1;
+  height: 6px;
+  background: rgba(0, 0, 0, 0.1);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+[data-theme="dark"] .toast-progress-bar-track {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+.toast-progress-bar-fill {
+  height: 100%;
+  background: #3b82f6;
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+
+.toast-progress-count {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.8;
+  flex-shrink: 0;
 }
 
 /* ===== Form Inputs ===== */

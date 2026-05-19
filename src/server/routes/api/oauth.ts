@@ -14,6 +14,9 @@ import {
   OauthImportValidationError,
   refreshOauthConnectionQuotaBatch,
   refreshOauthConnectionQuota,
+  refreshOauthAccessToken,
+  refreshOauthAccessTokenBatch,
+  refreshOauthConnectionModelsBatch,
   startOauthProviderFlow,
   startOauthRebindFlow,
   submitOauthManualCallback,
@@ -32,6 +35,7 @@ import {
   parseOauthImportPayload,
   parseOauthManualCallbackPayload,
   parseOauthQuotaBatchRefreshPayload,
+  parseOauthModelsBatchRefreshPayload,
   parseOauthRouteUnitCreatePayload,
   parseOauthRouteUnitUpdatePayload,
   parseOauthStartPayload,
@@ -88,6 +92,8 @@ let oauthRouteUnitCreateLimiter = createOauthSensitiveRouteLimiter('oauth-connec
 let oauthRouteUnitUpdateLimiter = createOauthSensitiveRouteLimiter('oauth-connection-sensitive-route-unit-update');
 let oauthRouteUnitDeleteLimiter = createOauthSensitiveRouteLimiter('oauth-connection-sensitive-route-unit-delete');
 const MAX_OAUTH_QUOTA_BATCH_SIZE = 100;
+const MAX_OAUTH_TOKEN_BATCH_SIZE = 100;
+const MAX_OAUTH_MODELS_BATCH_SIZE = 100;
 
 export function resetOauthSensitiveRouteLimiterForTests(options: {
   points?: number;
@@ -443,7 +449,182 @@ export async function oauthRoutes(app: FastifyInstance) {
           message: `accountIds must contain at most ${MAX_OAUTH_QUOTA_BATCH_SIZE} items`,
         });
       }
-      return refreshOauthConnectionQuotaBatch(accountIds);
+
+      reply.raw.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      });
+      reply.raw.write(': connected\n\n');
+
+      let aborted = false;
+      request.raw.on('close', () => { aborted = true; });
+
+      const pushEvent = (event: string, data: unknown) => {
+        if (aborted) return;
+        try {
+          reply.raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+        } catch {
+          aborted = true;
+        }
+      };
+
+      try {
+        const result = await refreshOauthConnectionQuotaBatch(accountIds, {
+          onRefreshed: (data) => pushEvent('refreshed', data),
+          signal: { get aborted() { return aborted; } },
+        });
+        pushEvent('done', {
+          success: result.success,
+          refreshed: result.refreshed,
+          failed: result.failed,
+        });
+      } catch (error: any) {
+        if (!aborted) {
+          pushEvent('error', { message: error?.message || 'batch quota refresh failed' });
+          pushEvent('done', { success: false, refreshed: 0, failed: accountIds.length });
+        }
+      }
+
+      if (!aborted) {
+        try { reply.raw.end(); } catch { /* ignore */ }
+      }
+    },
+  );
+
+  app.post<{ Body: unknown }>(
+    '/api/oauth/connections/models/refresh-batch',
+    { preHandler: [limitOauthConnectionMutate, limitOauthSensitiveRoute] },
+    async (request, reply) => {
+      const parsedBody = parseOauthModelsBatchRefreshPayload(request.body);
+      if (!parsedBody.success) {
+        return reply.code(400).send({ message: parsedBody.error });
+      }
+      const accountIds = Array.isArray(parsedBody.data.accountIds) ? parsedBody.data.accountIds : [];
+      if (accountIds.length === 0) {
+        return reply.code(400).send({ message: 'accountIds is required' });
+      }
+      if (accountIds.length > MAX_OAUTH_MODELS_BATCH_SIZE) {
+        return reply.code(400).send({
+          message: `accountIds must contain at most ${MAX_OAUTH_MODELS_BATCH_SIZE} items`,
+        });
+      }
+
+      reply.raw.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      });
+      reply.raw.write(': connected\n\n');
+
+      let aborted = false;
+      request.raw.on('close', () => { aborted = true; });
+
+      const pushEvent = (event: string, data: unknown) => {
+        if (aborted) return;
+        try {
+          reply.raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+        } catch {
+          aborted = true;
+        }
+      };
+
+      try {
+        const result = await refreshOauthConnectionModelsBatch(accountIds, {
+          onRefreshed: (data) => pushEvent('refreshed', data),
+          signal: { get aborted() { return aborted; } },
+        });
+        pushEvent('done', {
+          success: result.success,
+          refreshed: result.refreshed,
+          failed: result.failed,
+        });
+      } catch (error: any) {
+        if (!aborted) {
+          pushEvent('error', { message: error?.message || 'batch model refresh failed' });
+          pushEvent('done', { success: false, refreshed: 0, failed: accountIds.length });
+        }
+      }
+
+      if (!aborted) {
+        try { reply.raw.end(); } catch { /* ignore */ }
+      }
+    },
+  );
+
+  app.post<{ Params: { accountId: string } }>(
+    '/api/oauth/connections/:accountId/token/refresh',
+    { preHandler: [limitOauthConnectionMutate] },
+    async (request, reply) => {
+      const accountId = parsePositiveInteger(request.params.accountId);
+      if (accountId === null) {
+        return reply.code(400).send({ message: 'invalid account id' });
+      }
+      try {
+        return await refreshOauthAccessToken(accountId);
+      } catch (error: any) {
+        return reply.code(404).send({ message: error?.message || 'oauth account not found' });
+      }
+    },
+  );
+
+  app.post<{ Body: unknown }>(
+    '/api/oauth/connections/token/refresh-batch',
+    { preHandler: [limitOauthConnectionMutate, limitOauthSensitiveRoute] },
+    async (request, reply) => {
+      const parsedBody = parseOauthQuotaBatchRefreshPayload(request.body);
+      if (!parsedBody.success) {
+        return reply.code(400).send({ message: parsedBody.error });
+      }
+      const accountIds = Array.isArray(parsedBody.data.accountIds) ? parsedBody.data.accountIds : [];
+      if (accountIds.length === 0) {
+        return reply.code(400).send({ message: 'accountIds is required' });
+      }
+      if (accountIds.length > MAX_OAUTH_TOKEN_BATCH_SIZE) {
+        return reply.code(400).send({
+          message: `accountIds must contain at most ${MAX_OAUTH_TOKEN_BATCH_SIZE} items`,
+        });
+      }
+
+      reply.raw.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      });
+      reply.raw.write(': connected\n\n');
+
+      let aborted = false;
+      request.raw.on('close', () => { aborted = true; });
+
+      const pushEvent = (event: string, data: unknown) => {
+        if (aborted) return;
+        try {
+          reply.raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+        } catch {
+          aborted = true;
+        }
+      };
+
+      try {
+        const result = await refreshOauthAccessTokenBatch(accountIds, {
+          onRefreshed: (data) => pushEvent('refreshed', data),
+          signal: { get aborted() { return aborted; } },
+        });
+        pushEvent('done', {
+          success: result.success,
+          refreshed: result.refreshed,
+          failed: result.failed,
+        });
+      } catch (error: any) {
+        if (!aborted) {
+          pushEvent('error', { message: error?.message || 'batch token refresh failed' });
+          pushEvent('done', { success: false, refreshed: 0, failed: accountIds.length });
+        }
+      }
+
+      if (!aborted) {
+        try { reply.raw.end(); } catch { /* ignore */ }
+      }
     },
   );
 
@@ -559,7 +740,17 @@ export async function oauthRoutes(app: FastifyInstance) {
         if (!aborted) {
           const message = error?.message || 'oauth import failed';
           pushEvent('error', { message });
-          pushEvent('done', { imported: 0, updated: 0, skipped: 0, parseFailed: 1, refreshFailed: 0, quotaRefreshFailed: 0 });
+          pushEvent('done', {
+            imported: 0,
+            updated: 0,
+            skipped: 0,
+            skippedDuplicateInBatch: 0,
+            skippedExpiredMissing: 0,
+            skippedExpiredNotNewer: 0,
+            parseFailed: 1,
+            refreshFailed: 0,
+            quotaRefreshFailed: 0,
+          });
         }
       }
 

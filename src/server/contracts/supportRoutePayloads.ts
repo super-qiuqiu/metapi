@@ -32,6 +32,10 @@ const oauthConnectionProxyUpdatePayloadSchema = z.object({
   useSystemProxy: z.boolean().optional(),
 }).passthrough();
 
+const oauthModelsBatchRefreshPayloadSchema = z.object({
+  accountIds: z.array(z.number().int().positive()).optional(),
+}).passthrough();
+
 const oauthQuotaBatchRefreshPayloadSchema = z.object({
   accountIds: z.array(z.number().int().positive()).optional(),
 }).passthrough();
@@ -88,6 +92,7 @@ export type OauthConnectionRebindPayload = z.output<typeof oauthConnectionRebind
 export type OauthConnectionProxyUpdatePayload = z.output<typeof oauthConnectionProxyUpdatePayloadSchema>;
 export type OauthImportPayload = z.output<typeof oauthImportPayloadSchema>;
 export type OauthManualCallbackPayload = z.output<typeof oauthManualCallbackPayloadSchema>;
+export type OauthModelsBatchRefreshPayload = z.output<typeof oauthModelsBatchRefreshPayloadSchema>;
 export type OauthQuotaBatchRefreshPayload = z.output<typeof oauthQuotaBatchRefreshPayloadSchema>;
 export type OauthRouteUnitCreatePayload = z.output<typeof oauthRouteUnitCreatePayloadSchema>;
 export type OauthRouteUnitUpdatePayload = z.output<typeof oauthRouteUnitUpdatePayloadSchema>;
@@ -235,6 +240,11 @@ export function parseOauthConnectionRebindPayload(input: unknown):
 export function parseOauthConnectionProxyUpdatePayload(input: unknown):
 { success: true; data: OauthConnectionProxyUpdatePayload } | { success: false; error: string } {
   return parseSupportRoutePayload(oauthConnectionProxyUpdatePayloadSchema, input);
+}
+
+export function parseOauthModelsBatchRefreshPayload(input: unknown):
+{ success: true; data: OauthModelsBatchRefreshPayload } | { success: false; error: string } {
+  return parseSupportRoutePayload(oauthModelsBatchRefreshPayloadSchema, input);
 }
 
 export function parseOauthQuotaBatchRefreshPayload(input: unknown):
