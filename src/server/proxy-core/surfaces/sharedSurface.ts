@@ -9,6 +9,7 @@ import { isTokenExpiredError } from '../../services/alertRules.js';
 import { shouldRetryProxyRequest } from '../../services/proxyRetryPolicy.js';
 import { composeProxyLogMessage } from '../../services/proxyLogMessage.js';
 import { resolveProxyLogBilling } from '../../services/proxyBilling.js';
+import { getOauthInfoFromAccount } from '../../services/oauth/oauthAccount.js';
 import type { DownstreamClientContext } from '../downstreamClientContext.js';
 import { insertProxyLog } from '../../services/proxyLogStore.js';
 import { dispatchRuntimeRequest } from '../../services/runtimeDispatch.js';
@@ -101,6 +102,8 @@ type SurfaceResolvedUsageSummary = {
   usageSource: 'upstream' | 'self-log' | 'unknown';
 };
 
+const SURFACE_OAUTH_PRE_REFRESH_THRESHOLD_MS = 5 * 60 * 1000;
+
 export async function selectSurfaceChannelForAttempt(input: {
   requestedModel: string;
   downstreamPolicy: DownstreamRoutingPolicy;
@@ -110,6 +113,36 @@ export async function selectSurfaceChannelForAttempt(input: {
   forcedChannelId?: number | null;
 }): Promise<SelectedChannel> {
   return await selectProxyChannelForAttempt(input);
+}
+
+export async function trySurfaceOauthPreRefresh(input: {
+  selected: SurfaceOauthRefreshSelectedChannel;
+  nowMs?: number;
+  thresholdMs?: number;
+}): Promise<boolean> {
+  const nowMs = typeof input.nowMs === 'number' && Number.isFinite(input.nowMs)
+    ? input.nowMs
+    : Date.now();
+  const thresholdMs = Math.max(0, Math.trunc(input.thresholdMs ?? SURFACE_OAUTH_PRE_REFRESH_THRESHOLD_MS));
+  const oauth = getOauthInfoFromAccount(input.selected.account);
+  if (!oauth?.refreshToken) return false;
+  if (!(typeof oauth.tokenExpiresAt === 'number' && Number.isFinite(oauth.tokenExpiresAt) && oauth.tokenExpiresAt > 0)) {
+    return false;
+  }
+  if (oauth.tokenExpiresAt - nowMs > thresholdMs) return false;
+
+  try {
+    const refreshed = await refreshOauthAccessTokenSingleflight(input.selected.account.id);
+    input.selected.tokenValue = refreshed.accessToken;
+    input.selected.account = {
+      ...input.selected.account,
+      accessToken: refreshed.accessToken,
+      extraConfig: refreshed.extraConfig ?? input.selected.account.extraConfig,
+    };
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function buildSurfaceStickySessionKey(input: {

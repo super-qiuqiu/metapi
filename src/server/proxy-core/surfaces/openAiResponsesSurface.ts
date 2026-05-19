@@ -85,6 +85,7 @@ import {
   getSurfaceStickyPreferredChannelId,
   recordSurfaceSuccess,
   selectSurfaceChannelForAttempt,
+  trySurfaceOauthPreRefresh,
   trySurfaceOauthRefreshRecovery,
 } from './sharedSurface.js';
 import {
@@ -518,10 +519,14 @@ export async function handleOpenAiResponsesSurfaceRequest(
         })
       );
       const executeEndpointResultForSiteApiBaseUrl = async (siteApiBaseUrl: string) => {
+        if (oauth) {
+          await trySurfaceOauthPreRefresh({ selected });
+        }
         const forceResponsesUpstreamStream = shouldForceResponsesUpstreamStream({
           sitePlatform: selected.site.platform,
           isCompactRequest,
         });
+        const normalizedSitePlatform = String(selected.site.platform || '').trim().toLowerCase();
         const buildEndpointRequest = (endpoint: 'chat' | 'messages' | 'responses') => {
           const upstreamStream = isStream || (forceResponsesUpstreamStream && endpoint === 'responses');
           const responsesOriginalBody = (
@@ -559,12 +564,24 @@ export async function handleOpenAiResponsesSurfaceRequest(
               ? `${endpointRequest.path}/compact`
               : endpointRequest.path
           );
-          const requestBody = (
+          const baseRequestBody = (
             isCompactRequest && endpoint === 'responses'
               ? sanitizeCompactResponsesRequestBody(endpointRequest.body as Record<string, unknown>, {
                 sitePlatform: selected.site.platform,
               })
               : endpointRequest.body as Record<string, unknown>
+          );
+          const requestBody = (
+            endpoint === 'responses' && normalizedSitePlatform === 'codex' && isRecord(baseRequestBody)
+              ? (() => {
+                const nextBody: Record<string, unknown> = { ...baseRequestBody };
+                delete nextBody.temperature;
+                delete nextBody.top_p;
+                delete nextBody.frequency_penalty;
+                delete nextBody.presence_penalty;
+                return nextBody;
+              })()
+              : baseRequestBody
           );
           const requestHeaders = (
             isCompactRequest && endpoint === 'responses'
@@ -731,8 +748,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
 
           const unsupportedParameter = extractUnsupportedParameterName(ctx.rawErrText);
           if (
-            ctx.response.status === 400
-            && unsupportedParameter
+            unsupportedParameter
             && isRecord(ctx.request.body)
           ) {
             const recoveredBody = dropUnsupportedParameterFromBody(ctx.request.body, unsupportedParameter);

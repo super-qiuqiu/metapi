@@ -6,7 +6,7 @@ import { refreshOauthAccessTokenSingleflight } from './refreshSingleflight.js';
 const OAUTH_REFRESH_SCHEDULER_INTERVAL_MS = 60_000;
 const DEFAULT_OAUTH_REFRESH_LEAD_MS = 5 * 60 * 1000;
 const OAUTH_REFRESH_LEAD_BY_PROVIDER: Record<string, number> = {
-  codex: 5 * 24 * 60 * 60 * 1000,
+  codex: 1 * 24 * 60 * 60 * 1000,
   claude: 4 * 60 * 60 * 1000,
   'gemini-cli': 5 * 60 * 1000,
   antigravity: 5 * 60 * 1000,

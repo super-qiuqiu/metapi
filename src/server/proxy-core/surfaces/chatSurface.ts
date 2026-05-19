@@ -72,6 +72,7 @@ import {
   getSurfaceStickyPreferredChannelId,
   recordSurfaceSuccess,
   selectSurfaceChannelForAttempt,
+  trySurfaceOauthPreRefresh,
   trySurfaceOauthRefreshRecovery,
 } from './sharedSurface.js';
 import { dispatchCodexWebsocketRequest } from './codexWsBridge.js';
@@ -334,6 +335,9 @@ export async function handleChatSurfaceRequest(
       })
     );
     const executeEndpointResultForSiteApiBaseUrl = async (siteApiBaseUrl: string) => {
+      if (oauth) {
+        await trySurfaceOauthPreRefresh({ selected });
+      }
       const forceResponsesUpstreamStream = shouldForceResponsesUpstreamStream({
         sitePlatform: selected.site.platform,
         isCompactRequest: false,
@@ -461,8 +465,7 @@ export async function handleChatSurfaceRequest(
         }
         const unsupportedParameter = extractUnsupportedParameterName(ctx.rawErrText);
         if (
-          ctx.response.status === 400
-          && unsupportedParameter
+          unsupportedParameter
           && isRecord(ctx.request.body)
         ) {
           const recoveredBody = dropUnsupportedParameterFromBody(ctx.request.body, unsupportedParameter);
@@ -1355,6 +1358,9 @@ export async function handleClaudeCountTokensSurfaceRequest(
       });
     }
     const oauth = getOauthInfoFromAccount(selected.account);
+    if (oauth) {
+      await trySurfaceOauthPreRefresh({ selected });
+    }
     const startTime = Date.now();
     const leaseResult = await acquireSurfaceChannelLease({
       stickySessionKey,

@@ -108,7 +108,7 @@ describe('oauthRefreshScheduler', () => {
         siteId: activeSite.id,
         status: 'active',
         refreshToken: 'codex-refresh',
-        tokenExpiresAt: nowMs + (4 * 24 * 60 * 60 * 1000),
+        tokenExpiresAt: nowMs + (12 * 60 * 60 * 1000),
       },
       {
         key: 'codex_skip',
@@ -116,7 +116,7 @@ describe('oauthRefreshScheduler', () => {
         siteId: activeSite.id,
         status: 'active',
         refreshToken: 'codex-refresh-later',
-        tokenExpiresAt: nowMs + (6 * 24 * 60 * 60 * 1000),
+        tokenExpiresAt: nowMs + (2 * 24 * 60 * 60 * 1000),
       },
       {
         key: 'claude_due',

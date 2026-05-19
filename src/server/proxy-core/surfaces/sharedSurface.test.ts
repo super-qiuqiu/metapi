@@ -788,6 +788,72 @@ describe('selectSurfaceChannelForAttempt', () => {
     });
   });
 
+  it('pre-refreshes oauth token before upstream dispatch when expiry is within threshold', async () => {
+    const nowMs = Date.parse('2026-04-05T12:00:00.000Z');
+    const selected = {
+      account: {
+        id: 33,
+        accessToken: 'old-access-token',
+        extraConfig: JSON.stringify({
+          credentialMode: 'session',
+          oauth: {
+            provider: 'codex',
+            refreshToken: 'refresh-token',
+            tokenExpiresAt: nowMs + (2 * 60 * 1000),
+          },
+        }),
+      },
+      tokenValue: 'old-access-token',
+    };
+    refreshOauthAccessTokenSingleflightMock.mockResolvedValue({
+      accessToken: 'new-access-token',
+      extraConfig: '{"oauth":{"refreshToken":"refresh-next"}}',
+    });
+
+    const { trySurfaceOauthPreRefresh } = await import('./sharedSurface.js');
+    const refreshed = await trySurfaceOauthPreRefresh({
+      selected,
+      nowMs,
+      thresholdMs: 5 * 60 * 1000,
+    });
+
+    expect(refreshed).toBe(true);
+    expect(refreshOauthAccessTokenSingleflightMock).toHaveBeenCalledWith(33);
+    expect(selected.tokenValue).toBe('new-access-token');
+    expect(selected.account.accessToken).toBe('new-access-token');
+    expect(selected.account.extraConfig).toBe('{"oauth":{"refreshToken":"refresh-next"}}');
+  });
+
+  it('skips oauth pre-refresh when token is not near expiry', async () => {
+    const nowMs = Date.parse('2026-04-05T12:00:00.000Z');
+    const selected = {
+      account: {
+        id: 33,
+        accessToken: 'old-access-token',
+        extraConfig: JSON.stringify({
+          credentialMode: 'session',
+          oauth: {
+            provider: 'codex',
+            refreshToken: 'refresh-token',
+            tokenExpiresAt: nowMs + (30 * 60 * 1000),
+          },
+        }),
+      },
+      tokenValue: 'old-access-token',
+    };
+
+    const { trySurfaceOauthPreRefresh } = await import('./sharedSurface.js');
+    const refreshed = await trySurfaceOauthPreRefresh({
+      selected,
+      nowMs,
+      thresholdMs: 5 * 60 * 1000,
+    });
+
+    expect(refreshed).toBe(false);
+    expect(refreshOauthAccessTokenSingleflightMock).not.toHaveBeenCalled();
+    expect(selected.tokenValue).toBe('old-access-token');
+  });
+
   it('refreshes oauth tokens through the shared recover helper and retries the rebuilt request', async () => {
     const refreshedResponse = {
       ok: true,
