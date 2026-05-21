@@ -1,9 +1,9 @@
-import { and, eq, gte, lt } from 'drizzle-orm';
+import { and, eq, gte, lt, sql } from 'drizzle-orm';
 import { db, schema } from '../db/index.js';
 import { getLocalDayRangeUtc, formatLocalDateTime, getResolvedTimeZone } from './localTimeService.js';
 import { parseCheckinRewardAmount } from './checkinRewardParser.js';
 import { estimateRewardWithTodayIncomeFallback } from './todayIncomeRewardService.js';
-import { getProxyLogBaseSelectFields } from './proxyLogStore.js';
+import { runUsageAggregationProjectionPass } from './usageAggregationService.js';
 
 export type DailySummaryMetrics = {
   localDay: string;
@@ -29,85 +29,104 @@ function round6(value: number): number {
 }
 
 export async function collectDailySummaryMetrics(now = new Date()): Promise<DailySummaryMetrics> {
-  const proxyLogBaseFields = getProxyLogBaseSelectFields();
+  await runUsageAggregationProjectionPass();
+
   const { localDay, startUtc, endUtc } = getLocalDayRangeUtc(now);
 
-  const accountRows = await db.select().from(schema.accounts)
-    .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
-    .where(eq(schema.sites.status, 'active'))
-    .all();
-  const accounts = accountRows.map((row) => row.accounts);
+  const [accountRows, todayCheckinRows, todayProxyRow, todaySpendRow] = await Promise.all([
+    db.select({
+      id: schema.accounts.id,
+      balance: schema.accounts.balance,
+      status: schema.accounts.status,
+      extraConfig: schema.accounts.extraConfig,
+    }).from(schema.accounts)
+      .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
+      .where(eq(schema.sites.status, 'active'))
+      .all(),
+    db.select({
+      status: schema.checkinLogs.status,
+      reward: schema.checkinLogs.reward,
+      message: schema.checkinLogs.message,
+      accountId: schema.accounts.id,
+    }).from(schema.checkinLogs)
+      .innerJoin(schema.accounts, eq(schema.checkinLogs.accountId, schema.accounts.id))
+      .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
+      .where(and(
+        gte(schema.checkinLogs.createdAt, startUtc),
+        lt(schema.checkinLogs.createdAt, endUtc),
+        eq(schema.sites.status, 'active'),
+      ))
+      .all(),
+    db.select({
+      total: sql<number>`coalesce(sum(${schema.siteDayUsage.totalCalls}), 0)`,
+      success: sql<number>`coalesce(sum(${schema.siteDayUsage.successCalls}), 0)`,
+      failed: sql<number>`coalesce(sum(${schema.siteDayUsage.failedCalls}), 0)`,
+      totalTokens: sql<number>`coalesce(sum(${schema.siteDayUsage.totalTokens}), 0)`,
+    }).from(schema.siteDayUsage)
+      .innerJoin(schema.sites, eq(schema.siteDayUsage.siteId, schema.sites.id))
+      .where(and(
+        eq(schema.siteDayUsage.localDay, localDay),
+        eq(schema.sites.status, 'active'),
+      ))
+      .get(),
+    db.select({
+      todaySpend: sql<number>`coalesce(sum(coalesce(${schema.siteDayUsage.totalSiteSpend}, 0)), 0)`,
+    }).from(schema.siteDayUsage)
+      .innerJoin(schema.sites, eq(schema.siteDayUsage.siteId, schema.sites.id))
+      .where(and(
+        eq(schema.siteDayUsage.localDay, localDay),
+        eq(schema.sites.status, 'active'),
+      ))
+      .get(),
+  ]);
 
-  const activeAccounts = accounts.filter((account) => account.status === 'active').length;
-  const lowBalanceAccounts = accounts.filter((account) => (account.balance || 0) < 1).length;
+  const activeAccounts = accountRows.filter((a: { status: string | null }) => a.status === 'active').length;
+  const lowBalanceAccounts = accountRows.filter((a: { balance: number | null }) => (a.balance || 0) < 1).length;
 
-  const todayCheckinRows = await db.select().from(schema.checkinLogs)
-    .innerJoin(schema.accounts, eq(schema.checkinLogs.accountId, schema.accounts.id))
-    .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
-    .where(and(
-      gte(schema.checkinLogs.createdAt, startUtc),
-      lt(schema.checkinLogs.createdAt, endUtc),
-      eq(schema.sites.status, 'active'),
-    ))
-    .all();
-  const todayCheckins = todayCheckinRows.map((row) => row.checkin_logs);
-  const checkinSkipped = todayCheckins.filter((checkin) => checkin.status === 'skipped').length;
-  const checkinFailed = todayCheckins.filter((checkin) => checkin.status === 'failed').length;
-  const checkinSuccess = todayCheckins.length - checkinSkipped - checkinFailed;
+  const checkinSkipped = todayCheckinRows.filter((r: { status: string | null }) => r.status === 'skipped').length;
+  const checkinFailed = todayCheckinRows.filter((r: { status: string | null }) => r.status === 'failed').length;
+  const checkinSuccess = todayCheckinRows.length - checkinSkipped - checkinFailed;
 
   const rewardByAccount: Record<number, number> = {};
   const successCountByAccount: Record<number, number> = {};
   const parsedRewardCountByAccount: Record<number, number> = {};
   for (const row of todayCheckinRows) {
-    const checkin = row.checkin_logs;
-    if (checkin.status !== 'success') continue;
-    const accountId = row.accounts.id;
+    if (row.status !== 'success') continue;
+    const accountId = row.accountId;
     successCountByAccount[accountId] = (successCountByAccount[accountId] || 0) + 1;
-    const rewardValue = parseCheckinRewardAmount(checkin.reward) || parseCheckinRewardAmount(checkin.message);
+    const rewardValue = parseCheckinRewardAmount(row.reward) || parseCheckinRewardAmount(row.message);
     if (rewardValue <= 0) continue;
     rewardByAccount[accountId] = (rewardByAccount[accountId] || 0) + rewardValue;
     parsedRewardCountByAccount[accountId] = (parsedRewardCountByAccount[accountId] || 0) + 1;
   }
 
-  const todayProxyRows = await db.select({
-    proxy_logs: proxyLogBaseFields,
-    accounts: schema.accounts,
-    sites: schema.sites,
-  }).from(schema.proxyLogs)
-    .leftJoin(schema.accounts, eq(schema.proxyLogs.accountId, schema.accounts.id))
-    .leftJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
-    .where(and(
-      gte(schema.proxyLogs.createdAt, startUtc),
-      lt(schema.proxyLogs.createdAt, endUtc),
-      eq(schema.sites.status, 'active'),
-    ))
-    .all();
-  const todayProxyLogs = todayProxyRows.map((row) => row.proxy_logs);
-  const proxySuccess = todayProxyLogs.filter((log) => log.status === 'success').length;
-  const proxyFailed = todayProxyLogs.filter((log) => log.status === 'failed').length;
-  const proxyTotalTokens = todayProxyLogs.reduce((sum, log) => sum + (log.totalTokens || 0), 0);
-  const todaySpend = todayProxyLogs.reduce((sum, log) => sum + (typeof log.estimatedCost === 'number' ? log.estimatedCost : 0), 0);
+  const proxyTotal = Number(todayProxyRow?.total || 0);
+  const proxySuccess = Number(todayProxyRow?.success || 0);
+  const proxyFailed = Number(todayProxyRow?.failed || 0);
+  const proxyTotalTokens = Number(todayProxyRow?.totalTokens || 0);
+  const todaySpend = Number(todaySpendRow?.todaySpend || 0);
 
-  const todayReward = accounts.reduce((sum, account) => sum + estimateRewardWithTodayIncomeFallback({
-    day: localDay,
-    successCount: successCountByAccount[account.id] || 0,
-    parsedRewardCount: parsedRewardCountByAccount[account.id] || 0,
-    rewardSum: rewardByAccount[account.id] || 0,
-    extraConfig: account.extraConfig,
-  }), 0);
+  const todayReward = accountRows.reduce((sum: number, account: { id: number; extraConfig: string | null }) =>
+    sum + estimateRewardWithTodayIncomeFallback({
+      day: localDay,
+      successCount: successCountByAccount[account.id] || 0,
+      parsedRewardCount: parsedRewardCountByAccount[account.id] || 0,
+      rewardSum: rewardByAccount[account.id] || 0,
+      extraConfig: account.extraConfig,
+    }), 0);
 
   return {
     localDay,
     generatedAtLocal: formatLocalDateTime(now),
     timeZone: getResolvedTimeZone(),
-    totalAccounts: accounts.length,
+    totalAccounts: accountRows.length,
     activeAccounts,
     lowBalanceAccounts,
-    checkinTotal: todayCheckins.length,
+    checkinTotal: todayCheckinRows.length,
     checkinSuccess: Math.max(0, checkinSuccess),
     checkinSkipped,
     checkinFailed,
-    proxyTotal: todayProxyLogs.length,
+    proxyTotal,
     proxySuccess,
     proxyFailed,
     proxyTotalTokens,

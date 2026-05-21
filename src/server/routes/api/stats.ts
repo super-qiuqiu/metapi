@@ -1,6 +1,6 @@
 ﻿import { FastifyInstance } from "fastify";
 import { db, schema } from "../../db/index.js";
-import { and, desc, eq, gte, lt, sql } from "drizzle-orm";
+import { and, desc, eq, gte, lt, lte, sql } from "drizzle-orm";
 import { config } from "../../config.js";
 import { refreshModelsForAccount } from "../../services/modelService.js";
 import * as routeRefreshWorkflow from "../../services/routeRefreshWorkflow.js";
@@ -36,6 +36,7 @@ import {
   formatLocalDateTime,
   formatUtcSqlDateTime,
   getLocalDayRangeUtc,
+  getLocalRangeStartDayKey,
   getLocalRangeStartUtc,
   parseStoredUtcDateTime,
   type StoredUtcDateTimeInput,
@@ -48,6 +49,10 @@ import {
 } from "../../services/dashboardSnapshotService.js";
 import { getSiteStatsSnapshot } from "../../services/siteStatsSnapshotService.js";
 import { getModelBySiteSnapshot } from "../../services/modelBySiteSnapshotService.js";
+import { runUsageAggregationProjectionPass } from "../../services/usageAggregationService.js";
+import { readSnapshotCache } from "../../services/snapshotCacheService.js";
+import { isProxyLogFtsAvailable, ensureProxyLogFtsIndexes } from "../../db/index.js";
+import { createPricingFetchDedupedLimiter } from "../../services/pricingFetchLimiterService.js";
 
 function parseBooleanFlag(raw?: string): boolean {
   if (!raw) return false;
@@ -96,6 +101,25 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 const MODELS_MARKETPLACE_BASE_TTL_MS = 15_000;
 const MODELS_MARKETPLACE_PRICING_TTL_MS = 90_000;
+const PROXY_LOGS_META_TTL_MS = 15_000;
+const PROXY_LOGS_META_DEFAULT_DAYS = 7;
+const PROXY_LOGS_TOTAL_TTL_MS = 5_000;
+
+const proxyLogsTotalCache = new Map<string, { total: number; expiresAt: number }>();
+
+function getCachedProxyLogsTotal(cacheKey: string): number | null {
+  const entry = proxyLogsTotalCache.get(cacheKey);
+  if (!entry) return null;
+  if (Date.now() >= entry.expiresAt) {
+    proxyLogsTotalCache.delete(cacheKey);
+    return null;
+  }
+  return entry.total;
+}
+
+function setCachedProxyLogsTotal(cacheKey: string, total: number): void {
+  proxyLogsTotalCache.set(cacheKey, { total, expiresAt: Date.now() + PROXY_LOGS_TOTAL_TTL_MS });
+}
 const limitModelTokenCandidatesRead = createRateLimitGuard({
   bucket: "models-token-candidates-read",
   max: 30,
@@ -257,6 +281,12 @@ function createDownstreamKeyTagsParser() {
 
 function buildProxyLogSearchCondition(search: string) {
   if (!search) return null;
+  if (isProxyLogFtsAvailable()) {
+    const ftsQuery = search.split(/\s+/).filter(Boolean).join(' OR ');
+    return sql<boolean>`proxy_logs.id IN (
+      SELECT rowid FROM proxy_logs_fts WHERE proxy_logs_fts MATCH ${ftsQuery}
+    )`;
+  }
   const likeTerm = `%${search}%`;
   return sql<boolean>`(
     lower(coalesce(${schema.proxyLogs.modelRequested}, '')) like ${likeTerm}
@@ -655,6 +685,7 @@ function mapProxyLogRow(
 }
 
 export async function statsRoutes(app: FastifyInstance) {
+  await ensureProxyLogFtsIndexes();
   app.get<{ Querystring: { refresh?: string; view?: string; modelDays?: string; modelHours?: string; modelFrom?: string; modelTo?: string } }>(
     "/api/stats/dashboard",
     async (request, reply) => {
@@ -795,47 +826,85 @@ export async function statsRoutes(app: FastifyInstance) {
       } | null;
     }>;
 
-    let totalQuery = db
-      .select({
-        total: sql<number>`count(*)`,
-      })
-      .from(schema.proxyLogs)
-      .leftJoin(
-        schema.accounts,
-        eq(schema.proxyLogs.accountId, schema.accounts.id),
-      )
-      .leftJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
-      .leftJoin(
-        schema.downstreamApiKeys,
-        eq(schema.proxyLogs.downstreamApiKeyId, schema.downstreamApiKeys.id),
-      );
-    if (listWhere) {
-      totalQuery = totalQuery.where(listWhere) as typeof totalQuery;
+    const totalCacheKey = [status, search, client?.kind, client?.value, siteId, fromUtc, toUtc].join('|');
+    let total = getCachedProxyLogsTotal(totalCacheKey);
+    if (total === null) {
+      let totalQuery = db
+        .select({
+          total: sql<number>`count(*)`,
+        })
+        .from(schema.proxyLogs)
+        .leftJoin(
+          schema.accounts,
+          eq(schema.proxyLogs.accountId, schema.accounts.id),
+        )
+        .leftJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
+        .leftJoin(
+          schema.downstreamApiKeys,
+          eq(schema.proxyLogs.downstreamApiKeyId, schema.downstreamApiKeys.id),
+        );
+      if (listWhere) {
+        totalQuery = totalQuery.where(listWhere) as typeof totalQuery;
+      }
+      const totalRow = await totalQuery.get();
+      total = Number(totalRow?.total || 0);
+      setCachedProxyLogsTotal(totalCacheKey, total);
     }
-    const totalRow = await totalQuery.get();
 
     const parseTags = createDownstreamKeyTagsParser();
     return {
       items: listRows.map((row) => mapProxyLogRow(row, { parseTags })),
-      total: Number(totalRow?.total || 0),
+      total,
       page: Math.floor(offset / limit) + 1,
       pageSize: limit,
     };
   }
 
-  async function loadProxyLogsMetaPayload(params: {
+  type ProxyLogsMetaPayload = {
+    clientOptions: ProxyLogClientOption[];
+    summary: {
+      totalCount: number;
+      successCount: number;
+      failedCount: number;
+      totalCost: number;
+      totalTokensAll: number;
+    };
+    sites: Array<{ id: number | null; name: string | null; status: string | null }>;
+  };
+
+  function buildProxyLogsMetaCacheKey(params: {
     status?: string;
     search?: string;
     client?: string;
     siteId?: string;
     from?: string;
     to?: string;
-  }) {
+  }): string {
+    return [
+      params.status || "",
+      params.search || "",
+      params.client || "",
+      params.siteId || "",
+      params.from || "",
+      params.to || "",
+    ].join("|");
+  }
+
+  async function loadProxyLogsMetaPayloadRaw(params: {
+    status?: string;
+    search?: string;
+    client?: string;
+    siteId?: string;
+    from?: string;
+    to?: string;
+  }): Promise<ProxyLogsMetaPayload> {
     const status = normalizeProxyLogStatusFilter(params.status);
     const search = normalizeProxyLogSearch(params.search);
     const client = normalizeProxyLogClientFilter(params.client);
     const siteId = normalizeProxyLogSiteId(params.siteId);
-    const fromUtc = normalizeProxyLogTimeBoundary(params.from);
+    const fromUtc = params.from
+      ? normalizeProxyLogTimeBoundary(params.from)
+      : getLocalRangeStartUtc(PROXY_LOGS_META_DEFAULT_DAYS);
     const toUtc = normalizeProxyLogTimeBoundary(params.to);
     const summaryWhere = buildProxyLogWhereClause({
       search,
@@ -951,6 +1020,24 @@ export async function statsRoutes(app: FastifyInstance) {
       },
       sites: siteRows,
     };
+  }
+
+  async function loadProxyLogsMetaPayload(params: {
+    status?: string;
+    search?: string;
+    client?: string;
+    siteId?: string;
+    from?: string;
+    to?: string;
+  }): Promise<ProxyLogsMetaPayload> {
+    const cacheKey = buildProxyLogsMetaCacheKey(params);
+    const envelope = await readSnapshotCache<ProxyLogsMetaPayload>({
+      namespace: "proxy-logs-meta",
+      key: cacheKey,
+      ttlMs: PROXY_LOGS_META_TTL_MS,
+      loader: () => loadProxyLogsMetaPayloadRaw(params),
+    });
+    return envelope.payload;
   }
 
   // Proxy logs
@@ -1137,87 +1224,110 @@ export async function statsRoutes(app: FastifyInstance) {
         }
       }
 
-      const availability = await db
-        .select({
-          modelName: schema.tokenModelAvailability.modelName,
-          latencyMs: schema.tokenModelAvailability.latencyMs,
-          tokenId: schema.accountTokens.id,
-          tokenName: schema.accountTokens.name,
-          tokenIsDefault: schema.accountTokens.isDefault,
-          accountId: schema.accounts.id,
-          username: schema.accounts.username,
-          unitCost: schema.accounts.unitCost,
-          balance: schema.accounts.balance,
-          siteName: schema.sites.name,
-        })
-        .from(schema.tokenModelAvailability)
-        .innerJoin(
-          schema.accountTokens,
-          eq(schema.tokenModelAvailability.tokenId, schema.accountTokens.id),
-        )
-        .innerJoin(
-          schema.accounts,
-          eq(schema.accountTokens.accountId, schema.accounts.id),
-        )
-        .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
-        .where(
-          and(
-            eq(schema.tokenModelAvailability.available, true),
-            eq(schema.accountTokens.enabled, true),
-            eq(
-              schema.accountTokens.valueStatus,
-              ACCOUNT_TOKEN_VALUE_STATUS_READY,
-            ),
-            eq(schema.accounts.status, "active"),
-            eq(schema.sites.status, "active"),
-          ),
-        )
-        .all();
-      const accountAvailability = await db
-        .select({
-          modelName: schema.modelAvailability.modelName,
-          latencyMs: schema.modelAvailability.latencyMs,
-          accountId: schema.accounts.id,
-          username: schema.accounts.username,
-          unitCost: schema.accounts.unitCost,
-          balance: schema.accounts.balance,
-          siteName: schema.sites.name,
-        })
-        .from(schema.modelAvailability)
-        .innerJoin(
-          schema.accounts,
-          eq(schema.modelAvailability.accountId, schema.accounts.id),
-        )
-        .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
-        .where(
-          and(
-            eq(schema.modelAvailability.available, true),
-            eq(schema.accounts.status, "active"),
-            eq(schema.sites.status, "active"),
-          ),
-        )
-        .all();
+      await runUsageAggregationProjectionPass();
 
-      const last7d = getLocalRangeStartUtc(7);
-      const recentModelStatsRows = await db
-        .select({
-          modelActual: schema.proxyLogs.modelActual,
-          modelRequested: schema.proxyLogs.modelRequested,
-          total: sql<number>`count(*)`,
-          success: sql<number>`coalesce(sum(case when ${schema.proxyLogs.status} = 'success' then 1 else 0 end), 0)`,
-          totalLatency: sql<number>`coalesce(sum(coalesce(${schema.proxyLogs.latencyMs}, 0)), 0)`,
-        })
-        .from(schema.proxyLogs)
-        .where(gte(schema.proxyLogs.createdAt, last7d))
-        .groupBy(schema.proxyLogs.modelActual, schema.proxyLogs.modelRequested)
-        .all();
+      const last7dDayKey = getLocalRangeStartDayKey(7);
+      const { localDay: todayDayKey } = getLocalDayRangeUtc();
+
+      const [modelAccountAggRows, modelTokenRows, recentModelStatsRows] =
+        await Promise.all([
+          db
+            .select({
+              modelName: schema.modelAvailability.modelName,
+              accountId: schema.accounts.id,
+              username: schema.accounts.username,
+              unitCost: schema.accounts.unitCost,
+              balance: schema.accounts.balance,
+              siteName: schema.sites.name,
+              minLatencyMs: sql<number>`min(${schema.modelAvailability.latencyMs})`,
+            })
+            .from(schema.modelAvailability)
+            .innerJoin(
+              schema.accounts,
+              eq(schema.modelAvailability.accountId, schema.accounts.id),
+            )
+            .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
+            .where(
+              and(
+                eq(schema.modelAvailability.available, true),
+                eq(schema.accounts.status, "active"),
+                eq(schema.sites.status, "active"),
+              ),
+            )
+            .groupBy(
+              schema.modelAvailability.modelName,
+              schema.accounts.id,
+              schema.accounts.username,
+              schema.accounts.unitCost,
+              schema.accounts.balance,
+              schema.sites.name,
+            )
+            .all(),
+          db
+            .select({
+              modelName: schema.tokenModelAvailability.modelName,
+              accountId: schema.accounts.id,
+              username: schema.accounts.username,
+              unitCost: schema.accounts.unitCost,
+              balance: schema.accounts.balance,
+              siteName: schema.sites.name,
+              tokenId: schema.accountTokens.id,
+              tokenName: schema.accountTokens.name,
+              tokenIsDefault: schema.accountTokens.isDefault,
+              latencyMs: schema.tokenModelAvailability.latencyMs,
+            })
+            .from(schema.tokenModelAvailability)
+            .innerJoin(
+              schema.accountTokens,
+              eq(schema.tokenModelAvailability.tokenId, schema.accountTokens.id),
+            )
+            .innerJoin(
+              schema.accounts,
+              eq(schema.accountTokens.accountId, schema.accounts.id),
+            )
+            .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
+            .where(
+              and(
+                eq(schema.tokenModelAvailability.available, true),
+                eq(schema.accountTokens.enabled, true),
+                eq(
+                  schema.accountTokens.valueStatus,
+                  ACCOUNT_TOKEN_VALUE_STATUS_READY,
+                ),
+                eq(schema.accounts.status, "active"),
+                eq(schema.sites.status, "active"),
+              ),
+            )
+            .all(),
+          db
+            .select({
+              model: schema.modelDayUsage.model,
+              total: sql<number>`coalesce(sum(${schema.modelDayUsage.totalCalls}), 0)`,
+              success: sql<number>`coalesce(sum(${schema.modelDayUsage.successCalls}), 0)`,
+              totalLatency: sql<number>`coalesce(sum(${schema.modelDayUsage.totalLatencyMs}), 0)`,
+            })
+            .from(schema.modelDayUsage)
+            .innerJoin(
+              schema.sites,
+              eq(schema.modelDayUsage.siteId, schema.sites.id),
+            )
+            .where(
+              and(
+                gte(schema.modelDayUsage.localDay, last7dDayKey),
+                lte(schema.modelDayUsage.localDay, todayDayKey),
+                eq(schema.sites.status, "active"),
+              ),
+            )
+            .groupBy(schema.modelDayUsage.model)
+            .all(),
+        ]);
 
       const modelLogStats: Record<
         string,
         { success: number; total: number; totalLatency: number }
       > = {};
       for (const row of recentModelStatsRows) {
-        const model = (row.modelActual || row.modelRequested || "").trim();
+        const model = (row.model || "").trim();
         if (!model) continue;
         if (!modelLogStats[model]) {
           modelLogStats[model] = { success: 0, total: 0, totalLatency: 0 };
@@ -1279,32 +1389,38 @@ export async function statsRoutes(app: FastifyInstance) {
           )
           .all();
 
+        const pricingLimiter = createPricingFetchDedupedLimiter();
         const metadataResults = await Promise.all(
-          activeAccountRows.map(async (row) => {
-            const catalog = await fetchModelPricingCatalog({
-              site: {
-                id: row.site.id,
-                url: row.site.url,
-                platform: row.site.platform,
-              },
-              account: {
-                id: row.account.id,
-                accessToken: row.account.accessToken,
-                apiToken: row.account.apiToken,
-              },
-              modelName: "__metadata__",
-              totalTokens: 0,
-            });
+          activeAccountRows.map((row) => {
+            const dedupeKey = `${row.site.id}:${row.account.id}`;
+            return pricingLimiter.dedupedLimitedFetch(dedupeKey, async () => {
+              const catalog = await fetchModelPricingCatalog({
+                site: {
+                  id: row.site.id,
+                  url: row.site.url,
+                  platform: row.site.platform,
+                },
+                account: {
+                  id: row.account.id,
+                  accessToken: row.account.accessToken,
+                  apiToken: row.account.apiToken,
+                },
+                modelName: "__metadata__",
+                totalTokens: 0,
+              });
 
-            return {
-              account: row.account,
-              site: row.site,
-              catalog,
-            };
+              return {
+                account: row.account,
+                site: row.site,
+                catalog,
+              };
+            });
           }),
         );
 
-        for (const result of metadataResults) {
+        const validMetadataResults = metadataResults.filter(Boolean);
+
+        for (const result of validMetadataResults) {
           if (!result.catalog) continue;
 
           for (const model of result.catalog.models) {
@@ -1360,14 +1476,38 @@ export async function statsRoutes(app: FastifyInstance) {
         }
       > = {};
 
-      for (const row of availability) {
+      for (const row of modelAccountAggRows) {
         if (!modelMap[row.modelName]) {
           modelMap[row.modelName] = {
             name: row.modelName,
             accountsById: new Map(),
           };
         }
+        modelMap[row.modelName].accountsById.set(row.accountId, {
+          id: row.accountId,
+          site: row.siteName,
+          username: row.username,
+          latency: row.minLatencyMs,
+          unitCost: row.unitCost,
+          balance: row.balance || 0,
+          tokens: [],
+        });
+      }
 
+      const tokenLatencyByAccountModel = new Map<string, number>();
+      for (const row of modelTokenRows) {
+        const key = `${row.accountId}::${row.modelName}`;
+        const currentMin = tokenLatencyByAccountModel.get(key);
+        if (currentMin == null || (row.latencyMs != null && row.latencyMs < currentMin)) {
+          if (row.latencyMs != null) tokenLatencyByAccountModel.set(key, row.latencyMs);
+        }
+
+        if (!modelMap[row.modelName]) {
+          modelMap[row.modelName] = {
+            name: row.modelName,
+            accountsById: new Map(),
+          };
+        }
         const existingAccount = modelMap[row.modelName].accountsById.get(
           row.accountId,
         );
@@ -1388,12 +1528,14 @@ export async function statsRoutes(app: FastifyInstance) {
             ],
           });
         } else {
-          const nextLatency = (() => {
-            if (existingAccount.latency == null) return row.latencyMs;
-            if (row.latencyMs == null) return existingAccount.latency;
-            return Math.min(existingAccount.latency, row.latencyMs);
-          })();
-          existingAccount.latency = nextLatency;
+          const tokenMinLatency = tokenLatencyByAccountModel.get(key);
+          if (tokenMinLatency != null) {
+            if (existingAccount.latency == null) {
+              existingAccount.latency = tokenMinLatency;
+            } else {
+              existingAccount.latency = Math.min(existingAccount.latency, tokenMinLatency);
+            }
+          }
           if (!existingAccount.tokens.some((token) => token.id === row.tokenId)) {
             existingAccount.tokens.push({
               id: row.tokenId,
@@ -1402,38 +1544,6 @@ export async function statsRoutes(app: FastifyInstance) {
             });
           }
         }
-      }
-
-      for (const row of accountAvailability) {
-        if (!modelMap[row.modelName]) {
-          modelMap[row.modelName] = {
-            name: row.modelName,
-            accountsById: new Map(),
-          };
-        }
-
-        const existingAccount = modelMap[row.modelName].accountsById.get(
-          row.accountId,
-        );
-        if (!existingAccount) {
-          modelMap[row.modelName].accountsById.set(row.accountId, {
-            id: row.accountId,
-            site: row.siteName,
-            username: row.username,
-            latency: row.latencyMs,
-            unitCost: row.unitCost,
-            balance: row.balance || 0,
-            tokens: [],
-          });
-          continue;
-        }
-
-        const nextLatency = (() => {
-          if (existingAccount.latency == null) return row.latencyMs;
-          if (row.latencyMs == null) return existingAccount.latency;
-          return Math.min(existingAccount.latency, row.latencyMs);
-        })();
-        existingAccount.latency = nextLatency;
       }
 
       let upstreamDescriptionMap = new Map<string, string>();
@@ -1730,38 +1840,46 @@ export async function statsRoutes(app: FastifyInstance) {
           )
           .all();
 
+        const groupHintsLimiter = createPricingFetchDedupedLimiter();
         const metadataResults = await Promise.all(
           accountRows
             .filter((row) => accountIdsForGroupHints.has(row.account.id))
-            .map(async (row) => {
-              try {
-                const catalog = await fetchModelPricingCatalog({
-                  site: {
-                    id: row.site.id,
-                    url: row.site.url,
-                    platform: row.site.platform,
-                  },
-                  account: {
-                    id: row.account.id,
-                    accessToken: row.account.accessToken,
-                    apiToken: row.account.apiToken,
-                  },
-                  modelName: "__metadata__",
-                  totalTokens: 0,
-                });
-                return { accountId: row.account.id, catalog };
-              } catch {
-                return {
-                  accountId: row.account.id,
-                  catalog: null as Awaited<
-                    ReturnType<typeof fetchModelPricingCatalog>
-                  >,
-                };
-              }
+            .map((row) => {
+              const dedupeKey = `${row.site.id}:${row.account.id}`;
+              return groupHintsLimiter.dedupedLimitedFetch<
+                { accountId: number; catalog: Awaited<ReturnType<typeof fetchModelPricingCatalog>> | null }
+              >(dedupeKey, async () => {
+                try {
+                  const catalog = await fetchModelPricingCatalog({
+                    site: {
+                      id: row.site.id,
+                      url: row.site.url,
+                      platform: row.site.platform,
+                    },
+                    account: {
+                      id: row.account.id,
+                      accessToken: row.account.accessToken,
+                      apiToken: row.account.apiToken,
+                    },
+                    modelName: "__metadata__",
+                    totalTokens: 0,
+                  });
+                  return { accountId: row.account.id, catalog };
+                } catch {
+                  return {
+                    accountId: row.account.id,
+                    catalog: null as Awaited<
+                      ReturnType<typeof fetchModelPricingCatalog>
+                    >,
+                  };
+                }
+              });
             }),
         );
 
-        for (const result of metadataResults) {
+        const validGroupHintResults = metadataResults.filter(Boolean);
+
+        for (const result of validGroupHintResults) {
           if (!result.catalog) continue;
           for (const model of result.catalog.models) {
             const modelName = (model.modelName || "").trim();

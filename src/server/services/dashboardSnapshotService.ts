@@ -119,11 +119,11 @@ async function loadDashboardSummaryPayload(): Promise<DashboardSummaryPayload> {
     .where(eq(schema.sites.status, "active"))
     .all();
   const totalBalance = accounts.reduce(
-    (sum, account) => sum + (account.balance || 0),
+    (sum: number, account: { balance: number | null }) => sum + (account.balance || 0),
     0,
   );
   const activeCount = accounts.filter(
-    (account) => account.status === "active",
+    (account: { status: string | null }) => account.status === "active",
   ).length;
 
   const {
@@ -132,8 +132,8 @@ async function loadDashboardSummaryPayload(): Promise<DashboardSummaryPayload> {
     endUtc: todayEndUtc,
   } = getLocalDayRangeUtc();
   const nowTs = Date.now();
-  const last24hDate = formatUtcSqlDateTime(new Date(nowTs - 86_400_000));
   const lastMinuteDate = formatUtcSqlDateTime(new Date(nowTs - 60_000));
+  const last24hHourBucketStart = getLocalHourRangeStartUtc(24, getLocalHourAnchor());
 
   const [
     todayCheckinRows,
@@ -143,7 +143,14 @@ async function loadDashboardSummaryPayload(): Promise<DashboardSummaryPayload> {
     todaySpendRow,
   ] = await Promise.all([
     db
-      .select()
+      .select({
+        id: schema.checkinLogs.id,
+        status: schema.checkinLogs.status,
+        reward: schema.checkinLogs.reward,
+        message: schema.checkinLogs.message,
+        accountId: schema.accounts.id,
+        extraConfig: schema.accounts.extraConfig,
+      })
       .from(schema.checkinLogs)
       .innerJoin(
         schema.accounts,
@@ -168,38 +175,30 @@ async function loadDashboardSummaryPayload(): Promise<DashboardSummaryPayload> {
       .get(),
     db
       .select({
-        total: sql<number>`count(*)`,
-        success: sql<number>`coalesce(sum(case when ${schema.proxyLogs.status} = 'success' then 1 else 0 end), 0)`,
-        failed: sql<number>`coalesce(sum(case when ${schema.proxyLogs.status} = 'success' then 0 else 1 end), 0)`,
-        totalTokens: sql<number>`coalesce(sum(coalesce(${schema.proxyLogs.totalTokens}, 0)), 0)`,
+        total: sql<number>`coalesce(sum(${schema.siteHourUsage.totalCalls}), 0)`,
+        success: sql<number>`coalesce(sum(${schema.siteHourUsage.successCalls}), 0)`,
+        failed: sql<number>`coalesce(sum(${schema.siteHourUsage.failedCalls}), 0)`,
+        totalTokens: sql<number>`coalesce(sum(${schema.siteHourUsage.totalTokens}), 0)`,
       })
-      .from(schema.proxyLogs)
-      .innerJoin(
-        schema.accounts,
-        eq(schema.proxyLogs.accountId, schema.accounts.id),
-      )
-      .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
+      .from(schema.siteHourUsage)
+      .innerJoin(schema.sites, eq(schema.siteHourUsage.siteId, schema.sites.id))
       .where(
         and(
-          gte(schema.proxyLogs.createdAt, last24hDate),
+          gte(schema.siteHourUsage.bucketStartUtc, last24hHourBucketStart),
           eq(schema.sites.status, "active"),
         ),
       )
       .get(),
     db
       .select({
-        total: sql<number>`count(*)`,
-        totalTokens: sql<number>`coalesce(sum(coalesce(${schema.proxyLogs.totalTokens}, 0)), 0)`,
+        total: sql<number>`coalesce(sum(${schema.siteHourUsage.totalCalls}), 0)`,
+        totalTokens: sql<number>`coalesce(sum(${schema.siteHourUsage.totalTokens}), 0)`,
       })
-      .from(schema.proxyLogs)
-      .innerJoin(
-        schema.accounts,
-        eq(schema.proxyLogs.accountId, schema.accounts.id),
-      )
-      .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
+      .from(schema.siteHourUsage)
+      .innerJoin(schema.sites, eq(schema.siteHourUsage.siteId, schema.sites.id))
       .where(
         and(
-          gte(schema.proxyLogs.createdAt, lastMinuteDate),
+          gte(schema.siteHourUsage.bucketStartUtc, lastMinuteDate),
           eq(schema.sites.status, "active"),
         ),
       )
@@ -219,23 +218,21 @@ async function loadDashboardSummaryPayload(): Promise<DashboardSummaryPayload> {
       .get(),
   ]);
 
-  const todayCheckins = todayCheckinRows.map((row) => row.checkin_logs);
-  const checkinFailed = todayCheckins.filter(
-    (checkin) => checkin.status === "failed",
+  const checkinFailed = todayCheckinRows.filter(
+    (row: { status: string | null }) => row.status === "failed",
   ).length;
-  const checkinSuccess = todayCheckins.length - checkinFailed;
+  const checkinSuccess = todayCheckinRows.length - checkinFailed;
   const rewardByAccount: Record<number, number> = {};
   const successCountByAccount: Record<number, number> = {};
   const parsedRewardCountByAccount: Record<number, number> = {};
   for (const row of todayCheckinRows) {
-    const checkin = row.checkin_logs;
-    if (checkin.status !== "success") continue;
-    const accountId = row.accounts.id;
+    if (row.status !== "success") continue;
+    const accountId = row.accountId;
     successCountByAccount[accountId] =
       (successCountByAccount[accountId] || 0) + 1;
     const rewardValue =
-      parseCheckinRewardAmount(checkin.reward) ||
-      parseCheckinRewardAmount(checkin.message);
+      parseCheckinRewardAmount(row.reward) ||
+      parseCheckinRewardAmount(row.message);
     if (rewardValue <= 0) continue;
     rewardByAccount[accountId] =
       (rewardByAccount[accountId] || 0) + rewardValue;
@@ -252,7 +249,7 @@ async function loadDashboardSummaryPayload(): Promise<DashboardSummaryPayload> {
   const totalUsed = Number(totalUsedRow?.totalUsed || 0);
   const todaySpend = Number(todaySpendRow?.todaySpend || 0);
   const todayReward = accounts.reduce(
-    (sum, account) =>
+    (sum: number, account: { id: number; extraConfig: string | null }) =>
       sum +
       estimateRewardWithTodayIncomeFallback({
         day: today,
@@ -274,7 +271,7 @@ async function loadDashboardSummaryPayload(): Promise<DashboardSummaryPayload> {
     todayCheckin: {
       success: checkinSuccess,
       failed: checkinFailed,
-      total: todayCheckins.length,
+      total: todayCheckinRows.length,
     },
     proxy24h: {
       success: proxySuccess,
@@ -410,7 +407,12 @@ async function loadDashboardInsightsPayload(input: {
           ]);
 
           const watermarkId = Math.max(0, Number(checkpoint?.lastProxyLogId || 0));
-          const tailLogs = await db
+          const maxLogIdRow = await db
+            .select({ maxId: sql<number>`max(${schema.proxyLogs.id})` })
+            .from(schema.proxyLogs)
+            .get();
+          const maxLogId = Number(maxLogIdRow?.maxId || 0);
+          const tailLogs = watermarkId >= maxLogId ? [] : await db
             .select({
               id: schema.proxyLogs.id,
               createdAt: schema.proxyLogs.createdAt,
@@ -523,7 +525,12 @@ async function loadDashboardInsightsPayload(input: {
         ]);
 
         const watermarkId = Math.max(0, Number(checkpoint?.lastProxyLogId || 0));
-        const tailLogs = await db
+        const maxLogIdRow = await db
+          .select({ maxId: sql<number>`max(${schema.proxyLogs.id})` })
+          .from(schema.proxyLogs)
+          .get();
+        const maxLogId = Number(maxLogIdRow?.maxId || 0);
+        const tailLogs = watermarkId >= maxLogId ? [] : await db
           .select({
             id: schema.proxyLogs.id,
             createdAt: schema.proxyLogs.createdAt,
@@ -597,14 +604,14 @@ async function loadDashboardInsightsPayload(input: {
       return String(left.name || "").localeCompare(String(right.name || ""));
     },
   );
-  const activeSiteIdSet = new Set(sortedSites.map((site) => site.id));
+  const activeSiteIdSet = new Set(sortedSites.map((site: SiteAvailabilitySiteRow) => site.id));
 
   return {
     siteAvailability: buildSiteAvailabilitySummariesFromHourlyAggregates(
       sortedSites,
       siteAvailabilityRows
-        .filter((row) => activeSiteIdSet.has(row.siteId))
-        .map((row) => ({
+        .filter((row: { siteId: number }) => activeSiteIdSet.has(row.siteId))
+        .map((row: typeof siteAvailabilityRows[number]) => ({
           siteId: row.siteId,
           hourStartUtc: row.bucketStartUtc,
           totalRequests: row.totalCalls,
