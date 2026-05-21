@@ -111,6 +111,11 @@ const DEFAULT_PROXY_DEBUG_SETTINGS: ProxyDebugSettingsState = {
   proxyDebugMaxBodyBytes: 262144,
 };
 const DEBUG_REFRESH_INTERVAL_MS = 2000;
+const DEBUG_REFRESH_BACKOFF_MS = 10000;
+const DEBUG_REFRESH_BACKOFF_STEP_MS = 3000;
+const LOG_REFRESH_INTERVAL_MS = 2000;
+const LOG_REFRESH_BACKOFF_MS = 10000;
+const LOG_REFRESH_BACKOFF_STEP_MS = 3000;
 const formInputStyle: React.CSSProperties = {
   width: "100%",
   padding: "10px 14px",
@@ -1083,11 +1088,32 @@ export default function ProxyLogs() {
 
   useEffect(() => {
     if (!autoRefresh) return;
-    const timer = setInterval(() => {
-      void load(true);
-    }, 2000);
-    return () => clearInterval(timer);
-  }, [autoRefresh, load]);
+    let intervalMs = LOG_REFRESH_INTERVAL_MS;
+    let prevTotal = 0;
+    const tick = () => {
+      void load(true).then(() => {
+        if (total !== prevTotal) {
+          intervalMs = LOG_REFRESH_INTERVAL_MS;
+          prevTotal = total;
+        } else {
+          intervalMs = Math.min(intervalMs + LOG_REFRESH_BACKOFF_STEP_MS, LOG_REFRESH_BACKOFF_MS);
+        }
+      });
+    };
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const scheduleNext = () => {
+      timer = setTimeout(() => {
+        if (typeof document !== "undefined" && document.hidden) {
+          scheduleNext();
+          return;
+        }
+        tick();
+        scheduleNext();
+      }, intervalMs);
+    };
+    scheduleNext();
+    return () => { if (timer) clearTimeout(timer); };
+  }, [autoRefresh, load, total]);
 
   useEffect(() => {
     if (page <= totalPages) return;
@@ -1288,15 +1314,37 @@ export default function ProxyLogs() {
 
   useEffect(() => {
     if (!debugSettings.proxyDebugTraceEnabled) return;
-    const timer = setInterval(() => {
+    let intervalMs = DEBUG_REFRESH_INTERVAL_MS;
+    let prevCount = 0;
+    const tick = () => {
       void loadDebugTraceList({
         silent: true,
         refreshSelectedDetail: true,
         suppressToast: true,
+      }).then(() => {
+        const currentCount = debugTraces.length;
+        if (currentCount !== prevCount) {
+          intervalMs = DEBUG_REFRESH_INTERVAL_MS;
+          prevCount = currentCount;
+        } else {
+          intervalMs = Math.min(intervalMs + DEBUG_REFRESH_BACKOFF_STEP_MS, DEBUG_REFRESH_BACKOFF_MS);
+        }
       });
-    }, DEBUG_REFRESH_INTERVAL_MS);
-    return () => clearInterval(timer);
-  }, [debugSettings.proxyDebugTraceEnabled, loadDebugTraceList]);
+    };
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const scheduleNext = () => {
+      timer = setTimeout(() => {
+        if (typeof document !== "undefined" && document.hidden) {
+          scheduleNext();
+          return;
+        }
+        tick();
+        scheduleNext();
+      }, intervalMs);
+    };
+    scheduleNext();
+    return () => { if (timer) clearTimeout(timer); };
+  }, [debugSettings.proxyDebugTraceEnabled, loadDebugTraceList, debugTraces.length]);
 
   useEffect(() => {
     persistDebugTracePanelExpanded(debugTracePanelExpanded);
