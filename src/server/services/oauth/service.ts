@@ -23,6 +23,7 @@ import {
   type OAuthProviderDefinition,
 } from './providers.js';
 import { ensureOauthProviderSite } from './oauthSiteRegistry.js';
+import { getNextAccountSortOrder } from '../accountSortOrderService.js';
 import {
   buildOauthInfo,
   buildOauthInfoFromAccount,
@@ -384,14 +385,6 @@ function buildUsername(input: {
   provider: string;
 }) {
   return input.email || input.accountKey || `${input.provider}-user`;
-}
-
-async function getNextAccountSortOrder(txDb?: typeof db): Promise<number> {
-  const queryDb = txDb ?? db;
-  const row = await queryDb.select({
-    maxSortOrder: sql<number>`COALESCE(MAX(${schema.accounts.sortOrder}), -1)`,
-  }).from(schema.accounts).get();
-  return (row?.maxSortOrder ?? -1) + 1;
 }
 
 async function revertPersistedOauthAccount(input: {

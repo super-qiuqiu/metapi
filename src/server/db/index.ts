@@ -71,6 +71,7 @@ let sqliteConnection: SqliteConnection | null = null;
 let mysqlPool: mysql.Pool | null = null;
 let pgPool: pg.Pool | null = null;
 let proxyLogBillingDetailsColumnAvailable: boolean | null = null;
+let proxyLogFtsAvailable: boolean | null = null;
 let proxyLogDownstreamApiKeyIdColumnAvailable: boolean | null = null;
 let proxyLogClientColumnsAvailable: boolean | null = null;
 let proxyLogStreamTimingColumnsAvailable: boolean | null = null;
@@ -713,6 +714,117 @@ function ensureProxyLogClientSchema() {
   }
 
   proxyLogClientColumnsAvailable = true;
+}
+
+function ensureProxyLogFtsSchema() {
+  if (!tableExists('proxy_logs')) return;
+
+  const ftsTableExists = (() => {
+    const sqlite = requireSqliteConnection();
+    const row = sqlite.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1")
+      .get('proxy_logs_fts') as { name?: string } | undefined;
+    return !!row?.name;
+  })();
+
+  if (ftsTableExists) {
+    proxyLogFtsAvailable = true;
+    return;
+  }
+
+  try {
+    execSqliteLegacyCompat(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS proxy_logs_fts
+      USING fts5(model_requested, model_actual, dk_name, dk_group_name, dk_tags, content='proxy_logs', content_rowid='id');
+    `);
+
+    execSqliteLegacyCompat(`
+      CREATE TRIGGER IF NOT EXISTS proxy_logs_fts_insert AFTER INSERT ON proxy_logs BEGIN
+        INSERT INTO proxy_logs_fts(rowid, model_requested, model_actual, dk_name, dk_group_name, dk_tags)
+        VALUES (new.id, new.model_requested, new.model_actual,
+          (SELECT name FROM downstream_api_keys WHERE id = new.downstream_api_key_id),
+          (SELECT group_name FROM downstream_api_keys WHERE id = new.downstream_api_key_id),
+          (SELECT tags FROM downstream_api_keys WHERE id = new.downstream_api_key_id));
+      END;
+    `);
+
+    execSqliteLegacyCompat(`
+      CREATE TRIGGER IF NOT EXISTS proxy_logs_fts_delete AFTER DELETE ON proxy_logs BEGIN
+        INSERT INTO proxy_logs_fts(proxy_logs_fts, rowid, model_requested, model_actual, dk_name, dk_group_name, dk_tags)
+        VALUES ('delete', old.id, old.model_requested, old.model_actual,
+          (SELECT name FROM downstream_api_keys WHERE id = old.downstream_api_key_id),
+          (SELECT group_name FROM downstream_api_keys WHERE id = old.downstream_api_key_id),
+          (SELECT tags FROM downstream_api_keys WHERE id = old.downstream_api_key_id));
+      END;
+    `);
+
+    execSqliteLegacyCompat(`
+      CREATE TRIGGER IF NOT EXISTS proxy_logs_fts_update AFTER UPDATE ON proxy_logs BEGIN
+        INSERT INTO proxy_logs_fts(proxy_logs_fts, rowid, model_requested, model_actual, dk_name, dk_group_name, dk_tags)
+        VALUES ('delete', old.id, old.model_requested, old.model_actual,
+          (SELECT name FROM downstream_api_keys WHERE id = old.downstream_api_key_id),
+          (SELECT group_name FROM downstream_api_keys WHERE id = old.downstream_api_key_id),
+          (SELECT tags FROM downstream_api_keys WHERE id = old.downstream_api_key_id));
+        INSERT INTO proxy_logs_fts(rowid, model_requested, model_actual, dk_name, dk_group_name, dk_tags)
+        VALUES (new.id, new.model_requested, new.model_actual,
+          (SELECT name FROM downstream_api_keys WHERE id = new.downstream_api_key_id),
+          (SELECT group_name FROM downstream_api_keys WHERE id = new.downstream_api_key_id),
+          (SELECT tags FROM downstream_api_keys WHERE id = new.downstream_api_key_id));
+      END;
+    `);
+
+    proxyLogFtsAvailable = true;
+  } catch (error) {
+    console.warn('[db] FTS5 virtual table creation failed, falling back to LIKE search:', error);
+    proxyLogFtsAvailable = false;
+  }
+}
+
+export function isProxyLogFtsAvailable(): boolean {
+  return proxyLogFtsAvailable === true;
+}
+
+export async function ensureProxyLogFtsIndexes(): Promise<boolean> {
+  if (runtimeDbDialect === 'sqlite') {
+    ensureProxyLogFtsSchema();
+    return proxyLogFtsAvailable === true;
+  }
+
+  if (runtimeDbDialect === 'mysql') {
+    if (!mysqlPool) return false;
+    const indexExists = await hasMysqlIndex('proxy_logs_fulltext_idx');
+    if (!indexExists) {
+      try {
+        await mysqlPool.query(
+          'ALTER TABLE proxy_logs ADD FULLTEXT INDEX proxy_logs_fulltext_idx (model_requested, model_actual)'
+        );
+      } catch (error) {
+        if (!isDuplicateIndexError(error)) {
+          console.warn('[db] MySQL FULLTEXT index creation failed:', formatDbError(error));
+        }
+      }
+    }
+    proxyLogFtsAvailable = true;
+    return true;
+  }
+
+  if (runtimeDbDialect === 'postgres') {
+    if (!pgPool) return false;
+    const indexExists = await hasPostgresIndex('proxy_logs_model_trgm_idx');
+    if (!indexExists) {
+      try {
+        await pgPool.query('CREATE EXTENSION IF NOT EXISTS pg_trgm');
+        await pgPool.query(
+          'CREATE INDEX IF NOT EXISTS proxy_logs_model_trgm_idx ON proxy_logs USING gin (model_requested gin_trgm_ops, model_actual gin_trgm_ops)'
+        );
+      } catch (error) {
+        console.warn('[db] Postgres trigram index creation failed:', formatDbError(error));
+      }
+    }
+    proxyLogFtsAvailable = true;
+    return true;
+  }
+
+  return false;
 }
 
 function ensureProxyLogStreamTimingSchema() {
@@ -1447,6 +1559,7 @@ function initSqliteDb() {
   ensureDownstreamApiKeySchema();
   ensureProxyLogBillingDetailsSchema();
   ensureProxyLogClientSchema();
+  ensureProxyLogFtsSchema();
   ensureProxyVideoTaskSchema();
   ensureProxyFileSchema();
 

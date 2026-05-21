@@ -3,6 +3,7 @@ import { db, schema } from '../db/index.js';
 import { insertAndGetById } from '../db/insertHelpers.js';
 import { startBackgroundTask } from './backgroundTaskService.js';
 import { getAdapter } from './platforms/index.js';
+import { getNextAccountSortOrder } from './accountSortOrderService.js';
 import {
   guessPlatformUserIdFromUsername,
   mergeAccountExtraConfig,
@@ -61,12 +62,6 @@ async function withTimeout<T>(fn: () => Promise<T>, timeoutMs: number, timeoutMe
 
 function buildAccountVerifyTimeoutMessage(): string {
   return `Token verification timed out (${Math.max(1, Math.round(ACCOUNT_VERIFY_TIMEOUT_MS / 1000))}s)`;
-}
-
-async function getNextAccountSortOrder(): Promise<number> {
-  const rows = await db.select({ sortOrder: schema.accounts.sortOrder }).from(schema.accounts).all();
-  const max = rows.reduce((currentMax, row) => Math.max(currentMax, row.sortOrder || 0), -1);
-  return max + 1;
 }
 
 async function getModelsWithSiteApiEndpointPool(

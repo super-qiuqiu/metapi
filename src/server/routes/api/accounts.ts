@@ -1,7 +1,7 @@
 import { FastifyInstance } from "fastify";
 import { db, schema, runtimeDbDialect } from "../../db/index.js";
 import { insertAndGetById } from "../../db/insertHelpers.js";
-import { and, eq, gte, lt, sql } from "drizzle-orm";
+import { and, eq, gte, lt } from "drizzle-orm";
 import { refreshBalance } from "../../services/balanceService.js";
 import { getAdapter } from "../../services/platforms/index.js";
 import {
@@ -25,6 +25,7 @@ import { startBackgroundTask } from "../../services/backgroundTaskService.js";
 import { parseCheckinRewardAmount } from "../../services/checkinRewardParser.js";
 import { estimateRewardWithTodayIncomeFallback } from "../../services/todayIncomeRewardService.js";
 import { getLocalDayRangeUtc } from "../../services/localTimeService.js";
+import { getNextAccountSortOrder } from "../../services/accountSortOrderService.js";
 import {
   buildRuntimeHealthForAccount,
   setAccountRuntimeHealth,
@@ -215,18 +216,6 @@ function normalizeManagedTokenExpiresAt(input: unknown): number | undefined {
     if (Number.isFinite(parsed) && parsed > 0) return parsed;
   }
   return undefined;
-}
-
-async function getNextAccountSortOrder(): Promise<number> {
-  const rows = await db
-    .select({ sortOrder: schema.accounts.sortOrder })
-    .from(schema.accounts)
-    .all();
-  const max = rows.reduce(
-    (currentMax, row) => Math.max(currentMax, row.sortOrder || 0),
-    -1,
-  );
-  return max + 1;
 }
 
 type LoginFailureInfo = {
