@@ -2,10 +2,12 @@ import { TextEncoder } from 'node:util';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import { createCodexWebsocketRuntime, CodexWebsocketRuntimeError } from '../runtime/codexWebsocketRuntime.js';
+import { createCodexWebsocketSessionStore } from '../runtime/codexWebsocketSessionStore.js';
 import { config } from '../../config.js';
 import type { BuiltEndpointRequest } from '../orchestration/endpointFlow.js';
 
-const codexWsBridgeRuntime = createCodexWebsocketRuntime();
+const sharedSessionStore = createCodexWebsocketSessionStore();
+const codexWsBridgeRuntime = createCodexWebsocketRuntime({ sessionStore: sharedSessionStore });
 const CODEX_WS_BRIDGE_VERSION = '0.130.0';
 const CODEX_WS_BRIDGE_USER_AGENT = 'codex-tui/0.130.0 (Windows 10.0.26200; x86_64) WindowsTerminal (codex-tui; 0.130.0)';
 const CODEX_WS_BRIDGE_ORIGINATOR = 'codex-tui';

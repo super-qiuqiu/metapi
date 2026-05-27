@@ -2,8 +2,10 @@ import { randomUUID } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import type { IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
+// @ts-expect-error ws has no type declarations in this project
 import { WebSocketServer, type RawData, type WebSocket } from 'ws';
 import { createCodexWebsocketRuntime, CodexWebsocketRuntimeError } from '../../proxy-core/runtime/codexWebsocketRuntime.js';
+import { createCodexWebsocketSessionStore } from '../../proxy-core/runtime/codexWebsocketSessionStore.js';
 import { buildCodexSessionResponseStoreKey } from '../../proxy-core/runtime/codexSessionResponseStore.js';
 import { resolveResponsesContinuityKey } from '../../proxy-core/responsesContinuity.js';
 import {
@@ -25,7 +27,8 @@ const installedApps = new WeakSet<FastifyInstance>();
 const WS_TURN_STATE_HEADER = 'x-codex-turn-state';
 const RESPONSES_WEBSOCKET_MODE_HEADER = 'x-metapi-responses-websocket-mode';
 const RESPONSES_WEBSOCKET_TRANSPORT_HEADER = 'x-metapi-responses-websocket-transport';
-const codexWebsocketRuntime = createCodexWebsocketRuntime();
+const sharedSessionStore = createCodexWebsocketSessionStore();
+const codexWebsocketRuntime = createCodexWebsocketRuntime({ sessionStore: sharedSessionStore });
 
 type SelectedChannel = NonNullable<Awaited<ReturnType<typeof tokenRouter.selectChannel>>>;
 type ResponsesWebsocketAuthContext = DownstreamTokenAuthSuccess;
@@ -205,11 +208,38 @@ function dedupeResponsesInputItemsById(items: unknown[]): unknown[] {
   return dedupedReversed;
 }
 
+function inputContainsCompactionItems(input: unknown): boolean {
+  if (!Array.isArray(input)) return false;
+  for (const item of input) {
+    if (!isRecord(item)) continue;
+    const type = asTrimmedString(item.type);
+    if (type === 'compaction' || type === 'compaction_summary') return true;
+  }
+  return false;
+}
+
+function inputContainsFullTranscript(input: unknown): boolean {
+  if (!Array.isArray(input)) return false;
+  for (const item of input) {
+    if (!isRecord(item)) continue;
+    const type = asTrimmedString(item.type);
+    if (type === 'function_call' || type === 'custom_tool_call') return true;
+    if (type === 'message' && asTrimmedString(item.role) === 'assistant') return true;
+  }
+  return false;
+}
+
+function shouldReleasePinnedAuth(status: number | undefined): boolean {
+  if (!status) return false;
+  return status === 401 || status === 402 || status === 403 || status === 429;
+}
+
 function normalizeResponsesWebsocketRequest(
   parsed: Record<string, unknown>,
   lastRequest: Record<string, unknown> | null,
   lastResponseOutput: unknown[],
   supportsIncrementalInput: boolean,
+  allowCompactionReplayBypass: boolean,
 ): NormalizedResponsesWebsocketRequest {
   const requestType = asTrimmedString(parsed.type);
   if (requestType !== 'response.create' && requestType !== 'response.append') {
@@ -269,6 +299,25 @@ function normalizeResponsesWebsocketRequest(
   }
 
   if (supportsIncrementalInput && requestType === 'response.create' && asTrimmedString(parsed.previous_response_id)) {
+    return {
+      ok: true,
+      request: next,
+      nextRequestSnapshot: cloneJsonObject(next),
+    };
+  }
+
+  if (allowCompactionReplayBypass && inputContainsCompactionItems(parsed.input)) {
+    next.input = cloneJsonObject(parsed.input);
+    return {
+      ok: true,
+      request: next,
+      nextRequestSnapshot: cloneJsonObject(next),
+    };
+  }
+
+  if (inputContainsFullTranscript(parsed.input)) {
+    next.input = cloneJsonObject(parsed.input);
+    delete next.previous_response_id;
     return {
       ok: true,
       request: next,
@@ -702,6 +751,38 @@ async function supportsResponsesWebsocketIncrementalInput(
   }
 }
 
+function ensureImageGenerationTool(
+  body: Record<string, unknown>,
+  modelName: string,
+  isCodexFreePlan: boolean,
+): Record<string, unknown> {
+  const baseModel = modelName.toLowerCase();
+  if (baseModel.endsWith('spark')) return body;
+  if (isCodexFreePlan) return body;
+
+  const tools = body.tools;
+  if (!Array.isArray(tools)) {
+    return { ...body, tools: [{ type: 'image_generation', output_format: 'png' }] };
+  }
+
+  const hasImageGen = tools.some((tool: unknown) => {
+    if (!isRecord(tool)) return false;
+    return asTrimmedString(tool.type) === 'image_generation';
+  });
+  if (hasImageGen) return body;
+
+  return { ...body, tools: [...tools, { type: 'image_generation', output_format: 'png' }] };
+}
+
+function isCodexFreePlanAccount(selectedChannel: SelectedChannel | null): boolean {
+  if (!selectedChannel) return false;
+  const platform = asTrimmedString(selectedChannel.site?.platform).toLowerCase();
+  if (platform !== 'codex') return false;
+  const extraConfig = parseExtraConfigRecord(selectedChannel.account.extraConfig);
+  const planType = asTrimmedString(extraConfig?.plan_type).toLowerCase();
+  return planType === 'free';
+}
+
 async function handleResponsesWebsocketConnection(
   app: FastifyInstance,
   socket: WebSocket,
@@ -731,8 +812,12 @@ async function handleResponsesWebsocketConnection(
   const websocketSessionId = continuitySessionId || randomUUID();
   const runtimeSessionKeys = new Set<string>();
   let lastRequest: Record<string, unknown> | null = null;
+  let previousLastRequest: Record<string, unknown> | null = null;
   let lastResponseOutput: unknown[] = [];
+  let previousLastResponseOutput: unknown[] = [];
   let selectedChannel: SelectedChannel | null = null;
+  let pinnedChannelId: number | null = null;
+  let forceTranscriptReplayNextRequest = false;
   let messageQueue = Promise.resolve();
 
   socket.once('close', () => {
@@ -748,7 +833,27 @@ async function handleResponsesWebsocketConnection(
     }));
   });
 
-  socket.on('message', (raw) => {
+  socket.on('error', () => {
+    try { socket.close(1011, 'websocket error'); } catch { /* ignore */ }
+    const sessionKeys = runtimeSessionKeys.size > 0
+      ? Array.from(runtimeSessionKeys)
+      : [websocketSessionId];
+    void Promise.all(sessionKeys.map(async (sessionKey) => {
+      try {
+        await codexWebsocketRuntime.closeSession(sessionKey);
+      } catch { /* ignore */ }
+    }));
+  });
+
+  const primarySessionKey = runtimeSessionKeys.size > 0
+    ? Array.from(runtimeSessionKeys)[0]!
+    : websocketSessionId;
+
+  codexWebsocketRuntime.subscribeUpstreamDisconnect(primarySessionKey, () => {
+    try { socket.close(1011, 'upstream disconnected'); } catch { /* ignore */ }
+  });
+
+  socket.on('message', (raw: RawData) => {
     messageQueue = messageQueue
       .catch(() => undefined)
       .then(async () => {
@@ -765,18 +870,35 @@ async function handleResponsesWebsocketConnection(
             writeResponsesWebsocketError(socket, 403, 'model is not allowed for this downstream key');
             return;
           }
-          const supportsIncrementalInput = selectedChannelSupportsIncrementalInput(selectedChannel, requestModel)
+
+          let effectiveSelectedChannel = selectedChannel;
+          if (pinnedChannelId !== null && selectedChannel && selectedChannel.channel.id === pinnedChannelId) {
+            effectiveSelectedChannel = selectedChannel;
+          } else if (!shouldReuseSelectedChannel(selectedChannel, requestModel)) {
+            effectiveSelectedChannel = requestModel
+              ? await tokenRouter.selectChannel(requestModel, authContext.policy)
+              : null;
+            if (effectiveSelectedChannel) {
+              selectedChannel = effectiveSelectedChannel;
+            }
+          }
+
+          const supportsIncrementalInput = selectedChannelSupportsIncrementalInput(effectiveSelectedChannel, requestModel)
             || await supportsResponsesWebsocketIncrementalInput(parsed, lastRequest, authContext);
+          const allowCompactionReplayBypass = selectedChannelSupportsCodexWebsocketTransport(effectiveSelectedChannel, requestModel);
+          const effectiveIncremental = supportsIncrementalInput && !forceTranscriptReplayNextRequest;
+
           const shouldHandleLocalPrewarm = shouldHandleResponsesWebsocketPrewarmLocally(
             parsed,
             lastRequest,
-            supportsIncrementalInput,
+            effectiveIncremental,
           );
           const normalized = normalizeResponsesWebsocketRequest(
             parsed,
             lastRequest,
             lastResponseOutput,
-            supportsIncrementalInput,
+            effectiveIncremental,
+            allowCompactionReplayBypass,
           );
           if (!normalized.ok) {
             writeResponsesWebsocketError(socket, normalized.status, normalized.message);
@@ -787,7 +909,21 @@ async function handleResponsesWebsocketConnection(
             await consumeManagedKeyRequest(authContext.key.id);
           }
 
+          if (effectiveSelectedChannel && isCodexFreePlanAccount(effectiveSelectedChannel)) {
+            // no image tool for free plans
+          } else if (effectiveSelectedChannel && selectedChannelSupportsCodexWebsocketTransport(effectiveSelectedChannel, requestModel)) {
+            normalized.request = ensureImageGenerationTool(
+              normalized.request,
+              asTrimmedString(normalized.request.model) || requestModel,
+              isCodexFreePlanAccount(effectiveSelectedChannel),
+            );
+          }
+
+          previousLastRequest = lastRequest;
+          previousLastResponseOutput = lastResponseOutput;
           lastRequest = normalized.nextRequestSnapshot;
+          forceTranscriptReplayNextRequest = false;
+
           if (shouldHandleLocalPrewarm) {
             lastResponseOutput = [];
             for (const payload of synthesizePrewarmResponsePayloads(normalized.request)) {
@@ -796,21 +932,15 @@ async function handleResponsesWebsocketConnection(
             return;
           }
 
-          if (!shouldReuseSelectedChannel(selectedChannel, requestModel)) {
-            selectedChannel = requestModel
-              ? await tokenRouter.selectChannel(requestModel, authContext.policy)
-              : null;
-          }
-
-          const codexWebsocketChannel = selectedChannelSupportsCodexWebsocketTransport(selectedChannel, requestModel)
-            ? selectedChannel
+          const codexWebsocketChannel = selectedChannelSupportsCodexWebsocketTransport(effectiveSelectedChannel, requestModel)
+            ? effectiveSelectedChannel
             : null;
 
           if (codexWebsocketChannel) {
             const downstreamHeaders: Record<string, unknown> = {
               ...(request.headers as Record<string, unknown>),
               [RESPONSES_WEBSOCKET_TRANSPORT_HEADER]: '1',
-              ...(supportsIncrementalInput ? { [RESPONSES_WEBSOCKET_MODE_HEADER]: 'incremental' } : {}),
+              ...(effectiveIncremental ? { [RESPONSES_WEBSOCKET_MODE_HEADER]: 'incremental' } : {}),
             };
             const providerHeaders = buildOauthProviderHeaders({
               account: codexWebsocketChannel.account,
@@ -873,15 +1003,52 @@ async function handleResponsesWebsocketConnection(
                 latencyMs: Date.now() - turnStartedAtMs,
                 usage: extractResponsesUsage(runtimeResult.events),
               });
+              pinnedChannelId = codexWebsocketChannel.channel.id;
             } catch (error) {
               const runtimeError = unwrapCodexWebsocketRuntimeError(error);
+
+              if (runtimeError.isUpgradeRequired426) {
+                const forwarded = await forwardResponsesRequestViaHttp({
+                  app,
+                  socket,
+                  request,
+                  payload: normalized.request,
+                  preserveIncrementalMode: effectiveIncremental,
+                  authToken: authContext.token,
+                });
+                if (forwarded) {
+                  lastResponseOutput = forwarded.output;
+                  recordResponsesWebsocketSuccessBestEffort({
+                    selectedChannel: codexWebsocketChannel,
+                    requestModel,
+                    latencyMs: Date.now() - turnStartedAtMs,
+                    usage: forwarded.usage,
+                  });
+                } else {
+                  recordResponsesWebsocketFailureBestEffort({
+                    selectedChannel: codexWebsocketChannel,
+                    requestModel,
+                    status: runtimeError.status || 502,
+                    errorText: runtimeError.message,
+                  });
+                }
+                return;
+              }
+
+              if (shouldReleasePinnedAuth(runtimeError.status)) {
+                pinnedChannelId = null;
+                forceTranscriptReplayNextRequest = true;
+                lastRequest = previousLastRequest;
+                lastResponseOutput = previousLastResponseOutput;
+              }
+
               if (runtimeError.status && runtimeError.events.length === 0) {
                 const forwarded = await forwardResponsesRequestViaHttp({
                   app,
                   socket,
                   request,
                   payload: normalized.request,
-                  preserveIncrementalMode: supportsIncrementalInput,
+                  preserveIncrementalMode: effectiveIncremental,
                   authToken: authContext.token,
                 });
                 if (forwarded) {
@@ -934,7 +1101,7 @@ async function handleResponsesWebsocketConnection(
             socket,
             request,
             payload: normalized.request,
-            preserveIncrementalMode: supportsIncrementalInput,
+            preserveIncrementalMode: effectiveIncremental,
             authToken: authContext.token,
           });
           if (forwarded) {
@@ -971,13 +1138,16 @@ export function ensureResponsesWebsocketTransport(app: FastifyInstance) {
   installedApps.add(app);
 
   const websocketServer = new WebSocketServer({ noServer: true });
-  websocketServer.on('headers', (headers, request) => {
+  websocketServer.on('headers', (headers: string[], request: IncomingMessage) => {
     const turnState = headerValueToTrimmedString(request.headers[WS_TURN_STATE_HEADER]);
     if (!turnState) return;
     headers.push(`${WS_TURN_STATE_HEADER}: ${turnState}`);
   });
+  websocketServer.on('error', (err: Error) => {
+    app.log.error({ err }, 'responses websocket server error');
+  });
 
-  app.server.on('upgrade', (request, socket, head) => {
+  app.server.on('upgrade', (request: IncomingMessage, socket: Duplex, head: Buffer) => {
     void (async () => {
       const url = new URL(request.url || '/', 'http://localhost');
       if (url.pathname !== '/v1/responses') return;
@@ -991,7 +1161,7 @@ export function ensureResponsesWebsocketTransport(app: FastifyInstance) {
         writeUpgradeHttpError(socket, authResult.statusCode, authResult.error);
         return;
       }
-      websocketServer.handleUpgrade(request, socket, head, (client) => {
+      websocketServer.handleUpgrade(request, socket, head, (client: WebSocket) => {
         void handleResponsesWebsocketConnection(app, client, request, authResult);
       });
     })().catch(() => {

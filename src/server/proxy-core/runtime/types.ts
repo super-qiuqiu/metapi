@@ -19,10 +19,17 @@ export type CodexWebsocketSession = {
   socket: WebSocket | null;
   socketUrl: string | null;
   queue: Promise<unknown>;
+  upstreamDisconnectOnce: {
+    fired: boolean;
+    subscribers: Array<(error: Error) => void>;
+  };
+  createdAtMs: number;
+  lastActivityMs: number;
 };
 
 export type CodexWebsocketSessionStore = {
   getOrCreate(sessionId: string): CodexWebsocketSession;
   take(sessionId: string): CodexWebsocketSession | null;
   list(): CodexWebsocketSession[];
+  sweepExpired(nowMs?: number): void;
 };

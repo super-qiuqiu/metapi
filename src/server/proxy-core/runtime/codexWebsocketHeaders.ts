@@ -15,11 +15,16 @@ export function buildCodexWebsocketHandshakeHeaders(headers: Record<string, stri
   const openAiBeta = getHeaderValue(next, 'openai-beta').trim();
   if (!openAiBeta) {
     next['OpenAI-Beta'] = websocketBeta;
-    return next;
-  }
-  if (!openAiBeta.includes('responses_websockets=')) {
+  } else if (!openAiBeta.includes('responses_websockets=')) {
     next['OpenAI-Beta'] = `${openAiBeta},${websocketBeta}`;
   }
+
+  const userAgent = getHeaderValue(next, 'user-agent').toLowerCase();
+  const hasSessionId = getHeaderValue(next, 'session_id').trim() !== '';
+  if (userAgent.includes('mac os') && !hasSessionId) {
+    next['Session_id'] = crypto.randomUUID();
+  }
+
   return next;
 }
 
