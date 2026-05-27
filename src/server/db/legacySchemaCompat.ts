@@ -76,6 +76,16 @@ const BOOTSTRAP_OWNED_LEGACY_INDEXES = [
   'proxy_logs_downstream_api_key_created_at_idx',
 ];
 
+const BOOTSTRAP_OWNED_LEGACY_VIRTUAL_TABLES = [
+  'proxy_logs_fts',
+];
+
+const BOOTSTRAP_OWNED_LEGACY_TRIGGERS = [
+  'proxy_logs_fts_insert',
+  'proxy_logs_fts_delete',
+  'proxy_logs_fts_update',
+];
+
 function normalizeSqlText(sqlText: string): string {
   return sqlText.trim().replace(/\s+/g, ' ').toLowerCase();
 }
@@ -147,6 +157,20 @@ export function classifyLegacyCompatMutation(sqlText: string): LegacySchemaCompa
   );
   if (createIndexMatch) {
     return LEGACY_COMPAT_INDEXES.has(createIndexMatch[1]) ? 'legacy' : 'forbidden';
+  }
+
+  const createVirtualTableMatch = normalized.match(
+    /^create virtual table if not exists [`"]?([a-z0-9_]+)[`"]?/i,
+  );
+  if (createVirtualTableMatch) {
+    return BOOTSTRAP_OWNED_LEGACY_VIRTUAL_TABLES.includes(createVirtualTableMatch[1]) ? 'legacy' : 'forbidden';
+  }
+
+  const createTriggerMatch = normalized.match(
+    /^create trigger if not exists [`"]?([a-z0-9_]+)[`"]?/i,
+  );
+  if (createTriggerMatch) {
+    return BOOTSTRAP_OWNED_LEGACY_TRIGGERS.includes(createTriggerMatch[1]) ? 'legacy' : 'forbidden';
   }
 
   return 'forbidden';
