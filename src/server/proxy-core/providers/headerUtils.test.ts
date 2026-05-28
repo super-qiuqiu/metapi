@@ -55,7 +55,7 @@ describe('provider header utils', () => {
     const headers = buildCodexRuntimeHeaders({
       baseHeaders: {
         authorization: 'Bearer test',
-        version: '0.101.0',
+        version: '0.133.0',
       },
       providerHeaders: {
         originator: 'codex_cli_rs',

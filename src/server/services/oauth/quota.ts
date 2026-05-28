@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { fetch } from 'undici';
 import { db, schema } from '../../db/index.js';
 import { mergeAccountExtraConfig } from '../accountExtraConfig.js';
@@ -296,10 +296,10 @@ async function fetchCodexWhamUsage(input: {
   });
 }
 
-const CODEX_QUOTA_PROBE_MODELS = ['gpt-5.1-codex', 'gpt-5.3-codex'] as const;
+const CODEX_QUOTA_PROBE_FALLBACK_MODELS = ['gpt-5.5', 'gpt-5.4', 'gpt-5.3-codex', 'gpt-5.4-mini'] as const;
 const CODEX_UNSUPPORTED_MODEL_PATTERN = /is not supported when using Codex/i;
-const CODEX_QUOTA_PROBE_VERSION = '0.101.0';
-const CODEX_QUOTA_PROBE_USER_AGENT = 'codex_cli_rs/0.101.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464';
+const CODEX_QUOTA_PROBE_VERSION = '0.133.0';
+const CODEX_QUOTA_PROBE_USER_AGENT = 'codex_cli_rs/0.133.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9';
 const CODEX_QUOTA_PROBE_BETA = 'responses-2025-03-11';
 const CODEX_QUOTA_PROBE_INSTRUCTIONS = 'You are a helpful assistant.';
 const CODEX_QUOTA_PROBE_TIMEOUT_MS = 10_000;
@@ -309,6 +309,22 @@ const recentQuotaHeaderSnapshotByAccount = new Map<number, {
   recordedAtMs: number;
 }>();
 const pendingQuotaHeaderSnapshotKeys = new Set<string>();
+
+const CODEX_PROBE_MODEL_EXCLUSIONS = new Set(['codex-auto-review']);
+
+async function resolveCodexQuotaProbeModels(accountId: number): Promise<string[]> {
+  const rows = await db.select({ modelName: schema.modelAvailability.modelName })
+    .from(schema.modelAvailability)
+    .where(and(
+      eq(schema.modelAvailability.accountId, accountId),
+      eq(schema.modelAvailability.available, true),
+    ))
+    .all();
+  const discovered = rows
+    .map((r: { modelName: string }) => r.modelName.trim())
+    .filter((name: string) => name && !CODEX_PROBE_MODEL_EXCLUSIONS.has(name));
+  return discovered;
+}
 
 function asTrimmedString(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
@@ -1163,10 +1179,15 @@ async function probeCodexQuotaSnapshot(input: {
     accountId: input.oauth.accountId || input.oauth.accountKey,
   });
 
+  const discoveredModels = await resolveCodexQuotaProbeModels(input.account.id);
+  const probeModels = discoveredModels.length > 0
+    ? discoveredModels
+    : [...CODEX_QUOTA_PROBE_FALLBACK_MODELS];
+
   return runWithSiteApiEndpointPool(site, async (target) => {
     let lastErrorText = '';
 
-    for (const model of CODEX_QUOTA_PROBE_MODELS) {
+    for (const model of probeModels) {
       const requestBody = JSON.stringify(buildCodexQuotaProbePayload(model));
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), CODEX_QUOTA_PROBE_TIMEOUT_MS);
