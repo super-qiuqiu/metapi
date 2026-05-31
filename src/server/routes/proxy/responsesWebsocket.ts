@@ -2,9 +2,9 @@ import { randomUUID } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import type { IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
-// @ts-expect-error ws has no type declarations in this project
 import { WebSocketServer, type RawData, type WebSocket } from 'ws';
 import { createCodexWebsocketRuntime, CodexWebsocketRuntimeError } from '../../proxy-core/runtime/codexWebsocketRuntime.js';
+import { registerCodexWebsocketRuntime } from '../../proxy-core/runtime/codexWebsocketRuntimeRegistry.js';
 import { createCodexWebsocketSessionStore } from '../../proxy-core/runtime/codexWebsocketSessionStore.js';
 import { buildCodexSessionResponseStoreKey } from '../../proxy-core/runtime/codexSessionResponseStore.js';
 import { resolveResponsesContinuityKey } from '../../proxy-core/responsesContinuity.js';
@@ -27,8 +27,9 @@ const installedApps = new WeakSet<FastifyInstance>();
 const WS_TURN_STATE_HEADER = 'x-codex-turn-state';
 const RESPONSES_WEBSOCKET_MODE_HEADER = 'x-metapi-responses-websocket-mode';
 const RESPONSES_WEBSOCKET_TRANSPORT_HEADER = 'x-metapi-responses-websocket-transport';
+const RESPONSES_WEBSOCKET_HTTP_FALLBACK_HEADER = 'x-metapi-responses-websocket-http-fallback';
 const sharedSessionStore = createCodexWebsocketSessionStore();
-const codexWebsocketRuntime = createCodexWebsocketRuntime({ sessionStore: sharedSessionStore });
+const codexWebsocketRuntime = registerCodexWebsocketRuntime(createCodexWebsocketRuntime({ sessionStore: sharedSessionStore }));
 
 type SelectedChannel = NonNullable<Awaited<ReturnType<typeof tokenRouter.selectChannel>>>;
 type ResponsesWebsocketAuthContext = DownstreamTokenAuthSuccess;
@@ -147,6 +148,19 @@ function unwrapCodexWebsocketRuntimeError(error: unknown): CodexWebsocketRuntime
       ? error.message
       : 'upstream websocket request failed',
   );
+}
+
+function codexRuntimeErrorReason(error: CodexWebsocketRuntimeError): string {
+  return isRecord(error.payload) ? asTrimmedString(error.payload.reason) : '';
+}
+
+function isCodexRuntimeTransportFailure(error: CodexWebsocketRuntimeError): boolean {
+  const reason = codexRuntimeErrorReason(error);
+  return reason === 'upstream_closed'
+    || reason === 'read_error'
+    || reason === 'idle_timeout'
+    || reason === 'send_error'
+    || reason === 'write_error';
 }
 
 function shouldReuseSelectedChannel(
@@ -411,6 +425,12 @@ function collectResponsesOutput(payloads: unknown[]): unknown[] {
     if (type === 'response.failed') return 'failed';
     return 'incomplete';
   };
+  const withTerminalOutputStatus = (items: unknown[], status: string): unknown[] => items.map((item) => {
+    if (!isRecord(item)) return item;
+    if (asTrimmedString(item.type) !== 'message') return item;
+    if (asTrimmedString(item.status)) return item;
+    return { ...item, status };
+  });
 
   for (const payload of payloads) {
     if (!isRecord(payload)) continue;
@@ -426,7 +446,8 @@ function collectResponsesOutput(payloads: unknown[]): unknown[] {
       && isRecord(payload.response)
       && Array.isArray(payload.response.output)
     ) {
-      const terminalOutput = cloneJsonObject(payload.response.output);
+      const terminalStatus = asTrimmedString(payload.response.status) || fallbackStatusForType(type);
+      const terminalOutput = withTerminalOutputStatus(cloneJsonObject(payload.response.output), terminalStatus);
       if (terminalOutput.length > 0 || outputByIndex.size === 0) {
         completedOutput = terminalOutput;
       }
@@ -451,7 +472,8 @@ function collectResponsesOutput(payloads: unknown[]): unknown[] {
       continue;
     }
     if (Array.isArray(payload.output)) {
-      const terminalOutput = cloneJsonObject(payload.output);
+      const terminalStatus = asTrimmedString(payload.status) || fallbackStatusForType(type || 'response.completed');
+      const terminalOutput = withTerminalOutputStatus(cloneJsonObject(payload.output), terminalStatus);
       if (terminalOutput.length > 0 || outputByIndex.size === 0) {
         completedOutput = terminalOutput;
       }
@@ -612,6 +634,7 @@ async function forwardResponsesRequestViaHttp(input: {
   const injectHeaders: Record<string, string | string[]> = {
     ...buildInjectHeaders(input.request),
     [RESPONSES_WEBSOCKET_TRANSPORT_HEADER]: '1',
+    [RESPONSES_WEBSOCKET_HTTP_FALLBACK_HEADER]: '1',
     ...(input.preserveIncrementalMode ? { [RESPONSES_WEBSOCKET_MODE_HEADER]: 'incremental' } : {}),
   };
   if (
@@ -621,7 +644,6 @@ async function forwardResponsesRequestViaHttp(input: {
   ) {
     injectHeaders.authorization = `Bearer ${input.authToken}`;
   }
-
   const response = await input.app.inject({
     method: 'POST',
     url: '/v1/responses',
@@ -811,6 +833,7 @@ async function handleResponsesWebsocketConnection(
   }
   const websocketSessionId = continuitySessionId || randomUUID();
   const runtimeSessionKeys = new Set<string>();
+  const subscribedRuntimeSessionKeys = new Set<string>();
   let lastRequest: Record<string, unknown> | null = null;
   let previousLastRequest: Record<string, unknown> | null = null;
   let lastResponseOutput: unknown[] = [];
@@ -843,14 +866,6 @@ async function handleResponsesWebsocketConnection(
         await codexWebsocketRuntime.closeSession(sessionKey);
       } catch { /* ignore */ }
     }));
-  });
-
-  const primarySessionKey = runtimeSessionKeys.size > 0
-    ? Array.from(runtimeSessionKeys)[0]!
-    : websocketSessionId;
-
-  codexWebsocketRuntime.subscribeUpstreamDisconnect(primarySessionKey, () => {
-    try { socket.close(1011, 'upstream disconnected'); } catch { /* ignore */ }
   });
 
   socket.on('message', (raw: RawData) => {
@@ -954,6 +969,17 @@ async function handleResponsesWebsocketConnection(
               channelId: codexWebsocketChannel.channel.id,
             }) || websocketSessionId;
             runtimeSessionKeys.add(websocketRuntimeSessionKey);
+            if (!subscribedRuntimeSessionKeys.has(websocketRuntimeSessionKey)) {
+              subscribedRuntimeSessionKeys.add(websocketRuntimeSessionKey);
+              const disconnectPromise = codexWebsocketRuntime.waitForUpstreamDisconnect(websocketRuntimeSessionKey);
+              if (disconnectPromise) {
+                void disconnectPromise.then(() => {
+                  setTimeout(() => {
+                    try { socket.close(1011, 'upstream disconnected'); } catch { /* ignore */ }
+                  }, 50);
+                });
+              }
+            }
 
             try {
               const runtimeResult = await runWithSiteApiEndpointPool(
@@ -981,6 +1007,10 @@ async function handleResponsesWebsocketConnection(
                       requestUrl,
                       headers: prepared.headers,
                       body: prepared.body,
+                      authId: String(codexWebsocketChannel.account.id),
+                      onTimeline: (event) => {
+                        app.log.debug({ event }, 'codex websocket timeline');
+                      },
                     });
                   } catch (error) {
                     const runtimeError = error instanceof CodexWebsocketRuntimeError
@@ -1042,7 +1072,7 @@ async function handleResponsesWebsocketConnection(
                 lastResponseOutput = previousLastResponseOutput;
               }
 
-              if (runtimeError.status && runtimeError.events.length === 0) {
+              if (runtimeError.status && runtimeError.events.length === 0 && !isCodexRuntimeTransportFailure(runtimeError)) {
                 const forwarded = await forwardResponsesRequestViaHttp({
                   app,
                   socket,

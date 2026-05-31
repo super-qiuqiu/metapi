@@ -71,6 +71,28 @@ import { isPublicApiRoute, registerDesktopRoutes } from './desktop.js';
 import { existsSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, normalize, resolve, sep } from 'path';
+
+function isRecoverableWebsocketUncaughtException(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const name = (error as { name?: unknown }).name;
+  const message = (error as { message?: unknown }).message;
+  const context = (error as { context?: unknown }).context;
+  if (name === 'ErrorEvent') return true;
+  if (typeof message === 'string' && message.includes('Unhandled error. (ErrorEvent')) return true;
+  return !!context && typeof context === 'object' && (context as { type?: unknown }).type === 'error';
+}
+
+process.on('uncaughtException', (error) => {
+  if (isRecoverableWebsocketUncaughtException(error)) {
+    console.error('recoverable websocket uncaughtException:', error);
+    return;
+  }
+  console.error('fatal uncaughtException:', error);
+  process.exitCode = 1;
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('unhandledRejection:', reason);
+});
 import {
   applyRuntimeSettings,
   parseSettingFromMap,

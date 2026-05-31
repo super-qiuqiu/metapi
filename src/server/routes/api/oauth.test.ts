@@ -8,6 +8,11 @@ import { join } from 'node:path';
 const fetchMock = vi.fn();
 const undiciAgentCtorMock = vi.fn();
 const undiciProxyAgentCtorMock = vi.fn();
+const closeCodexWebsocketSessionsForAuthIdentifiersMock = vi.hoisted(() => vi.fn());
+
+vi.mock('../../proxy-core/runtime/codexWebsocketRuntimeRegistry.js', () => ({
+  closeCodexWebsocketSessionsForAuthIdentifiers: (...args: unknown[]) => closeCodexWebsocketSessionsForAuthIdentifiersMock(...args),
+}));
 
 vi.mock('undici', () => ({
   fetch: (...args: unknown[]) => fetchMock(...args),
@@ -88,6 +93,7 @@ describe('oauth routes', { timeout: 15_000 }, () => {
 
   beforeEach(async () => {
     fetchMock.mockReset();
+    closeCodexWebsocketSessionsForAuthIdentifiersMock.mockReset();
     undiciAgentCtorMock.mockReset();
     undiciProxyAgentCtorMock.mockReset();
     config.systemProxyUrl = '';
@@ -2129,9 +2135,135 @@ describe('oauth routes', { timeout: 15_000 }, () => {
     });
     expect(deleteResponse.statusCode).toBe(200);
     expect(deleteResponse.json()).toEqual({ success: true });
+    expect(closeCodexWebsocketSessionsForAuthIdentifiersMock).toHaveBeenCalledWith([
+      account.id,
+      'chatgpt-account-123',
+      'chatgpt-account-123',
+    ]);
 
     const accounts = await db.select().from(schema.accounts).all();
     expect(accounts).toEqual([]);
+  });
+
+  it('closes Codex websocket sessions for each codex account deleted in a batch only', async () => {
+    const codexSite = await db.insert(schema.sites).values({
+      name: 'ChatGPT Codex OAuth',
+      url: 'https://chatgpt.com/backend-api/codex',
+      platform: 'codex',
+      status: 'active',
+    }).returning().get();
+    const antigravitySite = await db.insert(schema.sites).values({
+      name: 'Antigravity OAuth',
+      url: 'https://example.com/antigravity',
+      platform: 'antigravity',
+      status: 'active',
+    }).returning().get();
+
+    const codexA = await db.insert(schema.accounts).values({
+      siteId: codexSite.id,
+      username: 'batch-codex-a@example.com',
+      accessToken: 'batch-codex-access-a',
+      status: 'active',
+      oauthProvider: 'codex',
+      oauthAccountKey: 'batch-codex-key-a',
+      extraConfig: JSON.stringify({
+        oauth: {
+          provider: 'codex',
+          accountId: 'batch-codex-account-a',
+          accountKey: 'batch-codex-key-a',
+          email: 'batch-codex-a@example.com',
+        },
+      }),
+    }).returning().get();
+    const codexB = await db.insert(schema.accounts).values({
+      siteId: codexSite.id,
+      username: 'batch-codex-b@example.com',
+      accessToken: 'batch-codex-access-b',
+      status: 'active',
+      oauthProvider: 'codex',
+      oauthAccountKey: 'batch-codex-key-b',
+      extraConfig: JSON.stringify({
+        oauth: {
+          provider: 'codex',
+          accountId: 'batch-codex-account-b',
+          accountKey: 'batch-codex-key-b',
+          email: 'batch-codex-b@example.com',
+        },
+      }),
+    }).returning().get();
+    const antigravity = await db.insert(schema.accounts).values({
+      siteId: antigravitySite.id,
+      username: 'batch-antigravity@example.com',
+      accessToken: 'batch-antigravity-access',
+      status: 'active',
+      oauthProvider: 'antigravity',
+      oauthAccountKey: 'batch-antigravity-key',
+      extraConfig: JSON.stringify({
+        oauth: {
+          provider: 'antigravity',
+          accountId: 'batch-antigravity-account',
+          accountKey: 'batch-antigravity-key',
+          email: 'batch-antigravity@example.com',
+        },
+      }),
+    }).returning().get();
+
+    const deleteResponse = await app.inject({
+      method: 'POST',
+      url: '/api/oauth/connections/delete-batch',
+      payload: { accountIds: [codexA.id, antigravity.id, codexB.id] },
+    });
+
+    expect(deleteResponse.statusCode).toBe(200);
+    expect(deleteResponse.json()).toMatchObject({ success: true, deleted: 3, failed: 0 });
+    expect(closeCodexWebsocketSessionsForAuthIdentifiersMock).toHaveBeenCalledTimes(2);
+    expect(closeCodexWebsocketSessionsForAuthIdentifiersMock).toHaveBeenCalledWith([
+      codexA.id,
+      'batch-codex-account-a',
+      'batch-codex-key-a',
+    ]);
+    expect(closeCodexWebsocketSessionsForAuthIdentifiersMock).toHaveBeenCalledWith([
+      codexB.id,
+      'batch-codex-account-b',
+      'batch-codex-key-b',
+    ]);
+
+    const accounts = await db.select().from(schema.accounts).all();
+    expect(accounts).toEqual([]);
+  });
+
+  it('does not close Codex websocket sessions when deleting a non-Codex oauth account', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'Antigravity OAuth',
+      url: 'https://example.com/antigravity',
+      platform: 'antigravity',
+      status: 'active',
+    }).returning().get();
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'delete-antigravity@example.com',
+      accessToken: 'delete-antigravity-access',
+      status: 'active',
+      oauthProvider: 'antigravity',
+      oauthAccountKey: 'delete-antigravity-key',
+      extraConfig: JSON.stringify({
+        oauth: {
+          provider: 'antigravity',
+          accountId: 'delete-antigravity-account',
+          accountKey: 'delete-antigravity-key',
+          email: 'delete-antigravity@example.com',
+        },
+      }),
+    }).returning().get();
+
+    const deleteResponse = await app.inject({
+      method: 'DELETE',
+      url: `/api/oauth/connections/${account.id}`,
+    });
+
+    expect(deleteResponse.statusCode).toBe(200);
+    expect(deleteResponse.json()).toEqual({ success: true });
+    expect(closeCodexWebsocketSessionsForAuthIdentifiersMock).not.toHaveBeenCalled();
   });
 
   it('refreshes oauth quota snapshots and marks unsupported providers explicitly', async () => {

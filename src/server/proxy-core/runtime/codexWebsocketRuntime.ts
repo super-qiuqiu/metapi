@@ -19,18 +19,53 @@ import {
 } from './codexSessionResponseStore.js';
 import { createCodexWebsocketSessionStore } from './codexWebsocketSessionStore.js';
 import type {
+  CodexWebsocketActiveRequest,
   CodexWebsocketRuntimeResult,
   CodexWebsocketRuntimeSendInput,
   CodexWebsocketSession,
   CodexWebsocketSessionStore,
+  CodexWebsocketTimelineEvent,
 } from './types.js';
 
 const CODEX_WS_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const CODEX_WS_HANDSHAKE_TIMEOUT_MS = 30 * 1000;
 const CODEX_WS_MAX_SEND_RETRIES = 1;
 
+type CodexWebsocketDisconnectReason =
+  | 'read_error'
+  | 'write_error'
+  | 'send_error'
+  | 'idle_timeout'
+  | 'upstream_error'
+  | 'upstream_closed'
+  | 'unexpected_binary'
+  | 'session_closed'
+  | 'auth_closed';
+
 function asTrimmedString(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
+}
+
+function emitTimeline(
+  session: CodexWebsocketSession,
+  event: CodexWebsocketTimelineEvent['event'],
+  input?: {
+    reason?: string;
+    payload?: unknown;
+    onTimeline?: (event: CodexWebsocketTimelineEvent) => void;
+  },
+): void {
+  try {
+    input?.onTimeline?.({
+      event,
+      timestamp: new Date().toISOString(),
+      sessionId: session.sessionId,
+      ...(input.reason ? { reason: input.reason } : {}),
+      ...(input.payload !== undefined ? { payload: input.payload } : {}),
+    });
+  } catch {
+    // Timeline hooks are observational and must not affect proxy behavior.
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -116,29 +151,30 @@ export class CodexWebsocketRuntimeError extends Error {
   }
 }
 
-function tryParseJson(raw: string): unknown {
-  const trimmed = raw.trim();
-  if (!trimmed) return undefined;
-  try {
-    return JSON.parse(trimmed);
-  } catch {
-    return undefined;
+function pickHeaderValue(headers: Record<string, string>, names: string[]): string {
+  for (const name of names) {
+    const expected = name.trim().toLowerCase();
+    for (const [key, value] of Object.entries(headers)) {
+      if (key.trim().toLowerCase() !== expected) continue;
+      const normalized = asTrimmedString(value);
+      if (normalized) return normalized;
+    }
   }
+  return '';
 }
 
-async function readUnexpectedResponseBody(response: IncomingMessage): Promise<string> {
-  return await new Promise<string>((resolve) => {
-    const chunks: Buffer[] = [];
-    response.on('data', (chunk) => {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-    });
-    response.once('end', () => {
-      resolve(Buffer.concat(chunks).toString('utf8'));
-    });
-    response.once('error', () => {
-      resolve('');
-    });
-  });
+function resolveRuntimeAuthId(input: CodexWebsocketRuntimeSendInput): string | null {
+  const explicit = asTrimmedString(input.authId);
+  if (explicit) return explicit;
+  return pickHeaderValue(input.headers, [
+    'chatgpt-account-id',
+    'ChatGPT-Account-ID',
+    'authorization',
+  ]) || null;
+}
+
+function runtimeErrorReason(error: CodexWebsocketRuntimeError): string {
+  return isRecord(error.payload) ? asTrimmedString(error.payload.reason) : '';
 }
 
 async function waitForSocketOpen(socket: WebSocket): Promise<void> {
@@ -166,18 +202,17 @@ async function waitForSocketOpen(socket: WebSocket): Promise<void> {
       reject(new Error('upstream websocket closed before opening'));
     };
     const onUnexpectedResponse = (_request: unknown, response: IncomingMessage) => {
-      void readUnexpectedResponseBody(response).then((body) => {
-        cleanup();
-        const is426 = response.statusCode === 426;
-        reject(new CodexWebsocketRuntimeError(
-          body.trim() || response.statusMessage || `upstream websocket upgrade failed with status ${response.statusCode || 502}`,
-          {
-            status: response.statusCode || 502,
-            payload: tryParseJson(body),
-            isUpgradeRequired426: is426,
-          },
-        ));
-      });
+      cleanup();
+      response.resume();
+      const status = response.statusCode || 502;
+      const is426 = status === 426;
+      reject(new CodexWebsocketRuntimeError(
+        response.statusMessage || `upstream websocket upgrade failed with status ${status}`,
+        {
+          status,
+          isUpgradeRequired426: is426,
+        },
+      ));
     };
     socket.once('open', onOpen);
     socket.once('error', onError);
@@ -209,24 +244,68 @@ function clearSessionSocket(session: CodexWebsocketSession, socket: WebSocket): 
   if (session.socket !== socket) return;
   session.socket = null;
   session.socketUrl = null;
+  if (session.readLoopSocket === socket) {
+    session.readLoopSocket = null;
+  }
 }
 
-function notifyUpstreamDisconnect(session: CodexWebsocketSession, error: Error): void {
-  if (session.upstreamDisconnectOnce.fired) return;
-  session.upstreamDisconnectOnce.fired = true;
-  for (const subscriber of session.upstreamDisconnectOnce.subscribers) {
-    try {
-      subscriber(error);
-    } catch {
-      // ignore subscriber errors
-    }
+function clearActiveRequest(session: CodexWebsocketSession, active: CodexWebsocketActiveRequest): void {
+  if (active.idleTimer) {
+    clearTimeout(active.idleTimer);
+    active.idleTimer = null;
   }
-  session.upstreamDisconnectOnce.subscribers.length = 0;
+  if (session.activeRequest === active) {
+    session.activeRequest = null;
+  }
+}
+
+function notifyUpstreamDisconnect(
+  session: CodexWebsocketSession,
+  error: Error,
+  reason: CodexWebsocketDisconnectReason,
+): void {
+  if (session.upstreamDisconnect.fired) return;
+  session.upstreamDisconnect.fired = true;
+  session.upstreamDisconnect.error = error;
+  emitTimeline(session, reason === 'upstream_error' ? 'error' : 'disconnect', {
+    reason,
+    payload: { message: error.message, name: error.name },
+    onTimeline: session.activeRequest?.onTimeline,
+  });
+  session.upstreamDisconnect.resolve(error);
+}
+
+function invalidateUpstreamConnection(
+  session: CodexWebsocketSession,
+  socket: WebSocket,
+  reason: CodexWebsocketDisconnectReason,
+  error: Error,
+): void {
+  const active = session.activeRequest;
+  if (active && active.socket === socket) {
+    clearActiveRequest(session, active);
+    const message = reason === 'upstream_closed'
+      ? 'stream closed before response.completed'
+      : error.message || 'upstream websocket error';
+    active.reject(new CodexWebsocketRuntimeError(message, {
+      events: [...active.events],
+      status: reason === 'idle_timeout' ? 408 : 502,
+      payload: { reason },
+    }));
+  }
+  clearSessionSocket(session, socket);
+  notifyUpstreamDisconnect(session, error, reason);
+  void closeSocket(socket);
 }
 
 function subscribeUpstreamDisconnect(session: CodexWebsocketSession, callback: (error: Error) => void): void {
-  if (session.upstreamDisconnectOnce.fired) return;
-  session.upstreamDisconnectOnce.subscribers.push(callback);
+  void session.upstreamDisconnect.promise.then((error) => {
+    try {
+      callback(error);
+    } catch {
+      // ignore subscriber errors
+    }
+  });
 }
 
 function buildContinuationAwareRuntimeBody(
@@ -246,6 +325,114 @@ function rememberSessionResponseId(sessionId: string, payload: unknown): void {
   setCodexSessionResponseId(sessionId, responseId);
 }
 
+function rejectActiveRequest(
+  session: CodexWebsocketSession,
+  active: CodexWebsocketActiveRequest,
+  message: string,
+  options?: { status?: number; payload?: unknown; reason?: CodexWebsocketDisconnectReason },
+): void {
+  clearActiveRequest(session, active);
+  emitTimeline(session, 'error', {
+    reason: options?.reason,
+    payload: options?.payload ?? { message },
+    onTimeline: active.onTimeline,
+  });
+  active.reject(new CodexWebsocketRuntimeError(message, {
+    events: [...active.events],
+    status: options?.status,
+    payload: options?.payload,
+  }));
+}
+
+function resolveActiveRequest(session: CodexWebsocketSession, active: CodexWebsocketActiveRequest): void {
+  clearActiveRequest(session, active);
+  active.resolve({
+    events: [...active.events],
+    reusedSession: active.reusedSession,
+  });
+}
+
+function resetActiveIdleTimer(session: CodexWebsocketSession, active: CodexWebsocketActiveRequest): void {
+  if (active.idleTimer) clearTimeout(active.idleTimer);
+  active.idleTimer = setTimeout(() => {
+    if (session.activeRequest !== active) return;
+    invalidateUpstreamConnection(
+      session,
+      active.socket,
+      'idle_timeout',
+      new Error(`upstream websocket idle timeout (${CODEX_WS_IDLE_TIMEOUT_MS}ms)`),
+    );
+  }, CODEX_WS_IDLE_TIMEOUT_MS);
+}
+
+function routeUpstreamMessage(session: CodexWebsocketSession, socket: WebSocket, payload: WebSocket.RawData): void {
+  const active = session.activeRequest;
+  if (!active || active.socket !== socket) return;
+
+  try {
+    const parsed = JSON.parse(String(payload));
+    if (!isRecord(parsed)) return;
+    session.lastActivityMs = Date.now();
+    active.events.push(parsed);
+    emitTimeline(session, 'response', { payload: parsed, onTimeline: active.onTimeline });
+    try {
+      active.onEvent?.(parsed);
+    } catch {
+      // Ignore downstream stream callback failures; runtime terminal handling
+      // is governed by websocket protocol terminal events.
+    }
+    if (!isTerminalEvent(parsed)) {
+      resetActiveIdleTimer(session, active);
+      return;
+    }
+    if (
+      isRuntimeErrorEvent(parsed)
+      || isResponsesPreviousResponseNotFoundError({
+        payload: parsed,
+        rawErrText: extractTerminalErrorMessage(parsed),
+      })
+    ) {
+      const message = extractTerminalErrorMessage(parsed);
+      clearSessionSocket(session, socket);
+      void closeSocket(socket);
+      rejectActiveRequest(session, active, message, {
+        status: extractFailureTerminalStatus(parsed),
+        payload: parsed,
+        reason: 'upstream_error',
+      });
+      return;
+    }
+    rememberSessionResponseId(session.sessionId, parsed);
+    resolveActiveRequest(session, active);
+  } catch {
+    // Ignore malformed frames and wait for a terminal event.
+  }
+}
+
+function startUpstreamReadLoop(session: CodexWebsocketSession, socket: WebSocket): void {
+  if (session.readLoopSocket === socket) return;
+  session.readLoopSocket = socket;
+  socket.on('message', (payload: WebSocket.RawData) => {
+    routeUpstreamMessage(session, socket, payload);
+  });
+  socket.on('ping', (payload: Buffer) => {
+    try {
+      socket.pong(payload);
+    } catch {
+      // Ping/pong is best-effort; socket errors are handled by the read loop.
+    }
+  });
+  socket.on('close', () => {
+    if (socket.readyState !== WebSocket.CLOSED) return;
+    if (session.socket !== socket && session.activeRequest?.socket !== socket) return;
+    invalidateUpstreamConnection(session, socket, 'upstream_closed', new Error('upstream websocket closed'));
+  });
+  socket.on('error', (error: Error) => {
+    if (session.socket !== socket && session.activeRequest?.socket !== socket) return;
+    invalidateUpstreamConnection(session, socket, 'read_error', error);
+  });
+}
+
 async function ensureSessionSocket(
   session: CodexWebsocketSession,
   input: CodexWebsocketRuntimeSendInput,
@@ -257,6 +444,7 @@ async function ensureSessionSocket(
     && session.socketUrl === requestUrl
     && existing.readyState === WebSocket.OPEN
   ) {
+    session.authId = resolveRuntimeAuthId(input);
     session.lastActivityMs = Date.now();
     return {
       socket: existing,
@@ -265,8 +453,8 @@ async function ensureSessionSocket(
   }
 
   if (existing) {
-    await closeSocket(existing);
     clearSessionSocket(session, existing);
+    await closeSocket(existing);
   }
 
   const nextSocket = new WebSocket(requestUrl, {
@@ -274,18 +462,16 @@ async function ensureSessionSocket(
     handshakeTimeout: CODEX_WS_HANDSHAKE_TIMEOUT_MS,
     agent: input.agent as never,
   });
+  startUpstreamReadLoop(session, nextSocket);
   await waitForSocketOpen(nextSocket);
   session.socket = nextSocket;
   session.socketUrl = requestUrl;
+  session.authId = resolveRuntimeAuthId(input);
   session.lastActivityMs = Date.now();
-
-  nextSocket.on('close', () => {
-    clearSessionSocket(session, nextSocket);
-    notifyUpstreamDisconnect(session, new Error('upstream websocket closed'));
-  });
-  nextSocket.on('error', (error: Error) => {
-    clearSessionSocket(session, nextSocket);
-    notifyUpstreamDisconnect(session, error);
+  emitTimeline(session, 'reconnect', {
+    reason: 'connected',
+    payload: { requestUrl },
+    onTimeline: input.onTimeline,
   });
 
   return {
@@ -301,109 +487,32 @@ async function sendSessionRequestAttempt(
   },
 ): Promise<CodexWebsocketRuntimeResult> {
   const { socket, reusedSession } = await ensureSessionSocket(session, input);
-  const events: Array<Record<string, unknown>> = [];
-
   return new Promise<CodexWebsocketRuntimeResult>((resolve, reject) => {
-    let settled = false;
-    let idleTimer: ReturnType<typeof setTimeout> | null = null;
-
-    const resetIdleTimer = () => {
-      if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        clearSessionSocket(session, socket);
-        void closeSocket(socket);
-        reject(new CodexWebsocketRuntimeError(
-          `upstream websocket idle timeout (${CODEX_WS_IDLE_TIMEOUT_MS}ms)`,
-          { events: [...events], status: 408 },
-        ));
-      }, CODEX_WS_IDLE_TIMEOUT_MS);
+    const active: CodexWebsocketActiveRequest = {
+      socket,
+      events: [],
+      reusedSession,
+      idleTimer: null,
+      onEvent: input.onEvent,
+      onTimeline: input.onTimeline,
+      resolve,
+      reject,
     };
-
-    const cleanup = () => {
-      socket.off('message', onMessage);
-      socket.off('error', onError);
-      socket.off('close', onClose);
-      if (idleTimer) {
-        clearTimeout(idleTimer);
-        idleTimer = null;
-      }
-    };
-
-    const rejectWith = (message: string, options?: { status?: number; payload?: unknown; isUpgradeRequired426?: boolean }) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      reject(new CodexWebsocketRuntimeError(message, { events: [...events], ...options }));
-    };
-
-    const onMessage = (payload: WebSocket.RawData) => {
-      try {
-        const parsed = JSON.parse(String(payload));
-        if (!isRecord(parsed)) return;
-        events.push(parsed);
-        try {
-          input.onEvent?.(parsed);
-        } catch {
-          // Ignore downstream stream callback failures; runtime terminal handling
-          // is governed by websocket protocol terminal events.
-        }
-        if (!isTerminalEvent(parsed)) {
-          resetIdleTimer();
-          return;
-        }
-        if (settled) return;
-        if (
-          isRuntimeErrorEvent(parsed)
-          || isResponsesPreviousResponseNotFoundError({
-            payload: parsed,
-            rawErrText: extractTerminalErrorMessage(parsed),
-          })
-        ) {
-          settled = true;
-          cleanup();
-          clearSessionSocket(session, socket);
-          void closeSocket(socket);
-          reject(new CodexWebsocketRuntimeError(extractTerminalErrorMessage(parsed), {
-            events: [...events],
-            status: extractFailureTerminalStatus(parsed),
-            payload: parsed,
-          }));
-          return;
-        }
-        rememberSessionResponseId(session.sessionId, parsed);
-        settled = true;
-        cleanup();
-        resolve({
-          events: [...events],
-          reusedSession,
-        });
-      } catch {
-        // Ignore malformed frames and wait for a terminal event.
-      }
-    };
-
-    const onError = (error: Error) => {
-      clearSessionSocket(session, socket);
-      rejectWith(error.message || 'upstream websocket error');
-    };
-
-    const onClose = () => {
-      clearSessionSocket(session, socket);
-      rejectWith('stream closed before response.completed');
-    };
-
-    socket.on('message', onMessage);
-    socket.once('error', onError);
-    socket.once('close', onClose);
-    resetIdleTimer();
+    session.activeRequest = active;
+    resetActiveIdleTimer(session, active);
+    emitTimeline(session, 'request', {
+      payload: input.body,
+      onTimeline: input.onTimeline,
+    });
 
     socket.send(JSON.stringify(buildCodexWebsocketRequestBody(input.body)), (error?: Error) => {
       if (!error) return;
-      clearSessionSocket(session, socket);
-      rejectWith(error.message || 'failed to send upstream websocket request');
+      invalidateUpstreamConnection(
+        session,
+        socket,
+        'send_error',
+        error.message ? error : new Error('failed to send upstream websocket request'),
+      );
     });
   });
 }
@@ -442,6 +551,7 @@ async function sendSessionRequest(
           && session.socket === null
           && CODEX_WS_MAX_SEND_RETRIES > 0
           && !previousResponseRecoveryTried
+          && (runtimeErrorReason(error) === 'send_error' || runtimeErrorReason(error) === 'write_error')
         ) {
           try {
             return await sendSessionRequestAttempt(session, {
@@ -497,9 +607,12 @@ export function createCodexWebsocketRuntime(input?: {
       const session = sessionStore.take(sessionId);
       if (!session) return;
       await session.queue.catch(() => undefined);
-      await closeSocket(session.socket);
-      session.socket = null;
-      session.socketUrl = null;
+      const socket = session.socket;
+      if (socket) {
+        clearSessionSocket(session, socket);
+        await closeSocket(socket);
+      }
+      session.activeRequest = null;
     },
 
     async closeAllSessions(): Promise<void> {
@@ -516,14 +629,22 @@ export function createCodexWebsocketRuntime(input?: {
       subscribeUpstreamDisconnect(session, callback);
     },
 
+    waitForUpstreamDisconnect(sessionId: string): Promise<Error> | null {
+      const normalized = sessionId.trim();
+      if (!normalized) return null;
+      const session = sessionStore.getOrCreate(normalized);
+      return session.upstreamDisconnect.promise;
+    },
+
     closeSessionsForAuthFilter(predicate: (session: CodexWebsocketSession) => boolean): void {
       const sessions = sessionStore.list();
       for (const session of sessions) {
         if (!predicate(session)) continue;
         sessionStore.take(session.sessionId);
-        void closeSocket(session.socket);
-        session.socket = null;
-        session.socketUrl = null;
+        const socket = session.socket;
+        if (!socket) continue;
+        clearSessionSocket(session, socket);
+        void closeSocket(socket);
       }
     },
   };

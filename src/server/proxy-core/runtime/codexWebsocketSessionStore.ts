@@ -3,6 +3,19 @@ import type { CodexWebsocketSession, CodexWebsocketSessionStore } from './types.
 const MAX_CODEX_WS_SESSIONS = 10_000;
 const CODEX_WS_SESSION_TTL_MS = 30 * 60 * 1000;
 
+function createDisconnectSignal() {
+  let resolveSignal!: (error: Error) => void;
+  const promise = new Promise<Error>((resolve) => {
+    resolveSignal = resolve;
+  });
+  return {
+    fired: false,
+    error: null,
+    promise,
+    resolve: resolveSignal,
+  };
+}
+
 export function createCodexWebsocketSessionStore(): CodexWebsocketSessionStore {
   const sessions = new Map<string, CodexWebsocketSession>();
 
@@ -18,13 +31,13 @@ export function createCodexWebsocketSessionStore(): CodexWebsocketSessionStore {
       const nowMs = Date.now();
       const created: CodexWebsocketSession = {
         sessionId: normalized,
+        authId: null,
         socket: null,
         socketUrl: null,
+        readLoopSocket: null,
+        activeRequest: null,
         queue: Promise.resolve(),
-        upstreamDisconnectOnce: {
-          fired: false,
-          subscribers: [],
-        },
+        upstreamDisconnect: createDisconnectSignal(),
         createdAtMs: nowMs,
         lastActivityMs: nowMs,
       };

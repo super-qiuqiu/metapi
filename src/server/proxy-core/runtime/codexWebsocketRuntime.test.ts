@@ -437,6 +437,97 @@ describe('codexWebsocketRuntime', () => {
     await runtime.closeSession('exec-session-retry-stale');
   });
 
+  it('resolves an upstream disconnect promise when the active upstream connection closes', async () => {
+    upstreamMessageHandler = (socket, parsed, requestIndex) => {
+      if (requestIndex === 1) {
+        socket.send(JSON.stringify({
+          type: 'response.completed',
+          response: {
+            id: 'resp-disconnect-1',
+            object: 'response',
+            model: parsed.model || 'gpt-5.4',
+            status: 'completed',
+            output: [],
+          },
+        }));
+        return;
+      }
+      socket.close();
+    };
+
+    const { createCodexWebsocketRuntime } = await import('./codexWebsocketRuntime.js');
+    const runtime = createCodexWebsocketRuntime();
+
+    await runtime.sendRequest({
+      sessionId: 'exec-session-disconnect-promise',
+      requestUrl: upstreamWsUrl,
+      headers: {
+        Authorization: 'Bearer oauth-access-token',
+        'OpenAI-Beta': 'responses_websockets=2026-02-06',
+      },
+      body: {
+        model: 'gpt-5.4',
+        input: [],
+      },
+    });
+
+    const disconnect = runtime.waitForUpstreamDisconnect('exec-session-disconnect-promise');
+
+    await expect(runtime.sendRequest({
+      sessionId: 'exec-session-disconnect-promise',
+      requestUrl: upstreamWsUrl,
+      headers: {
+        Authorization: 'Bearer oauth-access-token',
+        'OpenAI-Beta': 'responses_websockets=2026-02-06',
+      },
+      body: {
+        model: 'gpt-5.4',
+        previous_response_id: 'resp-disconnect-1',
+        input: [],
+      },
+    })).rejects.toThrow('stream closed before response.completed');
+
+    await expect(disconnect).resolves.toBeInstanceOf(Error);
+  });
+
+  it('closes websocket sessions by auth id filter', async () => {
+    const { createCodexWebsocketRuntime } = await import('./codexWebsocketRuntime.js');
+    const runtime = createCodexWebsocketRuntime();
+
+    await runtime.sendRequest({
+      sessionId: 'exec-session-auth-close',
+      requestUrl: upstreamWsUrl,
+      authId: 'auth-1',
+      headers: {
+        Authorization: 'Bearer oauth-access-token',
+        'OpenAI-Beta': 'responses_websockets=2026-02-06',
+      },
+      body: {
+        model: 'gpt-5.4',
+        input: [],
+      },
+    });
+
+    runtime.closeSessionsForAuthFilter((session) => session.authId === 'auth-1');
+
+    await runtime.sendRequest({
+      sessionId: 'exec-session-auth-close',
+      requestUrl: upstreamWsUrl,
+      authId: 'auth-1',
+      headers: {
+        Authorization: 'Bearer oauth-access-token',
+        'OpenAI-Beta': 'responses_websockets=2026-02-06',
+      },
+      body: {
+        model: 'gpt-5.4',
+        input: [],
+      },
+    });
+
+    expect(upstreamConnectionCount).toBe(2);
+    await runtime.closeSession('exec-session-auth-close');
+  });
+
   it('treats top-level error frames as terminal websocket failures', async () => {
     upstreamMessageHandler = (socket) => {
       socket.send(JSON.stringify({

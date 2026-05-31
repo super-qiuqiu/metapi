@@ -138,6 +138,12 @@ function isResponsesWebsocketTransportRequest(headers: Record<string, unknown>):
       && String(rawValue).trim() === '1');
 }
 
+function isResponsesWebsocketHttpFallbackRequest(headers: Record<string, unknown>): boolean {
+  return Object.entries(headers)
+    .some(([rawKey, rawValue]) => rawKey.trim().toLowerCase() === 'x-metapi-responses-websocket-http-fallback'
+      && String(rawValue).trim() === '1');
+}
+
 function rememberCodexSessionResponseId(sessionId: string, payload: unknown): void {
   const responseId = extractResponsesTerminalResponseId(payload);
   if (!responseId) return;
@@ -519,6 +525,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
         })
       );
       const executeEndpointResultForSiteApiBaseUrl = async (siteApiBaseUrl: string) => {
+        const websocketHttpFallbackRequest = isResponsesWebsocketHttpFallbackRequest(request.headers as Record<string, unknown>);
         if (oauth) {
           await trySurfaceOauthPreRefresh({ selected });
         }
@@ -611,7 +618,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
           if (!isCodexSite || !endpointRequest.path.startsWith('/responses')) {
             return baseDispatchRequest(endpointRequest, targetUrl);
           }
-          if (config.codexUpstreamWebsocketEnabled) {
+          if (config.codexUpstreamWebsocketEnabled && !websocketHttpFallbackRequest) {
             return dispatchCodexWebsocketRequest(
               endpointRequest,
               targetUrl,

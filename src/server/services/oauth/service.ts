@@ -46,6 +46,7 @@ import { buildQuotaSnapshotFromOauthInfo, refreshOauthQuotaSnapshot } from './qu
 import {
   listOauthRouteUnitsByAccountIds,
 } from './routeUnitService.js';
+import { closeCodexWebsocketSessionsForAuthIdentifiers } from '../../proxy-core/runtime/codexWebsocketRuntimeRegistry.js';
 
 type OAuthProviderMetadata = ReturnType<typeof listOauthProviders>[number];
 const MANUAL_CALLBACK_DELAY_MS = 15_000;
@@ -1273,6 +1274,13 @@ export async function deleteOauthConnection(accountId: number) {
   if (!normalizedOauth) {
     throw new Error('account is not managed by oauth');
   }
+  if (normalizedOauth.provider === 'codex') {
+    closeCodexWebsocketSessionsForAuthIdentifiers([
+      account.id,
+      normalizedOauth.accountId,
+      normalizedOauth.accountKey,
+    ]);
+  }
   await db.delete(schema.accounts).where(eq(schema.accounts.id, accountId)).run();
   await routeRefreshWorkflow.rebuildRoutesOnly();
   return { success: true };
@@ -1291,6 +1299,13 @@ export async function deleteOauthConnectionsBatch(accountIds: number[]) {
       const normalizedOauth = getOauthInfoFromAccount(account);
       if (!normalizedOauth) {
         return { accountId, success: false, error: 'account is not managed by oauth' };
+      }
+      if (normalizedOauth.provider === 'codex') {
+        closeCodexWebsocketSessionsForAuthIdentifiers([
+          account.id,
+          normalizedOauth.accountId,
+          normalizedOauth.accountKey,
+        ]);
       }
       await db.delete(schema.accounts).where(eq(schema.accounts.id, accountId)).run();
       return { accountId, success: true };

@@ -210,10 +210,13 @@ function stripCodexUnsupportedResponsesFields(
 function applyCodexResponsesCompatibility(
   body: Record<string, unknown>,
   sitePlatform: string,
+  options?: {
+    preserveInputStatusFields?: boolean;
+  },
 ): Record<string, unknown> {
   if (sitePlatform !== 'codex') return body;
   return extractSystemMessagesToInstructions(
-    stripCodexInputStatusFields(body, sitePlatform),
+    options?.preserveInputStatusFields ? body : stripCodexInputStatusFields(body, sitePlatform),
   );
 }
 
@@ -222,13 +225,14 @@ export function normalizeCodexResponsesBodyForProxy(
   sitePlatform: string,
   options?: {
     preservePreviousResponseId?: boolean;
+    preserveInputStatusFields?: boolean;
   },
 ): Record<string, unknown> {
   if (sitePlatform !== 'codex') return body;
   return ensureCodexResponsesStoreFalse(
     stripCodexUnsupportedResponsesFields(
       ensureCodexResponsesInstructions(
-        applyCodexResponsesCompatibility(body, sitePlatform),
+        applyCodexResponsesCompatibility(body, sitePlatform, options),
         sitePlatform,
       ),
       sitePlatform,
