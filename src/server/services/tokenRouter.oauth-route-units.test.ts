@@ -2,6 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { config } from '../config.js';
 
 type DbModule = typeof import('../db/index.js');
 type TokenRouterModule = typeof import('./tokenRouter.js');
@@ -472,5 +473,223 @@ describe('TokenRouter oauth route units', () => {
     const failover = await router.selectNextChannel('gpt-5.4', [channel.id]);
 
     expect(failover).toBeNull();
+  });
+
+  describe('codex sticky account mode', () => {
+    const originalStickyEnabled = config.codexStickyAccountEnabled;
+    const originalQuotaThreshold = config.codexStickyAccountQuotaThresholdPercent;
+
+    beforeAll(() => {
+      config.codexStickyAccountEnabled = true;
+      config.codexStickyAccountQuotaThresholdPercent = 10;
+    });
+
+    afterAll(() => {
+      config.codexStickyAccountEnabled = originalStickyEnabled;
+      config.codexStickyAccountQuotaThresholdPercent = originalQuotaThreshold;
+    });
+
+    it('sticks to the same codex account across calls when quota is healthy', async () => {
+      const site = await db.insert(schema.sites).values({
+        name: 'ChatGPT Codex OAuth',
+        url: 'https://chatgpt.com/backend-api/codex',
+        platform: 'codex',
+        status: 'active',
+      }).returning().get();
+
+      const accountA = await db.insert(schema.accounts).values({
+        siteId: site.id,
+        username: 'sticky-healthy-a@example.com',
+        accessToken: 'oauth-sticky-healthy-a',
+        apiToken: null,
+        status: 'active',
+        oauthProvider: 'codex',
+        oauthAccountKey: 'chatgpt-sticky-healthy-a',
+        extraConfig: JSON.stringify({
+          credentialMode: 'session',
+          oauth: {
+            provider: 'codex',
+            accountId: 'chatgpt-sticky-healthy-a',
+            email: 'sticky-healthy-a@example.com',
+            quota: {
+              status: 'supported',
+              source: 'official',
+              windows: {
+                fiveHour: { supported: true, used: 50, limit: 100, remaining: 50 },
+                sevenDay: { supported: true, used: 60, limit: 100, remaining: 40 },
+              },
+            },
+          },
+        }),
+      }).returning().get();
+
+      const accountB = await db.insert(schema.accounts).values({
+        siteId: site.id,
+        username: 'sticky-healthy-b@example.com',
+        accessToken: 'oauth-sticky-healthy-b',
+        apiToken: null,
+        status: 'active',
+        oauthProvider: 'codex',
+        oauthAccountKey: 'chatgpt-sticky-healthy-b',
+        extraConfig: JSON.stringify({
+          credentialMode: 'session',
+          oauth: {
+            provider: 'codex',
+            accountId: 'chatgpt-sticky-healthy-b',
+            email: 'sticky-healthy-b@example.com',
+            quota: {
+              status: 'supported',
+              source: 'official',
+              windows: {
+                fiveHour: { supported: true, used: 30, limit: 100, remaining: 70 },
+                sevenDay: { supported: true, used: 20, limit: 100, remaining: 80 },
+              },
+            },
+          },
+        }),
+      }).returning().get();
+
+      const route = await db.insert(schema.tokenRoutes).values({
+        modelPattern: 'gpt-5.4-sticky',
+        routingStrategy: 'round_robin',
+        enabled: true,
+      }).returning().get();
+      const routeUnit = await db.insert(schema.oauthRouteUnits).values({
+        siteId: site.id,
+        provider: 'codex',
+        name: 'Codex Sticky Pool',
+        strategy: 'round_robin',
+        enabled: true,
+      }).returning().get();
+      await db.insert(schema.oauthRouteUnitMembers).values([
+        { unitId: routeUnit.id, accountId: accountA.id, sortOrder: 0 },
+        { unitId: routeUnit.id, accountId: accountB.id, sortOrder: 1 },
+      ]).run();
+      await db.insert(schema.modelAvailability).values([
+        { accountId: accountA.id, modelName: 'gpt-5.4-sticky', available: true },
+        { accountId: accountB.id, modelName: 'gpt-5.4-sticky', available: true },
+      ]).run();
+      await db.insert(schema.routeChannels).values({
+        routeId: route.id,
+        accountId: accountA.id,
+        tokenId: null,
+        oauthRouteUnitId: routeUnit.id,
+        priority: 0,
+        weight: 10,
+        enabled: true,
+        manualOverride: false,
+      }).run();
+
+      const router = new TokenRouter();
+      const first = await router.selectChannel('gpt-5.4-sticky');
+      const second = await router.selectChannel('gpt-5.4-sticky');
+      // Even though strategy is round_robin, sticky account mode should pick the
+      // same account on both calls (account B has higher remaining so it goes
+      // first, then sticks).
+      expect(first?.account.id).toBeDefined();
+      expect(second?.account.id).toBe(first?.account.id);
+    });
+
+    it('switches to another codex account when sticky account quota drops below threshold', async () => {
+      const site = await db.insert(schema.sites).values({
+        name: 'ChatGPT Codex OAuth',
+        url: 'https://chatgpt.com/backend-api/codex',
+        platform: 'codex',
+        status: 'active',
+      }).returning().get();
+
+      // Account A: low quota (7% remaining — below 10% threshold)
+      const accountA = await db.insert(schema.accounts).values({
+        siteId: site.id,
+        username: 'sticky-low-a@example.com',
+        accessToken: 'oauth-sticky-low-a',
+        apiToken: null,
+        status: 'active',
+        oauthProvider: 'codex',
+        oauthAccountKey: 'chatgpt-sticky-low-a',
+        extraConfig: JSON.stringify({
+          credentialMode: 'session',
+          oauth: {
+            provider: 'codex',
+            accountId: 'chatgpt-sticky-low-a',
+            email: 'sticky-low-a@example.com',
+            quota: {
+              status: 'supported',
+              source: 'official',
+              windows: {
+                fiveHour: { supported: true, used: 93, limit: 100, remaining: 7 },
+                sevenDay: { supported: true, used: 95, limit: 100, remaining: 5 },
+              },
+            },
+          },
+        }),
+      }).returning().get();
+
+      // Account B: healthy quota (40% remaining — above 10% threshold)
+      const accountB = await db.insert(schema.accounts).values({
+        siteId: site.id,
+        username: 'sticky-low-b@example.com',
+        accessToken: 'oauth-sticky-low-b',
+        apiToken: null,
+        status: 'active',
+        oauthProvider: 'codex',
+        oauthAccountKey: 'chatgpt-sticky-low-b',
+        extraConfig: JSON.stringify({
+          credentialMode: 'session',
+          oauth: {
+            provider: 'codex',
+            accountId: 'chatgpt-sticky-low-b',
+            email: 'sticky-low-b@example.com',
+            quota: {
+              status: 'supported',
+              source: 'official',
+              windows: {
+                fiveHour: { supported: true, used: 60, limit: 100, remaining: 40 },
+                sevenDay: { supported: true, used: 55, limit: 100, remaining: 45 },
+              },
+            },
+          },
+        }),
+      }).returning().get();
+
+      const route = await db.insert(schema.tokenRoutes).values({
+        modelPattern: 'gpt-5.4-low-quota',
+        routingStrategy: 'round_robin',
+        enabled: true,
+      }).returning().get();
+      const routeUnit = await db.insert(schema.oauthRouteUnits).values({
+        siteId: site.id,
+        provider: 'codex',
+        name: 'Codex Low Quota Pool',
+        strategy: 'round_robin',
+        enabled: true,
+      }).returning().get();
+      await db.insert(schema.oauthRouteUnitMembers).values([
+        { unitId: routeUnit.id, accountId: accountA.id, sortOrder: 0 },
+        { unitId: routeUnit.id, accountId: accountB.id, sortOrder: 1 },
+      ]).run();
+      await db.insert(schema.modelAvailability).values([
+        { accountId: accountA.id, modelName: 'gpt-5.4-low-quota', available: true },
+        { accountId: accountB.id, modelName: 'gpt-5.4-low-quota', available: true },
+      ]).run();
+      await db.insert(schema.routeChannels).values({
+        routeId: route.id,
+        accountId: accountA.id,
+        tokenId: null,
+        oauthRouteUnitId: routeUnit.id,
+        priority: 0,
+        weight: 10,
+        enabled: true,
+        manualOverride: false,
+      }).run();
+
+      const router = new TokenRouter();
+      // First call: A has low quota (5% < 10%), so should pick B (higher remaining).
+      const first = await router.selectChannel('gpt-5.4-low-quota');
+      expect(first?.account.id).toBe(accountB.id);
+      // Second call: still B (sticky, quota still healthy)
+      const second = await router.selectChannel('gpt-5.4-low-quota');
+      expect(second?.account.id).toBe(accountB.id);
+    });
   });
 });

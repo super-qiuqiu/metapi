@@ -17,6 +17,7 @@ import { type DownstreamRoutingPolicy, EMPTY_DOWNSTREAM_ROUTING_POLICY } from '.
 import { isUsableAccountToken } from './accountTokenService.js';
 import { getOauthInfoFromAccount } from './oauth/oauthAccount.js';
 import { parseCodexQuotaResetHint } from './oauth/quota.js';
+import type { OauthQuotaSnapshot, OauthQuotaWindowSnapshot } from './oauth/quotaTypes.js';
 import {
   incFailureClass,
   incFallbackLegacy,
@@ -3406,6 +3407,45 @@ export class TokenRouter {
     })[0] ?? null;
   }
 
+  /**
+   * Returns the lowest remaining quota percentage across all codex quota windows
+   * for the given account. Returns `null` if quota data is unavailable.
+   */
+  private resolveCodexAccountQuotaRemainingPercent(account: typeof schema.accounts.$inferSelect): number | null {
+    const oauth = getOauthInfoFromAccount(account);
+    if (!oauth || oauth.provider !== 'codex') return null;
+    const quota = oauth.quota as OauthQuotaSnapshot | undefined;
+    if (!quota || quota.status !== 'supported') return null;
+    const windows = [quota.windows.sevenDay, quota.windows.fiveHour].filter(
+      (w): w is OauthQuotaWindowSnapshot & { remaining: number } =>
+        w.supported && typeof w.remaining === 'number' && Number.isFinite(w.remaining),
+    );
+    if (windows.length === 0) return null;
+    return Math.min(...windows.map((w) => w.remaining));
+  }
+
+  /**
+   * Sort members by descending quota remaining. Members without quota data
+   * are placed last (treated as having unknown-but-potentially-ok quota).
+   */
+  private sortMembersByQuotaRemaining(
+    members: RouteChannelCandidate['routeUnitMembers'],
+  ): RouteChannelCandidate['routeUnitMembers'] {
+    return [...members].sort((left, right) => {
+      const leftRemaining = this.resolveCodexAccountQuotaRemainingPercent(left.account);
+      const rightRemaining = this.resolveCodexAccountQuotaRemainingPercent(right.account);
+      // Both unknown → preserve stable order (account id)
+      if (leftRemaining === null && rightRemaining === null) {
+        return left.account.id - right.account.id;
+      }
+      // Unknown quota is worse than known-good quota
+      if (leftRemaining === null) return 1;
+      if (rightRemaining === null) return -1;
+      // Higher remaining is better
+      return rightRemaining - leftRemaining;
+    });
+  }
+
   private selectRouteUnitMember(
     candidate: RouteChannelCandidate,
     requestedModel: string,
@@ -3441,6 +3481,34 @@ export class TokenRouter {
       const sticky = this.getStickyPreferredRouteUnitMember(candidateMembers);
       if (sticky) return sticky;
       return this.getRoundRobinRouteUnitMembers(candidateMembers)[0] ?? null;
+    }
+
+    // Codex sticky-account mode: when enabled, prefer the last-selected codex account
+    // and only switch to another member when the current account's quota remaining
+    // falls below the configured threshold percent.
+    if (config.codexStickyAccountEnabled && eligibleMembers.length > 0) {
+      const codexMembers = candidateMembers.filter(
+        (m) => (m.account.oauthProvider || '').trim().toLowerCase() === 'codex',
+      );
+      if (codexMembers.length > 0) {
+        const sticky = this.getStickyPreferredRouteUnitMember(codexMembers);
+        if (sticky) {
+          const remaining = this.resolveCodexAccountQuotaRemainingPercent(sticky.account);
+          // Keep the sticky account when quota data is missing (conservative) or
+          // when remaining quota is at or above the threshold.
+          if (remaining === null || remaining >= config.codexStickyAccountQuotaThresholdPercent) {
+            return sticky;
+          }
+          // Quota is below threshold — switch to the member with the best quota.
+          const sorted = this.sortMembersByQuotaRemaining(codexMembers.filter((m) => m.account.id !== sticky.account.id));
+          if (sorted.length > 0) return sorted[0];
+          // All other members are ineligible (e.g. cooling down); keep sticky as last resort.
+          return sticky;
+        }
+        // No sticky preference yet — pick the member with the best quota.
+        const sorted = this.sortMembersByQuotaRemaining(codexMembers);
+        return sorted[0] ?? this.getRoundRobinRouteUnitMembers(codexMembers)[0] ?? null;
+      }
     }
 
     return this.getRoundRobinRouteUnitMembers(candidateMembers)[0] ?? null;

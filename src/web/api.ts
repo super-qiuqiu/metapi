@@ -383,6 +383,8 @@ export type RuntimeSettingsPayload = {
   payloadRules?: Record<string, unknown> | null;
   modelAvailabilityProbeEnabled?: boolean;
   codexUpstreamWebsocketEnabled?: boolean;
+  codexStickyAccountEnabled?: boolean;
+  codexStickyAccountQuotaThresholdPercent?: number;
   responsesCompactFallbackToResponsesEnabled?: boolean;
   disableCrossProtocolFallback?: boolean;
   proxySessionChannelConcurrencyLimit?: number;

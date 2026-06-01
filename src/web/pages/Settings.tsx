@@ -69,6 +69,8 @@ type RuntimeSettings = {
   logCleanupRetentionDays: number;
   modelAvailabilityProbeEnabled: boolean;
   codexUpstreamWebsocketEnabled: boolean;
+  codexStickyAccountEnabled: boolean;
+  codexStickyAccountQuotaThresholdPercent: number;
   responsesCompactFallbackToResponsesEnabled: boolean;
   disableCrossProtocolFallback: boolean;
   proxySessionChannelConcurrencyLimit: number;
@@ -351,6 +353,8 @@ export default function Settings() {
     logCleanupRetentionDays: 30,
     modelAvailabilityProbeEnabled: false,
     codexUpstreamWebsocketEnabled: false,
+    codexStickyAccountEnabled: false,
+    codexStickyAccountQuotaThresholdPercent: 10,
     responsesCompactFallbackToResponsesEnabled: false,
     disableCrossProtocolFallback: false,
     proxySessionChannelConcurrencyLimit: 2,
@@ -676,6 +680,10 @@ export default function Settings() {
           : 30,
         modelAvailabilityProbeEnabled: !!runtimeInfo.modelAvailabilityProbeEnabled,
         codexUpstreamWebsocketEnabled: !!runtimeInfo.codexUpstreamWebsocketEnabled,
+        codexStickyAccountEnabled: !!runtimeInfo.codexStickyAccountEnabled,
+        codexStickyAccountQuotaThresholdPercent: typeof runtimeInfo.codexStickyAccountQuotaThresholdPercent === 'number'
+          ? Math.trunc(runtimeInfo.codexStickyAccountQuotaThresholdPercent)
+          : 10,
         responsesCompactFallbackToResponsesEnabled: !!runtimeInfo.responsesCompactFallbackToResponsesEnabled,
         disableCrossProtocolFallback: !!runtimeInfo.disableCrossProtocolFallback,
         proxySessionChannelConcurrencyLimit: Number(runtimeInfo.proxySessionChannelConcurrencyLimit) >= 0
@@ -892,6 +900,8 @@ export default function Settings() {
     try {
       const res = await api.updateRuntimeSettings({
         codexUpstreamWebsocketEnabled: runtime.codexUpstreamWebsocketEnabled,
+        codexStickyAccountEnabled: runtime.codexStickyAccountEnabled,
+        codexStickyAccountQuotaThresholdPercent: runtime.codexStickyAccountQuotaThresholdPercent,
         responsesCompactFallbackToResponsesEnabled: runtime.responsesCompactFallbackToResponsesEnabled,
         proxySessionChannelConcurrencyLimit: runtime.proxySessionChannelConcurrencyLimit,
         proxySessionChannelQueueWaitMs: runtime.proxySessionChannelQueueWaitMs,
@@ -901,6 +911,12 @@ export default function Settings() {
         codexUpstreamWebsocketEnabled: typeof res?.codexUpstreamWebsocketEnabled === 'boolean'
           ? res.codexUpstreamWebsocketEnabled
           : prev.codexUpstreamWebsocketEnabled,
+        codexStickyAccountEnabled: typeof res?.codexStickyAccountEnabled === 'boolean'
+          ? res.codexStickyAccountEnabled
+          : prev.codexStickyAccountEnabled,
+        codexStickyAccountQuotaThresholdPercent: typeof res?.codexStickyAccountQuotaThresholdPercent === 'number'
+          ? res.codexStickyAccountQuotaThresholdPercent
+          : prev.codexStickyAccountQuotaThresholdPercent,
         responsesCompactFallbackToResponsesEnabled: typeof res?.responsesCompactFallbackToResponsesEnabled === 'boolean'
           ? res.responsesCompactFallbackToResponsesEnabled
           : prev.responsesCompactFallbackToResponsesEnabled,
@@ -1779,7 +1795,7 @@ export default function Settings() {
         <div className="card animate-slide-up stagger-4" style={settingsModernCardStyle} data-settings-card="proxy-transport">
           <div style={settingsModernHeaderStyle}>
             <div style={settingsModernTitleBlockStyle}>
-              <div style={settingsModernTitleStyle}>Codex 上游传输与会话并发</div>
+              <div style={settingsModernTitleStyle}>Codex 上游传输、粘滞账号与会话并发</div>
               <div style={settingsModernDescriptionStyle}>
                 默认采用 HTTP 优先。只有这里开启后，metapi 才会在 Codex 请求上尝试把上游升级为 WebSocket。下游 Codex 客户端也必须同时启用 `/v1/responses` websocket，单开这里不会生效。
               </div>
@@ -1790,6 +1806,9 @@ export default function Settings() {
               </span>
               <span style={getSettingsPillStyle('neutral')}>
                 {proxyTransportQueueLabel}
+              </span>
+              <span style={getSettingsPillStyle(runtime.codexStickyAccountEnabled ? 'primary' : 'neutral')}>
+                {runtime.codexStickyAccountEnabled ? '粘滞账号' : '轮询账号'}
               </span>
             </div>
           </div>
@@ -1807,6 +1826,40 @@ export default function Settings() {
               style={{ width: 16, height: 16, marginTop: 2, flexShrink: 0 }}
             />
           </label>
+          <label style={settingsModernToggleStyle}>
+            <div style={settingsModernToggleCopyStyle}>
+              <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text-secondary)' }}>Codex 粘滞账号</span>
+              <span style={{ fontSize: 12, lineHeight: 1.7, color: 'var(--color-text-muted)' }}>
+                启用后，同一 Codex 路由池将始终使用上次选中的账号，仅在额度剩余低于阈值时自动切换到额度更高的账号。适合需要保持会话上下文连续性的场景。
+              </span>
+            </div>
+            <input
+              type="checkbox"
+              checked={runtime.codexStickyAccountEnabled}
+              onChange={(e) => setRuntime((prev) => ({ ...prev, codexStickyAccountEnabled: e.target.checked }))}
+              style={{ width: 16, height: 16, marginTop: 2, flexShrink: 0 }}
+            />
+          </label>
+          <div style={{ ...settingsModernFieldCardStyle, opacity: runtime.codexStickyAccountEnabled ? 1 : 0.5, pointerEvents: runtime.codexStickyAccountEnabled ? 'auto' : 'none' }}>
+            <div style={settingsModernFieldLabelStyle}>粘滞账号额度切换阈值 (%)</div>
+            <input
+              type="number"
+              min={1}
+              max={100}
+              step={1}
+              value={runtime.codexStickyAccountQuotaThresholdPercent}
+              onChange={(e) => {
+                const v = Math.trunc(Number(e.target.value));
+                if (Number.isFinite(v) && v >= 1 && v <= 100) {
+                  setRuntime((prev) => ({ ...prev, codexStickyAccountQuotaThresholdPercent: v }));
+                }
+              }}
+              style={{ ...inputStyle, width: 80 }}
+            />
+            <span style={{ fontSize: 12, color: 'var(--color-text-muted)', marginLeft: 8 }}>
+              当账号额度剩余低于此百分比时自动切换，默认 10%
+            </span>
+          </div>
           <label style={settingsModernToggleStyle}>
             <div style={settingsModernToggleCopyStyle}>
               <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text-secondary)' }}>Compact 明确不支持时回退到普通 Responses</span>

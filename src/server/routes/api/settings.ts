@@ -60,6 +60,8 @@ interface RuntimeSettingsBody {
   payloadRules?: unknown;
   modelAvailabilityProbeEnabled?: boolean;
   codexUpstreamWebsocketEnabled?: boolean;
+  codexStickyAccountEnabled?: boolean;
+  codexStickyAccountQuotaThresholdPercent?: number;
   responsesCompactFallbackToResponsesEnabled?: boolean;
   responsesRequireContinuitySession?: boolean;
   responsesStrictPreviousResponseRecovery?: boolean;
@@ -447,6 +449,16 @@ function applyImportedSettingToRuntime(key: string, value: unknown) {
     case 'codex_upstream_websocket_enabled': {
       if (typeof value !== 'boolean') return;
       config.codexUpstreamWebsocketEnabled = value;
+      return;
+    }
+    case 'codex_sticky_account_enabled': {
+      if (typeof value !== 'boolean') return;
+      config.codexStickyAccountEnabled = value;
+      return;
+    }
+    case 'codex_sticky_account_quota_threshold_percent': {
+      if (typeof value !== 'number' || !Number.isFinite(value) || value < 1 || value > 100) return;
+      config.codexStickyAccountQuotaThresholdPercent = Math.trunc(value);
       return;
     }
     case 'responses_compact_fallback_to_responses_enabled': {
@@ -842,6 +854,8 @@ function getRuntimeSettingsResponse(currentAdminIp = '') {
     logCleanupRetentionDays: config.logCleanupRetentionDays,
     modelAvailabilityProbeEnabled: config.modelAvailabilityProbeEnabled,
     codexUpstreamWebsocketEnabled: config.codexUpstreamWebsocketEnabled,
+    codexStickyAccountEnabled: config.codexStickyAccountEnabled,
+    codexStickyAccountQuotaThresholdPercent: config.codexStickyAccountQuotaThresholdPercent,
     responsesCompactFallbackToResponsesEnabled: config.responsesCompactFallbackToResponsesEnabled,
     responsesRequireContinuitySession: config.responsesRequireContinuitySession,
     responsesStrictPreviousResponseRecovery: config.responsesStrictPreviousResponseRecovery,
@@ -1330,6 +1344,38 @@ export async function settingsRoutes(app: FastifyInstance) {
       }
       config.codexUpstreamWebsocketEnabled = nextValue;
       upsertSetting('codex_upstream_websocket_enabled', config.codexUpstreamWebsocketEnabled);
+    }
+
+    if (body.codexStickyAccountEnabled !== undefined) {
+      let nextValue = false;
+      try {
+        nextValue = parseBooleanFlag(body.codexStickyAccountEnabled, 'Codex 粘滞账号开关');
+      } catch (err: any) {
+        return reply.code(400).send({
+          success: false,
+          message: err?.message || 'Codex 粘滞账号开关格式无效',
+        });
+      }
+      if (nextValue !== config.codexStickyAccountEnabled) {
+        changedLabels.push('Codex 粘滞账号');
+      }
+      config.codexStickyAccountEnabled = nextValue;
+      upsertSetting('codex_sticky_account_enabled', config.codexStickyAccountEnabled);
+    }
+
+    if (body.codexStickyAccountQuotaThresholdPercent !== undefined) {
+      const raw = Math.trunc(Number(body.codexStickyAccountQuotaThresholdPercent));
+      if (!Number.isFinite(raw) || raw < 1 || raw > 100) {
+        return reply.code(400).send({
+          success: false,
+          message: 'Codex 粘滞账号额度阈值必须在 1–100 之间',
+        });
+      }
+      if (raw !== config.codexStickyAccountQuotaThresholdPercent) {
+        changedLabels.push('Codex 粘滞账号额度阈值');
+      }
+      config.codexStickyAccountQuotaThresholdPercent = raw;
+      upsertSetting('codex_sticky_account_quota_threshold_percent', config.codexStickyAccountQuotaThresholdPercent);
     }
 
     if (body.responsesCompactFallbackToResponsesEnabled !== undefined) {

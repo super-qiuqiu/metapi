@@ -136,6 +136,8 @@ export function buildConfig(env: NodeJS.ProcessEnv) {
     proxySessionChannelLeaseTtlMs: Math.max(5_000, Math.trunc(parseNumber(env.PROXY_SESSION_CHANNEL_LEASE_TTL_MS, 90_000))),
     proxySessionChannelLeaseKeepaliveMs: Math.max(1_000, Math.trunc(parseNumber(env.PROXY_SESSION_CHANNEL_LEASE_KEEPALIVE_MS, 15_000))),
     codexUpstreamWebsocketEnabled: parseBoolean(env.CODEX_UPSTREAM_WEBSOCKET_ENABLED, true),
+    codexStickyAccountEnabled: parseBoolean(env.CODEX_STICKY_ACCOUNT_ENABLED, false),
+    codexStickyAccountQuotaThresholdPercent: Math.max(1, Math.min(100, Math.trunc(parseNumber(env.CODEX_STICKY_ACCOUNT_QUOTA_THRESHOLD_PERCENT, 10)))),
     responsesCompactFallbackToResponsesEnabled: parseBoolean(env.RESPONSES_COMPACT_FALLBACK_TO_RESPONSES_ENABLED, false),
     responsesRequireContinuitySession: parseBoolean(env.RESPONSES_REQUIRE_CONTINUITY_SESSION, false),
     responsesStrictPreviousResponseRecovery: parseBoolean(env.RESPONSES_STRICT_PREVIOUS_RESPONSE_RECOVERY, false),
