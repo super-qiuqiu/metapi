@@ -28,6 +28,7 @@ import {
   extractUnsupportedParameterName,
 } from '../orchestration/unsupportedParameterRecovery.js';
 import { detectProxyFailure } from '../../services/proxyFailureJudge.js';
+import { isClientContinuationFailure, shouldRetryProxyRequest, shouldAbortSameSiteEndpointFallback } from '../../services/proxyRetryPolicy.js';
 import { getProxyAuthContext, getProxyResourceOwner } from '../../middleware/auth.js';
 import { normalizeInputFileBlock } from '../../transformers/shared/inputFile.js';
 import { promoteRequiredEndpointCandidateAfterProtocolError } from '../../transformers/shared/endpointCompatibility.js';
@@ -72,7 +73,6 @@ import {
 } from '../capabilities/responsesCompact.js';
 import { detectDownstreamClientContext } from '../downstreamClientContext.js';
 import { getProxyMaxChannelRetries } from '../../services/proxyChannelRetry.js';
-import { shouldAbortSameSiteEndpointFallback } from '../../services/proxyRetryPolicy.js';
 import { resolveChannelProxyUrl } from '../../services/siteProxy.js';
 import {
   acquireSurfaceChannelLease,
@@ -1027,6 +1027,29 @@ export async function handleOpenAiResponsesSurfaceRequest(
               );
               const latency = Date.now() - startTime;
 	              if (streamResult.status === 'failed') {
+                const streamErrorMessage = streamResult.errorMessage || 'stream processing failed';
+                if (isClientContinuationFailure(streamErrorMessage)) {
+                  // Client continuation errors are not channel failures —
+                  // do NOT clear sticky session or record channel failure.
+                  await failureToolkit.log({
+                    selected,
+                    modelRequested: requestedModel,
+                    status: 'failed',
+                    httpStatus: 200,
+                    isStream: true,
+                    latencyMs: latency,
+                    errorMessage: streamErrorMessage,
+                    retryCount,
+                    promptTokens: parsedUsage.promptTokens,
+                    completionTokens: parsedUsage.completionTokens,
+                    totalTokens: parsedUsage.totalTokens,
+                    upstreamPath: successfulUpstreamPath,
+                  });
+                  await finalizeDebugFailure(502, {
+                    error: { message: streamErrorMessage, type: 'stream_error' },
+                  }, successfulUpstreamPath);
+                  return;
+                }
 	                clearSurfaceStickyChannel({
 	                  stickySessionKey,
 	                  selected,
@@ -1035,7 +1058,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
 	                  selected,
 	                  requestedModel,
                   modelName,
-                  errorMessage: streamResult.errorMessage,
+                  errorMessage: streamErrorMessage,
                   latencyMs: latency,
                   retryCount,
                   promptTokens: parsedUsage.promptTokens,
@@ -1045,7 +1068,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
                 });
                 await finalizeDebugFailure(502, {
                   error: {
-                    message: streamResult.errorMessage,
+                    message: streamErrorMessage,
                     type: 'stream_error',
                   },
                 }, successfulUpstreamPath);
@@ -1082,6 +1105,32 @@ export async function handleOpenAiResponsesSurfaceRequest(
             const latency = Date.now() - startTime;
             const failure = detectProxyFailure({ rawText, usage: parsedUsage });
 	            if (failure) {
+              if (isClientContinuationFailure(rawText)) {
+                // Client continuation errors are not channel failures —
+                // do NOT clear sticky session, record failure, or cross-channel retry.
+                await failureToolkit.log({
+                  selected,
+                  modelRequested: requestedModel,
+                  status: 'failed',
+                  httpStatus: 200,
+                  isStream: true,
+                  latencyMs: latency,
+                  errorMessage: failure.reason,
+                  retryCount,
+                  promptTokens: parsedUsage.promptTokens,
+                  completionTokens: parsedUsage.completionTokens,
+                  totalTokens: parsedUsage.totalTokens,
+                  upstreamPath: successfulUpstreamPath,
+                });
+                await finalizeDebugFailure(
+                  failure.status,
+                  { error: { message: failure.reason, type: 'upstream_error' } },
+                  successfulUpstreamPath,
+                );
+                return reply.code(failure.status).send({
+                  error: { message: failure.reason, type: 'upstream_error' },
+                });
+              }
 	              clearSurfaceStickyChannel({
 	                stickySessionKey,
 	                selected,
@@ -1118,6 +1167,27 @@ export async function handleOpenAiResponsesSurfaceRequest(
             startSseResponse();
             const streamResult = streamSession.consumeUpstreamFinalPayload(upstreamData, rawText, reply.raw);
 	            if (streamResult.status === 'failed') {
+              const streamErrorMessage = streamResult.errorMessage || 'stream processing failed';
+              if (isClientContinuationFailure(streamErrorMessage)) {
+                await failureToolkit.log({
+                  selected,
+                  modelRequested: requestedModel,
+                  status: 'failed',
+                  httpStatus: 200,
+                  isStream: true,
+                  latencyMs: latency,
+                  errorMessage: streamErrorMessage,
+                  retryCount,
+                  promptTokens: parsedUsage.promptTokens,
+                  completionTokens: parsedUsage.completionTokens,
+                  totalTokens: parsedUsage.totalTokens,
+                  upstreamPath: successfulUpstreamPath,
+                });
+                await finalizeDebugFailure(502, {
+                  error: { message: streamErrorMessage, type: 'stream_error' },
+                }, successfulUpstreamPath);
+                return;
+              }
 	              clearSurfaceStickyChannel({
 	                stickySessionKey,
 	                selected,
@@ -1126,7 +1196,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
 	                selected,
 	                requestedModel,
                 modelName,
-                errorMessage: streamResult.errorMessage,
+                errorMessage: streamErrorMessage,
                 latencyMs: latency,
                 retryCount,
                 promptTokens: parsedUsage.promptTokens,
@@ -1137,7 +1207,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
               });
               await finalizeDebugFailure(502, {
                 error: {
-                  message: streamResult.errorMessage,
+                  message: streamErrorMessage,
                   type: 'stream_error',
                 },
               }, successfulUpstreamPath);
@@ -1207,11 +1277,32 @@ export async function handleOpenAiResponsesSurfaceRequest(
               );
               const latency = Date.now() - startTime;
               if (streamResult.status === 'failed') {
+                const streamErrorMessage = streamResult.errorMessage || 'stream processing failed';
+                if (isClientContinuationFailure(streamErrorMessage)) {
+                  await failureToolkit.log({
+                    selected,
+                    modelRequested: requestedModel,
+                    status: 'failed',
+                    httpStatus: 200,
+                    isStream: true,
+                    latencyMs: latency,
+                    errorMessage: streamErrorMessage,
+                    retryCount,
+                    promptTokens: parsedUsage.promptTokens,
+                    completionTokens: parsedUsage.completionTokens,
+                    totalTokens: parsedUsage.totalTokens,
+                    upstreamPath: successfulUpstreamPath,
+                  });
+                  await finalizeDebugFailure(502, {
+                    error: { message: streamErrorMessage, type: 'stream_error' },
+                  }, successfulUpstreamPath);
+                  return;
+                }
                 await failureToolkit.recordStreamFailure({
                   selected,
                   requestedModel,
                   modelName,
-                  errorMessage: streamResult.errorMessage,
+                  errorMessage: streamErrorMessage,
                   latencyMs: latency,
                   retryCount,
                   promptTokens: parsedUsage.promptTokens,
@@ -1222,7 +1313,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
                 });
                 await finalizeDebugFailure(502, {
                   error: {
-                    message: streamResult.errorMessage,
+                    message: streamErrorMessage,
                     type: 'stream_error',
                   },
                 }, successfulUpstreamPath);
@@ -1269,6 +1360,27 @@ export async function handleOpenAiResponsesSurfaceRequest(
 
           const latency = Date.now() - startTime;
 	          if (streamResult.status === 'failed') {
+            const streamErrorMessage = streamResult.errorMessage || 'stream processing failed';
+            if (isClientContinuationFailure(streamErrorMessage)) {
+              await failureToolkit.log({
+                selected,
+                modelRequested: requestedModel,
+                status: 'failed',
+                httpStatus: 200,
+                isStream: true,
+                latencyMs: latency,
+                errorMessage: streamErrorMessage,
+                retryCount,
+                promptTokens: parsedUsage.promptTokens,
+                completionTokens: parsedUsage.completionTokens,
+                totalTokens: parsedUsage.totalTokens,
+                upstreamPath: successfulUpstreamPath,
+              });
+              await finalizeDebugFailure(502, {
+                error: { message: streamErrorMessage, type: 'stream_error' },
+              }, successfulUpstreamPath);
+              return;
+            }
 	            clearSurfaceStickyChannel({
 	              stickySessionKey,
 	              selected,
@@ -1277,7 +1389,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
 	              selected,
 	              requestedModel,
               modelName,
-              errorMessage: streamResult.errorMessage,
+              errorMessage: streamErrorMessage,
               latencyMs: latency,
               retryCount,
               promptTokens: parsedUsage.promptTokens,
@@ -1288,7 +1400,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
             });
             await finalizeDebugFailure(502, {
               error: {
-                message: streamResult.errorMessage,
+                message: streamErrorMessage,
                 type: 'stream_error',
               },
             }, successfulUpstreamPath);
@@ -1350,6 +1462,32 @@ export async function handleOpenAiResponsesSurfaceRequest(
         const upstreamUsagePresent = hasProxyUsagePayload(upstreamData);
         const failure = detectProxyFailure({ rawText, usage: parsedUsage });
 	        if (failure) {
+          if (isClientContinuationFailure(rawText)) {
+            // Client continuation errors are not channel failures —
+            // do NOT clear sticky session, record failure, or cross-channel retry.
+            await failureToolkit.log({
+              selected,
+              modelRequested: requestedModel,
+              status: 'failed',
+              httpStatus: 200,
+              isStream: false,
+              latencyMs: latency,
+              errorMessage: failure.reason,
+              retryCount,
+              promptTokens: parsedUsage.promptTokens,
+              completionTokens: parsedUsage.completionTokens,
+              totalTokens: parsedUsage.totalTokens,
+              upstreamPath: successfulUpstreamPath,
+            });
+            await finalizeDebugFailure(
+              failure.status,
+              { error: { message: failure.reason, type: 'upstream_error' } },
+              successfulUpstreamPath,
+            );
+            return reply.code(failure.status).send({
+              error: { message: failure.reason, type: 'upstream_error' },
+            });
+          }
 	          clearSurfaceStickyChannel({
 	            stickySessionKey,
 	            selected,
@@ -1459,13 +1597,35 @@ export async function handleOpenAiResponsesSurfaceRequest(
             || (endpointFailureStatus !== null && endpointFailureStatus >= 500)
           );
           if (isSiteApiEndpointFailure) {
+            const responseErrorText = err?.rawErrText || err?.message || 'unknown error';
+            if (isClientContinuationFailure(responseErrorText)) {
+              // Client continuation errors are not channel failures —
+              // do NOT clear sticky session, record failure, or cross-channel retry.
+              await failureToolkit.log({
+                selected,
+                modelRequested: requestedModel,
+                status: 'failed',
+                httpStatus: endpointFailureStatus || 502,
+                latencyMs: Date.now() - startTime,
+                errorMessage: err?.message || 'unknown error',
+                retryCount,
+              });
+              await finalizeDebugFailure(
+                endpointFailureStatus || 502,
+                { error: { message: err?.message || 'unknown error', type: 'upstream_error' } },
+                null,
+              );
+              return reply.code(endpointFailureStatus || 502).send({
+                error: { message: err?.message || 'unknown error', type: 'upstream_error' },
+              });
+            }
             const failureOutcome = await failureToolkit.handleUpstreamFailure({
               selected,
           requestedModel,
           modelName,
           status: endpointFailureStatus || 502,
           errText: err?.message || 'unknown error',
-          rawErrText: err?.rawErrText || err?.message || 'unknown error',
+          rawErrText: responseErrorText,
           isStream,
           latencyMs: Date.now() - startTime,
           retryCount,
@@ -1496,9 +1656,11 @@ export async function handleOpenAiResponsesSurfaceRequest(
             retryCount,
           });
           const terminalFailureOutcome = failureOutcome.action === 'retry'
-            ? (canRetryChannelSelection(retryCount, forcedChannelId)
-              ? null
-              : finalizeRetryAsExecutionFailure(err?.message || 'network failure'))
+            ? (isClientContinuationFailure(err?.message || 'network failure')
+              ? finalizeRetryAsExecutionFailure(err?.message || 'network failure')
+              : (canRetryChannelSelection(retryCount, forcedChannelId)
+                ? null
+                : finalizeRetryAsExecutionFailure(err?.message || 'network failure')))
             : failureOutcome;
           if (!terminalFailureOutcome) {
             retryCount += 1;

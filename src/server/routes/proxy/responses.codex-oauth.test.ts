@@ -1,3 +1,9 @@
+/**
+ * @vitest-environment node
+ */
+// Force HTTP path for codex upstream — the websocket path requires a real WS server.
+process.env.CODEX_UPSTREAM_WEBSOCKET_ENABLED = 'false';
+
 import { zstdCompressSync } from 'node:zlib';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -27,6 +33,7 @@ const originalProxyEmptyContentFailEnabled = config.proxyEmptyContentFailEnabled
 const originalProxyStickySessionEnabled = config.proxyStickySessionEnabled;
 const originalProxySessionChannelConcurrencyLimit = config.proxySessionChannelConcurrencyLimit;
 const originalProxySessionChannelQueueWaitMs = config.proxySessionChannelQueueWaitMs;
+const originalCodexUpstreamWebsocketEnabled = config.codexUpstreamWebsocketEnabled;
 const dbInsertMock = vi.fn((_arg?: any) => ({
   values: (values: Record<string, unknown>) => {
     insertedProxyLogs.push(values);
@@ -76,6 +83,15 @@ vi.mock('../../services/modelPricingService.js', () => ({
 }));
 
 vi.mock('../../services/proxyRetryPolicy.js', () => ({
+  isClientContinuationFailure: (text: string | null | undefined) => {
+    const t = (text || '').trim().toLowerCase();
+    if (!t) return false;
+    return /context\s*window/i.test(t) || t.includes('exceeds the context')
+      || t.includes('previous_response_not_found') || /previous\s+response.*not\s+found/i.test(t)
+      || t.includes('missing required parameter') || t.includes('[objectparam]')
+      || t.includes('tool-output-only continuation cannot be safely replayed')
+      || t.includes('unable to safely recover continuation');
+  },
   shouldRetryProxyRequest: () => false,
   shouldAbortSameSiteEndpointFallback: () => false,
   RETRYABLE_TIMEOUT_PATTERNS: [/(request timed out|connection timed out|read timeout|\btimed out\b)/i],
@@ -186,6 +202,7 @@ describe('responses proxy codex oauth refresh', () => {
   beforeEach(() => {
     resetCodexHttpSessionQueue();
     resetCodexSessionResponseStore();
+    config.codexUpstreamWebsocketEnabled = false;
     config.proxyEmptyContentFailEnabled = false;
     config.proxyStickySessionEnabled = originalProxyStickySessionEnabled;
     config.proxySessionChannelConcurrencyLimit = originalProxySessionChannelConcurrencyLimit;
@@ -237,6 +254,7 @@ describe('responses proxy codex oauth refresh', () => {
   });
 
   afterAll(async () => {
+    config.codexUpstreamWebsocketEnabled = originalCodexUpstreamWebsocketEnabled;
     config.proxyEmptyContentFailEnabled = originalProxyEmptyContentFailEnabled;
     config.proxyStickySessionEnabled = originalProxyStickySessionEnabled;
     config.proxySessionChannelConcurrencyLimit = originalProxySessionChannelConcurrencyLimit;
@@ -881,6 +899,36 @@ describe('responses proxy codex oauth refresh', () => {
         output: '{"ok":true}',
       },
     ]);
+  });
+
+  it('does not retry codex responses requests across channels for continuation context errors', async () => {
+    // Context-window errors arrive inside a streaming response (response.failed),
+    // not as a non-stream 400.  The proxy must log the failure but NOT record
+    // a channel failure or clear the sticky session.
+    fetchMock.mockResolvedValueOnce(createSseResponse([
+      'event: response.created\n',
+      'data: {"type":"response.created","response":{"id":"resp_ctx_win","model":"gpt-5.4","created_at":1706000000,"status":"in_progress","output":[]}}\n\n',
+      'event: response.failed\n',
+      'data: {"type":"response.failed","response":{"id":"resp_ctx_win","model":"gpt-5.4","status":"failed","error":{"message":"Your input exceeds the context window of this model. Please adjust your input and try again.","code":"context_window_exceeded"}}}\n\n',
+      'data: [DONE]\n\n',
+    ]));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      payload: {
+        model: 'gpt-5.4',
+        input: 'hello codex',
+        stream: true,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain('response.failed');
+    expect(response.body).toContain('context_window');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    // Continuation/context errors are NOT channel failures — must not penalize.
+    expect(recordFailureMock).not.toHaveBeenCalled();
   });
 
   it('drops stale previous_response_id and retries codex responses requests once', async () => {

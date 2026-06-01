@@ -42,6 +42,17 @@ const RETRYABLE_CHANNEL_LOCAL_PATTERNS: RegExp[] = [
   ...RETRYABLE_TIMEOUT_PATTERNS,
 ];
 
+const CLIENT_CONTINUATION_FAILURE_PATTERNS: RegExp[] = [
+  /previous_response_not_found/i,
+  /previous\s+response.*not\s+found/i,
+  /exceeds\s+the\s+context/i,
+  /context\s*window/i,
+  /missing\s+required\s+parameter/i,
+  /\[objectparam\]/i,
+  /tool-output-only continuation cannot be safely replayed/i,
+  /unable to safely recover continuation/i,
+];
+
 const NON_RETRYABLE_REQUEST_PATTERNS: RegExp[] = [
   /invalid\s+request\s+body/i,
   /validation/i,
@@ -84,7 +95,19 @@ function matchesAnyPattern(patterns: RegExp[], rawMessage?: string | null): bool
   return patterns.some((pattern) => pattern.test(text));
 }
 
+/**
+ * Returns true if the error text indicates a client continuation/context failure
+ * that is NOT a channel failure. These should not trigger cross-channel retry,
+ * sticky session clearing, or channel failure recording.
+ */
+export function isClientContinuationFailure(errorText: string | null | undefined): boolean {
+  return matchesAnyPattern(CLIENT_CONTINUATION_FAILURE_PATTERNS, errorText);
+}
+
 export function shouldRetryProxyRequest(status: number, upstreamErrorText?: string | null): boolean {
+  // Client continuation/context errors must never be retried on a different channel —
+  // the error is caused by stale conversation state, not a bad channel.
+  if (matchesAnyPattern(CLIENT_CONTINUATION_FAILURE_PATTERNS, upstreamErrorText)) return false;
   if (status >= 500) return true;
   if (status === 408 || status === 409 || status === 425 || status === 429) return true;
   if (status === 401 || status === 403) return true;
