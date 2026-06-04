@@ -655,6 +655,8 @@ function mapProxyLogRow(
     ...row.proxy_logs,
     isStream:
       row.proxy_logs.isStream == null ? null : Boolean(row.proxy_logs.isStream),
+    downstreamTransport: row.proxy_logs.downstreamTransport ?? null,
+    upstreamTransport: row.proxy_logs.upstreamTransport ?? null,
     firstByteLatencyMs:
       typeof row.proxy_logs.firstByteLatencyMs === "number"
         ? row.proxy_logs.firstByteLatencyMs

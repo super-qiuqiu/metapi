@@ -1459,6 +1459,18 @@
           "notNull": false,
           "defaultValue": null,
           "primaryKey": false
+        },
+        "downstream_transport": {
+          "logicalType": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "upstream_transport": {
+          "logicalType": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
         }
       }
     },

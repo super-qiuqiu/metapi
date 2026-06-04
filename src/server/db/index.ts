@@ -75,6 +75,7 @@ let proxyLogFtsAvailable: boolean | null = null;
 let proxyLogDownstreamApiKeyIdColumnAvailable: boolean | null = null;
 let proxyLogClientColumnsAvailable: boolean | null = null;
 let proxyLogStreamTimingColumnsAvailable: boolean | null = null;
+let proxyLogTransportColumnsAvailable: boolean | null = null;
 
 const DB_ERROR_LOG_MAX_LEN = 280;
 
@@ -842,6 +843,21 @@ function ensureProxyLogStreamTimingSchema() {
   proxyLogStreamTimingColumnsAvailable = true;
 }
 
+function ensureProxyLogTransportSchema() {
+  if (!tableExists('proxy_logs')) {
+    return;
+  }
+
+  if (!tableColumnExists('proxy_logs', 'downstream_transport')) {
+    execSqliteLegacyCompat('ALTER TABLE proxy_logs ADD COLUMN downstream_transport text;');
+  }
+  if (!tableColumnExists('proxy_logs', 'upstream_transport')) {
+    execSqliteLegacyCompat('ALTER TABLE proxy_logs ADD COLUMN upstream_transport text;');
+  }
+
+  proxyLogTransportColumnsAvailable = true;
+}
+
 function normalizeSchemaErrorMessage(error: unknown): string {
   if (typeof error === 'object' && error && 'message' in error) {
     return String((error as { message?: unknown }).message || '');
@@ -1262,11 +1278,107 @@ export async function ensureProxyLogStreamTimingColumns(): Promise<boolean> {
   }
 }
 
+export async function hasProxyLogTransportColumns(): Promise<boolean> {
+  if (proxyLogTransportColumnsAvailable !== null) {
+    return proxyLogTransportColumnsAvailable;
+  }
+
+  const requiredColumns = ['downstream_transport', 'upstream_transport'];
+
+  if (runtimeDbDialect === 'sqlite') {
+    proxyLogTransportColumnsAvailable = tableExists('proxy_logs')
+      && requiredColumns.every((columnName) => tableColumnExists('proxy_logs', columnName));
+    return proxyLogTransportColumnsAvailable;
+  }
+
+  if (runtimeDbDialect === 'mysql') {
+    if (!mysqlPool) return false;
+    const [rows] = await mysqlPool.query(
+      'SELECT column_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name IN (?, ?)',
+      ['proxy_logs', ...requiredColumns],
+    ) as [Array<{ column_name?: string }>, unknown];
+    const available = new Set(
+      Array.isArray(rows)
+        ? rows.map((row) => String(row?.column_name || '').trim().toLowerCase()).filter(Boolean)
+        : [],
+    );
+    proxyLogTransportColumnsAvailable = requiredColumns.every((columnName) => available.has(columnName));
+    return proxyLogTransportColumnsAvailable;
+  }
+
+  if (!pgPool) return false;
+  const result = await pgPool.query(
+    'SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1 AND column_name = ANY($2::text[])',
+    ['proxy_logs', requiredColumns],
+  );
+  const available = new Set(
+    result.rows.map((row) => String((row as { column_name?: string }).column_name || '').trim().toLowerCase()).filter(Boolean),
+  );
+  proxyLogTransportColumnsAvailable = requiredColumns.every((columnName) => available.has(columnName));
+  return proxyLogTransportColumnsAvailable;
+}
+
+export async function ensureProxyLogTransportColumns(): Promise<boolean> {
+  const requiredColumns = [
+    { name: 'downstream_transport', sqliteType: 'text', mysqlType: 'TEXT NULL', postgresType: 'TEXT' },
+    { name: 'upstream_transport', sqliteType: 'text', mysqlType: 'TEXT NULL', postgresType: 'TEXT' },
+  ];
+
+  if (runtimeDbDialect === 'sqlite') {
+    ensureProxyLogTransportSchema();
+    proxyLogTransportColumnsAvailable = tableExists('proxy_logs')
+      && requiredColumns.every((column) => tableColumnExists('proxy_logs', column.name));
+    return proxyLogTransportColumnsAvailable;
+  }
+
+  if (await hasProxyLogTransportColumns()) {
+    return true;
+  }
+
+  try {
+    if (runtimeDbDialect === 'mysql') {
+      if (!mysqlPool) return false;
+      for (const column of requiredColumns) {
+        const [rows] = await mysqlPool.query('SHOW COLUMNS FROM `proxy_logs` LIKE ?', [column.name]);
+        if (Array.isArray(rows) && rows.length > 0) continue;
+        await executeLegacyCompat(
+          (statement) => mysqlPool!.query(statement).then(() => undefined),
+          `ALTER TABLE \`proxy_logs\` ADD COLUMN \`${column.name}\` ${column.mysqlType}`,
+        );
+      }
+    } else {
+      if (!pgPool) return false;
+      for (const column of requiredColumns) {
+        const result = await pgPool.query(
+          'SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2 LIMIT 1',
+          ['proxy_logs', column.name],
+        );
+        if (Number(result.rowCount || 0) > 0) continue;
+        await executeLegacyCompat(
+          (statement) => pgPool!.query(statement).then(() => undefined),
+          `ALTER TABLE "proxy_logs" ADD COLUMN "${column.name}" ${column.postgresType}`,
+        );
+      }
+    }
+    proxyLogTransportColumnsAvailable = true;
+    return true;
+  } catch (error) {
+    if (isDuplicateColumnError(error)) {
+      proxyLogTransportColumnsAvailable = await hasProxyLogTransportColumns();
+      return proxyLogTransportColumnsAvailable;
+    }
+    proxyLogTransportColumnsAvailable = false;
+    console.warn(`[db] failed to ensure proxy_logs transport columns: ${formatDbError(error)}`);
+    return false;
+  }
+}
+
 function resetSchemaCapabilityCache() {
   proxyLogBillingDetailsColumnAvailable = null;
   proxyLogDownstreamApiKeyIdColumnAvailable = null;
   proxyLogClientColumnsAvailable = null;
   proxyLogStreamTimingColumnsAvailable = null;
+  proxyLogTransportColumnsAvailable = null;
 }
 
 async function sqliteProxyQuery(sqlText: string, params: unknown[], method: SqlMethod) {
@@ -1560,6 +1672,7 @@ function initSqliteDb() {
   ensureProxyLogBillingDetailsSchema();
   ensureProxyLogClientSchema();
   ensureProxyLogFtsSchema();
+  ensureProxyLogTransportSchema();
   ensureProxyVideoTaskSchema();
   ensureProxyFileSchema();
 
