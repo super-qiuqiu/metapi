@@ -526,6 +526,12 @@ export default function Dashboard({
   const proxy24hSuccess = safeNumber(data?.proxy24h?.success);
   const proxy24hTotal = safeNumber(data?.proxy24h?.total);
   const totalTokens = safeNumber(data?.proxy24h?.totalTokens);
+  const proxy24hSuccessRate = proxy24hTotal > 0
+    ? Math.round((proxy24hSuccess / proxy24hTotal) * 100)
+    : 0;
+  const checkinSuccessRate = todayTotal > 0
+    ? Math.round((todaySuccess / todayTotal) * 100)
+    : 0;
   const performanceWindowSeconds = Math.max(
     1,
     safeNumber(data?.performance?.windowSeconds) || 60,
@@ -546,6 +552,7 @@ export default function Dashboard({
   const siteAvailability = showInactiveSites
     ? [...activeSites, ...inactiveSites]
     : activeSites;
+  const observedSiteCount = activeSites.length;
 
   const getLatencyColor = (ms: number) =>
     ms <= 500
@@ -596,19 +603,39 @@ export default function Dashboard({
   };
 
   return (
-    <div className="animate-fade-in">
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          marginBottom: 24,
-        }}
-      >
-        <h2 className="greeting">
-          {getGreeting() + "\uFF0C" + normalizedAdminName}
-        </h2>
-        <div style={{ display: "flex", gap: 8 }}>
+    <div className="dashboard-page animate-fade-in">
+      <section className="dashboard-hero animate-slide-up stagger-1">
+        <div className="dashboard-hero-orb dashboard-hero-orb-primary" />
+        <div className="dashboard-hero-orb dashboard-hero-orb-secondary" />
+        <div className="dashboard-hero-main">
+          <div className="dashboard-eyebrow">实时运营看板</div>
+          <h2 className="greeting dashboard-hero-title">
+            {getGreeting() + "\uFF0C" + normalizedAdminName}
+          </h2>
+          <p className="dashboard-hero-subtitle">
+            余额、请求、签到与站点健康集中监控，数据每 30 秒自动刷新。
+          </p>
+          <div className="dashboard-hero-pills" aria-label="仪表盘摘要">
+            <span>24h 请求 {Math.round(proxy24hTotal).toLocaleString()}</span>
+            <span>成功率 {proxy24hSuccessRate}%</span>
+            <span>监控站点 {observedSiteCount}</span>
+          </div>
+        </div>
+        <div className="dashboard-hero-side">
+          <div className="dashboard-hero-metrics">
+            <div className="dashboard-hero-metric dashboard-hero-metric-primary">
+              <span>当前余额</span>
+              <strong>${totalBalance.toFixed(2)}</strong>
+            </div>
+            <div className="dashboard-hero-metric">
+              <span>活跃账户</span>
+              <strong>{Math.round(activeAccounts)}/{Math.round(totalAccounts)}</strong>
+            </div>
+            <div className="dashboard-hero-metric">
+              <span>签到完成</span>
+              <strong>{checkinSuccessRate}%</strong>
+            </div>
+          </div>
           <button
             onClick={() => {
               void load(true);
@@ -636,9 +663,10 @@ export default function Dashboard({
                 d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
               />
             </svg>
+            <span>{refreshing ? "刷新中" : "刷新数据"}</span>
           </button>
         </div>
-      </div>
+      </section>
 
       <div className="dashboard-stat-grid">
         <div className="stat-card animate-slide-up stagger-1">
@@ -909,10 +937,7 @@ export default function Dashboard({
             <div className="dashboard-stat-content">
               <div className="stat-label">成功率</div>
               <div className="stat-value animate-count-up">
-                {todayTotal > 0
-                  ? Math.round((todaySuccess / todayTotal) * 100)
-                  : 0}
-                %
+                {checkinSuccessRate}%
               </div>
             </div>
           </div>
@@ -984,6 +1009,141 @@ export default function Dashboard({
               </div>
             </div>
           </div>
+        </div>
+      </div>
+
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr",
+          gap: 16,
+          marginBottom: 16,
+        }}
+      >
+        <div
+          className="chart-container site-observability-panel animate-slide-up stagger-7"
+          style={{ gridColumn: isMobile ? undefined : "1 / -1" }}
+        >
+          <div className="site-observability-header">
+            <div>
+              <div className="site-observability-title">
+                站点可用性观测
+                <span className="site-observability-count-badge">
+                  {siteAvailability.length}
+                </span>
+              </div>
+              <div className="site-observability-subtitle">
+                最近 24 小时按小时聚合，点击色块可直达对应日志。
+              </div>
+            </div>
+            {inactiveSites.length > 0 && (
+              <button
+                type="button"
+                className="site-observability-toggle-btn"
+                onClick={() => setShowInactiveSites((value) => !value)}
+              >
+                {showInactiveSites ? "隐藏无流量" : `显示无流量 ${inactiveSites.length}`}
+              </button>
+            )}
+          </div>
+          <div className="site-observability-legend">
+            <span className="site-observability-legend-text">低</span>
+            <span
+              className="site-observability-legend-chip"
+              style={{ background: getAvailabilityColor(0) }}
+            />
+            <span
+              className="site-observability-legend-chip"
+              style={{ background: getAvailabilityColor(50) }}
+            />
+            <span
+              className="site-observability-legend-chip"
+              style={{ background: getAvailabilityColor(100) }}
+            />
+            <span className="site-observability-legend-text">高</span>
+          </div>
+          {siteAvailability.length > 0 ? (
+            <div className="site-observability-grid">
+              {siteAvailability.map((site) => (
+                <div
+                  key={site.siteId}
+                  className={`site-observability-card${site.totalRequests > 0 ? "" : " site-observability-card--inactive"}`}
+                >
+                  <div className="site-observability-card-top">
+                    <div className="site-observability-card-title">
+                      <span className="site-observability-site-name">
+                        {site.siteName}
+                      </span>
+                    </div>
+                    <Link
+                      to={buildSiteLast24hLogsRoute(site.siteId)}
+                      className="site-observability-log-link-compact site-observability-log-link"
+                      title="查看日志"
+                    >
+                      <svg
+                        width="14"
+                        height="14"
+                        fill="none"
+                        viewBox="0 0 24 24"
+                        stroke="currentColor"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414A1 1 0 0119 9.414V19a2 2 0 01-2 2z"
+                        />
+                      </svg>
+                    </Link>
+                  </div>
+                  <div className="site-observability-card-metrics">
+                    <span
+                      className="site-observability-metric-main"
+                      style={{ color: getAvailabilityColor(site.availabilityPercent) }}
+                    >
+                      {formatAvailabilityPercent(site.availabilityPercent)}
+                    </span>
+                    <span className="site-observability-metric-sep">/</span>
+                    <span>{site.averageLatencyMs == null ? "—" : `${Math.round(site.averageLatencyMs)}ms`}</span>
+                    <span className="site-observability-metric-sep">/</span>
+                    <span>{Math.round(site.successCount)}/{Math.round(site.totalRequests)}</span>
+                  </div>
+                  <div className="site-availability-strip-compact">
+                    {site.buckets.map((bucket, index) => {
+                      const tooltip = [
+                        `时间：${formatAvailabilityBucketLabel(bucket)}`,
+                        `可用性：${formatAvailabilityPercent(bucket.availabilityPercent)}`,
+                        `成功/失败：${Math.round(bucket.successCount)}/${Math.round(bucket.failedCount)}`,
+                        `平均延迟：${bucket.averageLatencyMs == null ? "—" : `${Math.round(bucket.averageLatencyMs)}ms`}`,
+                      ].join("\n");
+                      return (
+                        <Link
+                          key={`${bucket.label}-${index}`}
+                          to={buildAvailabilityBucketLogsRoute(site.siteId, bucket)}
+                          className="site-availability-cell"
+                          title={`${formatAvailabilityBucketLabel(bucket)} · 可用性 ${formatAvailabilityPercent(bucket.availabilityPercent)}`}
+                          data-tooltip={tooltip}
+                          data-tooltip-preserve-lines="true"
+                          data-tooltip-compact="true"
+                          style={{
+                            background: getAvailabilityColor(bucket.availabilityPercent),
+                            opacity: bucket.totalRequests > 0 ? 1 : 0.28,
+                          }}
+                        />
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="site-observability-empty">
+              <div className="site-observability-empty-title">暂无站点可用性数据</div>
+              <div className="site-observability-empty-note">
+                有代理请求后会展示每小时可用性与延迟热力条。
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
