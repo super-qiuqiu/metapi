@@ -35,6 +35,7 @@ export function createCodexWebsocketSessionStore(): CodexWebsocketSessionStore {
         socket: null,
         socketUrl: null,
         readLoopSocket: null,
+        heartbeatTimer: null,
         activeRequest: null,
         queue: Promise.resolve(),
         upstreamDisconnect: createDisconnectSignal(),
@@ -49,6 +50,10 @@ export function createCodexWebsocketSessionStore(): CodexWebsocketSessionStore {
       if (!normalized) return null;
       const existing = sessions.get(normalized) || null;
       if (existing) {
+        if (existing.heartbeatTimer) {
+          clearInterval(existing.heartbeatTimer);
+          existing.heartbeatTimer = null;
+        }
         sessions.delete(normalized);
       }
       return existing;

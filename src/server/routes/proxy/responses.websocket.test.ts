@@ -18,6 +18,7 @@ const consumeManagedKeyRequestMock = vi.fn();
 const refreshModelsAndRebuildRoutesMock = vi.fn();
 const reportProxyAllFailedMock = vi.fn();
 const reportTokenExpiredMock = vi.fn();
+const shouldRetryProxyRequestMock = vi.fn();
 const resolveProxyUsageWithSelfLogFallbackMock = vi.fn(async ({ usage }: any) => ({
   ...usage,
   estimatedCostFromQuota: 0,
@@ -86,7 +87,10 @@ vi.mock('../../services/modelPricingService.js', () => ({
 }));
 
 vi.mock('../../services/proxyRetryPolicy.js', () => ({
-  shouldRetryProxyRequest: () => false,
+  isClientContinuationFailure: () => false,
+  isContextWindowExceededRetryPolicy: () => false,
+  isPreviousResponseNotFoundError: () => false,
+  shouldRetryProxyRequest: (...args: unknown[]) => shouldRetryProxyRequestMock(...args),
   shouldAbortSameSiteEndpointFallback: () => false,
   RETRYABLE_TIMEOUT_PATTERNS: [/(request timed out|connection timed out|read timeout|\btimed out\b)/i],
 }));
@@ -124,6 +128,7 @@ vi.mock('../../db/index.js', () => ({
   hasProxyLogClientColumns: async () => false,
   hasProxyLogDownstreamApiKeyIdColumn: async () => false,
   hasProxyLogStreamTimingColumns: async () => false,
+  hasProxyLogTransportColumns: async () => false,
   schema: {
     proxyLogs: {},
     siteApiEndpoints: {
@@ -153,6 +158,9 @@ function createSelectedChannel(options?: {
   siteName?: string;
   siteUrl?: string;
   sitePlatform?: string;
+  channelId?: number;
+  routeId?: number;
+  accountId?: number;
   username?: string;
   extraConfig?: unknown;
   tokenValue?: string;
@@ -161,7 +169,7 @@ function createSelectedChannel(options?: {
   const sitePlatform = options?.sitePlatform ?? 'codex';
   const isCodex = sitePlatform === 'codex';
   return {
-    channel: { id: 11, routeId: 22 },
+    channel: { id: options?.channelId ?? 11, routeId: options?.routeId ?? 22 },
     site: {
       id: 44,
       name: options?.siteName ?? (isCodex ? 'codex-site' : 'openai-site'),
@@ -169,7 +177,7 @@ function createSelectedChannel(options?: {
       platform: sitePlatform,
     },
     account: {
-      id: 33,
+      id: options?.accountId ?? 33,
       username: options?.username ?? (isCodex ? 'codex-user@example.com' : 'openai-user@example.com'),
       extraConfig: options?.extraConfig ?? (isCodex
         ? JSON.stringify({
@@ -304,6 +312,7 @@ function createClientSocketForPath(path: string, headers: Record<string, string>
 describe('responses websocket transport', () => {
   const originalCodexResponsesWebsocketBeta = config.codexResponsesWebsocketBeta;
   const originalCodexUpstreamWebsocketEnabled = config.codexUpstreamWebsocketEnabled;
+  const originalCodexUpstreamWebsocketSameAccountRetries = config.codexUpstreamWebsocketSameAccountRetries;
   const originalResponsesRequireContinuitySession = config.responsesRequireContinuitySession;
   const originalResponsesStrictPreviousResponseRecovery = config.responsesStrictPreviousResponseRecovery;
   let app: FastifyInstance;
@@ -320,6 +329,7 @@ describe('responses websocket transport', () => {
   let rejectedUpgradeStatus: number;
   let rejectedUpgradeStatusText: string;
   let rejectedUpgradeBody: string;
+  let rejectedUpgradeCount: number;
 
   beforeAll(async () => {
     const { responsesProxyRoute } = await import('./responses.js');
@@ -353,6 +363,7 @@ describe('responses websocket transport', () => {
 
     rejectedUpgradeServer = createServer();
     rejectedUpgradeServer.on('upgrade', (_request, socket) => {
+      rejectedUpgradeCount += 1;
       const body = rejectedUpgradeBody;
       socket.write(
         `HTTP/1.1 ${rejectedUpgradeStatus} ${rejectedUpgradeStatusText}\r\n`
@@ -383,6 +394,7 @@ describe('responses websocket transport', () => {
     refreshModelsAndRebuildRoutesMock.mockReset();
     reportProxyAllFailedMock.mockReset();
     reportTokenExpiredMock.mockReset();
+    shouldRetryProxyRequestMock.mockReset();
     resolveProxyUsageWithSelfLogFallbackMock.mockClear();
     dbInsertMock.mockClear();
     siteApiEndpointRows = [];
@@ -392,16 +404,19 @@ describe('responses websocket transport', () => {
     selectNextChannelMock.mockReturnValue(null);
     selectPreferredChannelMock.mockReturnValue(null);
     previewSelectedChannelMock.mockResolvedValue(selectedChannel);
+    shouldRetryProxyRequestMock.mockReturnValue(false);
     upstreamConnectionCount = 0;
     upstreamUpgradeHeaders = {};
     upstreamRequests = [];
     (config as any).codexResponsesWebsocketBeta = originalCodexResponsesWebsocketBeta;
     (config as any).codexUpstreamWebsocketEnabled = true;
+    (config as any).codexUpstreamWebsocketSameAccountRetries = originalCodexUpstreamWebsocketSameAccountRetries;
     (config as any).responsesRequireContinuitySession = false;
     (config as any).responsesStrictPreviousResponseRecovery = false;
     rejectedUpgradeStatus = 426;
     rejectedUpgradeStatusText = 'Upgrade Required';
     rejectedUpgradeBody = 'Upgrade Required';
+    rejectedUpgradeCount = 0;
     authorizeDownstreamTokenMock.mockResolvedValue({
       ok: true,
       source: 'global',
@@ -444,6 +459,7 @@ describe('responses websocket transport', () => {
 
   afterAll(async () => {
     (config as any).codexUpstreamWebsocketEnabled = originalCodexUpstreamWebsocketEnabled;
+    (config as any).codexUpstreamWebsocketSameAccountRetries = originalCodexUpstreamWebsocketSameAccountRetries;
     (config as any).responsesRequireContinuitySession = originalResponsesRequireContinuitySession;
     (config as any).responsesStrictPreviousResponseRecovery = originalResponsesStrictPreviousResponseRecovery;
     for (const socket of trackedClientSockets) {
@@ -1135,6 +1151,45 @@ describe('responses websocket transport', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(message?.type).toBe('response.completed');
     expect(message?.response?.id).toBe('resp_http_fallback_401');
+  });
+
+  it('retries codex websocket on the same account before switching channel when upgrade returns HTTP 200 without switching protocols', async () => {
+    rejectedUpgradeStatus = 200;
+    rejectedUpgradeStatusText = 'OK';
+    rejectedUpgradeBody = 'Expected 101 status code';
+    shouldRetryProxyRequestMock.mockImplementation((status: number) => status >= 500);
+    const failedChannel = createSelectedChannel({
+      siteUrl: rejectedUpgradeSiteUrl,
+      channelId: 11,
+      accountId: 33,
+    });
+    const recoveredChannel = createSelectedChannel({
+      siteUrl: upstreamSiteUrl,
+      channelId: 12,
+      accountId: 34,
+      username: 'codex-recovered@example.com',
+    });
+    selectChannelMock.mockReturnValue(failedChannel);
+    selectNextChannelMock.mockReturnValue(recoveredChannel);
+    previewSelectedChannelMock.mockResolvedValue(failedChannel);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      payload: {
+        model: 'gpt-5.4',
+        input: [],
+        stream: true,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain('response.completed');
+    expect(rejectedUpgradeCount).toBe(2);
+    expect(selectNextChannelMock).toHaveBeenCalledTimes(1);
+    expect(recordFailureMock).toHaveBeenCalledWith(11, expect.objectContaining({ status: 502 }));
+    expect(recordSuccessMock).toHaveBeenCalledWith(12, expect.any(Number), 0, 'gpt-5.4', undefined, expect.any(Object));
+    expect(upstreamConnectionCount).toBe(1);
   });
 
   it('treats response.incomplete as a terminal HTTP fallback event instead of appending a websocket error', async () => {

@@ -114,7 +114,40 @@ export function isResponsesPreviousResponseNotFoundError(input: {
   if (!combined) return false;
   return (
     combined.includes('previous_response_not_found')
-    || /previous[\s_-]*response(?:[\s_-]*(?:id|identifier))?[\s_-]*not[\s_-]*found/i.test(combined)
+    // Codex native format: "Previous response not found" (no id)
+    || /previous[\s_-]*response[\s_-]*not[\s_-]*found/i.test(combined)
+    // Codex verbose format: "Previous response with id 'resp_...' not found"
+    || /previous[\s_-]*response[\s_-]+with[\s_-]+(?:id|identifier)[\s\S]*?not[\s_-]*found/i.test(combined)
+    // Codex error code variant
+    || combined.includes('previous_response_id_not_found')
+    // Compact id variant: "previous response id not found"
+    || /previous[\s_-]*response[\s_-]*(?:id|identifier)[\s_-]*not[\s_-]*found/i.test(combined)
+  );
+}
+
+/**
+ * Detects Codex tool call mismatch errors:
+ * - "No tool call found for function call output with call_id ..."
+ * - "No tool output found for function call ..."
+ *
+ * These errors occur when the session state is inconsistent — typically after
+ * a WS reconnection where the previous response's tool calls are lost upstream.
+ * Recovery: clear session response_id and strip previous_response_id.
+ */
+export function isResponsesToolCallMismatchError(input: {
+  rawErrText?: string | null;
+  payload?: unknown;
+}): boolean {
+  const fragments = [
+    ...collectResponsesErrorFragments(input.payload),
+  ];
+  const rawErrText = asTrimmedString(input.rawErrText);
+  if (rawErrText) fragments.push(rawErrText);
+  const combined = fragments.join(' ').toLowerCase();
+  if (!combined) return false;
+  return (
+    /no[\s_-]+tool[\s_-]+call[\s_-]+found/i.test(combined)
+    || /no[\s_-]+tool[\s_-]+output[\s_-]+found/i.test(combined)
   );
 }
 

@@ -1,4 +1,5 @@
 import { config } from '../../config.js';
+import { shouldRememberResponseId } from '../capabilities/contextWindowGuard.js';
 
 const MAX_CODEX_SESSION_RESPONSE_IDS = 10_000;
 const MIN_CODEX_SESSION_RESPONSE_TTL_MS = 5 * 60 * 1000;
@@ -9,6 +10,21 @@ type SessionResponseEntry = {
 };
 
 const codexSessionResponseIds = new Map<string, SessionResponseEntry>();
+
+// Sessions that have been trimmed by Layer 1 — their response IDs
+// should NOT be remembered because the context was altered.
+// This prevents unsafe previous_response_id injection that would
+// cause double-counting of tokens (trimmed context + full client input).
+const layer1TrimmedSessions = new Map<string, number>(); // sessionId → timestamp
+const LAYER1_TRIMMED_SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+function sweepExpiredLayer1TrimmedSessions(nowMs = Date.now()): void {
+  for (const [key, ts] of layer1TrimmedSessions.entries()) {
+    if ((ts + LAYER1_TRIMMED_SESSION_TTL_MS) <= nowMs) {
+      layer1TrimmedSessions.delete(key);
+    }
+  }
+}
 
 const SCOPED_SESSION_SEGMENT_PREFIX = 'session:';
 const SCOPED_STORE_KEY_SEGMENT_PATTERN = /^(site|account|channel):\d+$/;
@@ -147,6 +163,52 @@ export function getCodexSessionResponseId(sessionId: string): string | null {
   return null;
 }
 
+/**
+ * Safe variant of setCodexSessionResponseId that inspects the response payload
+ * before recording the response ID.  Mirrors Codex native behavior:
+ * only `response.completed` responses are eligible for `previous_response_id`
+ * chaining.  Failed / context-exceeded responses are silently dropped.
+ */
+export function safeSetCodexSessionResponseId(
+  sessionId: string,
+  payload: unknown,
+): { remembered: boolean; reason: string } {
+  // If this session was trimmed by Layer 1, don't record the response ID.
+  // The trimmed response's context is incomplete — injecting it as
+  // previous_response_id would cause the upstream to load the trimmed
+  // context PLUS the client's full (untrimmed) input, leading to
+  // double token counting and context overflow.
+  const normalizedSessionId = normalizeSessionId(sessionId);
+  sweepExpiredLayer1TrimmedSessions();
+  if (normalizedSessionId && layer1TrimmedSessions.has(normalizedSessionId)) {
+    return { remembered: false, reason: 'session was trimmed by Layer 1 — response ID not safe for previous_response_id chaining' };
+  }
+  const evaluation = shouldRememberResponseId(payload);
+  if (!evaluation.shouldRemember) {
+    return { remembered: false, reason: evaluation.reason };
+  }
+  // Extract the response ID from the payload
+  const responseId = extractResponseIdFromPayload(payload);
+  if (!responseId) {
+    return { remembered: false, reason: 'no response id in payload' };
+  }
+  setCodexSessionResponseId(sessionId, responseId);
+  return { remembered: true, reason: evaluation.reason };
+}
+
+function extractResponseIdFromPayload(payload: unknown): string | null {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
+  const obj = payload as Record<string, unknown>;
+  // Direct response object
+  if (typeof obj.id === 'string' && obj.id.trim()) return obj.id.trim();
+  // SSE event with nested response
+  if (obj.response && typeof obj.response === 'object' && !Array.isArray(obj.response)) {
+    const resp = obj.response as Record<string, unknown>;
+    if (typeof resp.id === 'string' && resp.id.trim()) return resp.id.trim();
+  }
+  return null;
+}
+
 export function setCodexSessionResponseId(sessionId: string, responseId: string): void {
   const nowMs = Date.now();
   sweepExpiredSessionResponseIds(nowMs);
@@ -181,6 +243,36 @@ export function clearCodexSessionResponseId(sessionId: string): void {
   }
 }
 
+/**
+ * Marks a session as having been trimmed by Layer 1.
+ * Subsequent safeSetCodexSessionResponseId calls will refuse to record
+ * response IDs for this session, preventing unsafe previous_response_id
+ * injection that would cause double token counting.
+ */
+export function markLayer1TrimmedSession(sessionId: string): void {
+  const normalized = normalizeSessionId(sessionId);
+  if (!normalized) return;
+  sweepExpiredLayer1TrimmedSessions();
+  layer1TrimmedSessions.set(normalized, Date.now());
+  // Also clear any existing response ID
+  for (const key of getSessionStoreKeys(normalized)) {
+    codexSessionResponseIds.delete(key);
+  }
+}
+
+/**
+ * Clears the Layer 1 trimmed flag for a session.
+ * Called when the session token usage is reset (e.g., after a context
+ * overflow recovery, or when the session naturally evolves past the
+ * trimmed state).
+ */
+export function clearLayer1TrimmedSession(sessionId: string): void {
+  const normalized = normalizeSessionId(sessionId);
+  if (!normalized) return;
+  layer1TrimmedSessions.delete(normalized);
+}
+
 export function resetCodexSessionResponseStore(): void {
   codexSessionResponseIds.clear();
+  layer1TrimmedSessions.clear();
 }

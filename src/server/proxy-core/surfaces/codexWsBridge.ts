@@ -52,7 +52,7 @@ export async function dispatchCodexWebsocketRequest(
     };
 
     if (isStream) {
-      return buildCodexWsStreamingResponse({
+      return await buildCodexWsStreamingResponse({
         wsSessionId,
         requestUrl,
         runtimeHeaders,
@@ -61,7 +61,7 @@ export async function dispatchCodexWebsocketRequest(
       });
     }
 
-    const result = await codexWsBridgeRuntime.sendRequest({
+    const result = await sendCodexWsBridgeRequestWithSameAccountRetries({
       sessionId: wsSessionId,
       requestUrl,
       headers: runtimeHeaders,
@@ -183,68 +183,141 @@ function buildCodexWsResponse(
   });
 }
 
-function buildCodexWsStreamingResponse(input: {
+async function buildCodexWsStreamingResponse(input: {
   wsSessionId: string;
   requestUrl: string;
   runtimeHeaders: Record<string, string>;
   body: Record<string, unknown>;
   agent?: unknown;
-}): Response {
+}): Promise<Response> {
   const encoder = new TextEncoder();
-  const stream = new ReadableStream({
-    async start(controller) {
-      const sendSse = (event: Record<string, unknown>) => {
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
-      };
+  const stream = new TransformStream<Uint8Array, Uint8Array>();
+  const writer = stream.writable.getWriter();
+  let responseStarted = false;
+  let initialResponseResolved = false;
+  let resolveInitialResponse: (response: Response) => void = () => undefined;
+  let writeChain = Promise.resolve();
+  let lastSseEvent: Record<string, unknown> | null = null;
+  const initialResponse = new Promise<Response>((resolve) => {
+    resolveInitialResponse = resolve;
+  });
 
-      try {
-        await codexWsBridgeRuntime.sendRequest({
-          sessionId: input.wsSessionId,
-          requestUrl: input.requestUrl,
-          headers: input.runtimeHeaders,
-          body: input.body,
-          authId: pickHeaderValue(input.runtimeHeaders, ['chatgpt-account-id', 'Chatgpt-Account-Id']) || null,
-          agent: input.agent,
-          onEvent: sendSse,
-        });
-      } catch (error) {
-        const runtimeError = error instanceof CodexWebsocketRuntimeError
-          ? error
-          : new CodexWebsocketRuntimeError(
-            error instanceof Error
-              ? error.message || 'upstream websocket request failed'
-              : 'upstream websocket request failed',
-            {
-              payload: error && typeof error === 'object'
-                ? {
-                  raw_error_type: (error as { name?: unknown }).name ?? null,
-                  raw_error_message: (error as { message?: unknown }).message ?? null,
-                  raw_error_stack: (error as { stack?: unknown }).stack ?? null,
-                }
-                : null,
-            },
-          );
-        const errorEvent = runtimeError.events && runtimeError.events.length > 0
-          ? runtimeError.events[runtimeError.events.length - 1]
-          : {
-            type: 'error',
-            status: runtimeError.status || 502,
-            error: {
-              message: runtimeError.message,
-              raw_error_type: runtimeError.name,
-              payload: runtimeError.payload ?? null,
-            },
-          };
-        sendSse(errorEvent);
+  const resolveStreamingResponse = () => {
+    if (initialResponseResolved) return;
+    initialResponseResolved = true;
+    resolveInitialResponse(new Response(stream.readable, {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+    }));
+  };
+
+  const enqueueSse = (event: Record<string, unknown>) => {
+    lastSseEvent = event;
+    responseStarted = true;
+    resolveStreamingResponse();
+    writeChain = writeChain.then(() => writer.write(encoder.encode(`data: ${JSON.stringify(event)}\n\n`)));
+  };
+
+  void (async () => {
+    try {
+      await sendCodexWsBridgeRequestWithSameAccountRetries({
+        sessionId: input.wsSessionId,
+        requestUrl: input.requestUrl,
+        headers: input.runtimeHeaders,
+        body: input.body,
+        authId: pickHeaderValue(input.runtimeHeaders, ['chatgpt-account-id', 'Chatgpt-Account-Id']) || null,
+        agent: input.agent,
+        onEvent: (event) => {
+          enqueueSse(event);
+        },
+      }, () => !responseStarted);
+    } catch (error) {
+      const runtimeError = normalizeCodexWsRuntimeError(error);
+      if (!responseStarted) {
+        initialResponseResolved = true;
+        await writer.abort(runtimeError).catch(() => undefined);
+        resolveInitialResponse(buildCodexWsErrorResponse(runtimeError));
+        return;
       }
+      const errorEvent = buildCodexWsErrorEvent(runtimeError);
+      if (lastSseEvent !== errorEvent) {
+        enqueueSse(errorEvent);
+      }
+    }
 
-      controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-      controller.close();
+    resolveStreamingResponse();
+    await writeChain.catch(() => undefined);
+    await writer.write(encoder.encode('data: [DONE]\n\n')).catch(() => undefined);
+    await writer.close().catch(() => undefined);
+  })();
+
+  return await initialResponse;
+}
+
+function normalizeCodexWsRuntimeError(error: unknown): CodexWebsocketRuntimeError {
+  if (error instanceof CodexWebsocketRuntimeError) return error;
+  return new CodexWebsocketRuntimeError(
+    error instanceof Error
+      ? error.message || 'upstream websocket request failed'
+      : 'upstream websocket request failed',
+    {
+      payload: error && typeof error === 'object'
+        ? {
+          raw_error_type: (error as { name?: unknown }).name ?? null,
+          raw_error_message: (error as { message?: unknown }).message ?? null,
+          raw_error_stack: (error as { stack?: unknown }).stack ?? null,
+        }
+        : null,
     },
-  });
+  );
+}
 
-  return new Response(stream, {
-    status: 200,
-    headers: { 'Content-Type': 'text/event-stream' },
+function buildCodexWsErrorEvent(runtimeError: CodexWebsocketRuntimeError): Record<string, unknown> {
+  return runtimeError.events && runtimeError.events.length > 0
+    ? runtimeError.events[runtimeError.events.length - 1]
+    : {
+      type: 'error',
+      status: runtimeError.status || 502,
+      error: {
+        message: runtimeError.message,
+        raw_error_type: runtimeError.name,
+        payload: runtimeError.payload ?? null,
+      },
+    };
+}
+
+function buildCodexWsErrorResponse(runtimeError: CodexWebsocketRuntimeError): Response {
+  return new Response(JSON.stringify(buildCodexWsErrorEvent(runtimeError)), {
+    status: runtimeError.status || 502,
+    headers: { 'Content-Type': 'application/json' },
   });
+}
+
+function isCodexWsSameAccountRetryableError(runtimeError: CodexWebsocketRuntimeError): boolean {
+  const status = typeof runtimeError.status === 'number' ? runtimeError.status : 502;
+  return runtimeError.events.length === 0 && (status >= 500 || status === 408);
+}
+
+async function sendCodexWsBridgeRequestWithSameAccountRetries(
+  input: Parameters<typeof codexWsBridgeRuntime.sendRequest>[0],
+  canRetry?: (error: CodexWebsocketRuntimeError) => boolean,
+) {
+  const maxSameAccountRetries = Math.max(0, Math.trunc(config.codexUpstreamWebsocketSameAccountRetries || 0));
+  let sameAccountAttempt = 0;
+  for (;;) {
+    try {
+      return await codexWsBridgeRuntime.sendRequest(input);
+    } catch (error) {
+      const runtimeError = normalizeCodexWsRuntimeError(error);
+      if (
+        sameAccountAttempt < maxSameAccountRetries
+        && isCodexWsSameAccountRetryableError(runtimeError)
+        && (!canRetry || canRetry(runtimeError))
+      ) {
+        sameAccountAttempt += 1;
+        continue;
+      }
+      throw runtimeError;
+    }
+  }
 }

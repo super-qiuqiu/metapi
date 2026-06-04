@@ -437,6 +437,121 @@ describe('codexWebsocketRuntime', () => {
     await runtime.closeSession('exec-session-retry-stale');
   });
 
+  it('retries once when a fresh upstream websocket closes before yielding any events', async () => {
+    upstreamMessageHandler = (socket, parsed, requestIndex) => {
+      if (requestIndex === 1) {
+        socket.close(1011, 'not ready');
+        return;
+      }
+
+      socket.send(JSON.stringify({
+        type: 'response.completed',
+        response: {
+          id: 'resp-recovered',
+          object: 'response',
+          model: parsed.model || 'gpt-5.4',
+          status: 'completed',
+          output: [],
+          usage: {
+            input_tokens: 1,
+            output_tokens: 1,
+            total_tokens: 2,
+          },
+        },
+      }));
+    };
+
+    const { createCodexWebsocketRuntime } = await import('./codexWebsocketRuntime.js');
+    const runtime = createCodexWebsocketRuntime();
+
+    const recovered = await runtime.sendRequest({
+      sessionId: 'exec-session-fresh-close-retry',
+      requestUrl: upstreamWsUrl,
+      headers: {
+        Authorization: 'Bearer oauth-access-token',
+        'OpenAI-Beta': 'responses_websockets=2026-02-06',
+      },
+      body: {
+        model: 'gpt-5.4',
+        input: [],
+      },
+    });
+
+    expect(recovered.events[0]).toMatchObject({
+      type: 'response.completed',
+      response: { id: 'resp-recovered' },
+    });
+    expect(recovered.reusedSession).toBe(false);
+    expect(upstreamConnectionCount).toBe(2);
+    expect(upstreamRequests).toHaveLength(2);
+    expect(upstreamRequests[0]).toMatchObject({ type: 'response.create' });
+    expect(upstreamRequests[1]).toMatchObject({ type: 'response.create' });
+
+    await runtime.closeSession('exec-session-fresh-close-retry');
+  });
+
+  it('retries once when a fresh upstream websocket closes before opening', async () => {
+    const closingServer = new WebSocketServer({ port: 0 });
+    let connectionCount = 0;
+    let requestCount = 0;
+    closingServer.on('connection', (socket) => {
+      connectionCount += 1;
+      if (connectionCount === 1) {
+        socket.close(1013, 'try again');
+        return;
+      }
+      socket.on('message', (payload) => {
+        requestCount += 1;
+        const parsed = JSON.parse(String(payload)) as Record<string, unknown>;
+        socket.send(JSON.stringify({
+          type: 'response.completed',
+          response: {
+            id: 'resp-open-recovered',
+            object: 'response',
+            model: parsed.model || 'gpt-5.4',
+            status: 'completed',
+            output: [],
+            usage: {
+              input_tokens: 1,
+              output_tokens: 1,
+              total_tokens: 2,
+            },
+          },
+        }));
+      });
+    });
+    await new Promise<void>((resolve) => closingServer.once('listening', () => resolve()));
+    const address = closingServer.address() as AddressInfo;
+    const closingWsUrl = `ws://127.0.0.1:${address.port}/backend-api/codex/responses`;
+
+    const { createCodexWebsocketRuntime } = await import('./codexWebsocketRuntime.js');
+    const runtime = createCodexWebsocketRuntime();
+    try {
+      const recovered = await runtime.sendRequest({
+        sessionId: 'exec-session-fresh-close-before-open-retry',
+        requestUrl: closingWsUrl,
+        headers: {
+          Authorization: 'Bearer oauth-access-token',
+          'OpenAI-Beta': 'responses_websockets=2026-02-06',
+        },
+        body: {
+          model: 'gpt-5.4',
+          input: [],
+        },
+      });
+
+      expect(recovered.events[0]).toMatchObject({
+        type: 'response.completed',
+        response: { id: 'resp-open-recovered' },
+      });
+      expect(connectionCount).toBe(2);
+      expect(requestCount).toBe(1);
+    } finally {
+      await runtime.closeSession('exec-session-fresh-close-before-open-retry');
+      await new Promise<void>((resolve) => closingServer.close(() => resolve()));
+    }
+  });
+
   it('resolves an upstream disconnect promise when the active upstream connection closes', async () => {
     upstreamMessageHandler = (socket, parsed, requestIndex) => {
       if (requestIndex === 1) {

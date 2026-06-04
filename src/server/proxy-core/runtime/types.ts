@@ -22,6 +22,7 @@ export type CodexWebsocketSession = {
   socket: WebSocket | null;
   socketUrl: string | null;
   readLoopSocket: WebSocket | null;
+  heartbeatTimer: ReturnType<typeof setInterval> | null;
   activeRequest: CodexWebsocketActiveRequest | null;
   queue: Promise<unknown>;
   upstreamDisconnect: CodexWebsocketDisconnectSignal;

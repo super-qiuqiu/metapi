@@ -7,6 +7,7 @@ import { openAiResponsesTransformer } from '../../transformers/openai/responses/
 import {
   extractResponsesTerminalResponseId,
   isResponsesPreviousResponseNotFoundError,
+  isResponsesToolCallMismatchError,
   shouldInferResponsesPreviousResponseId,
   stripResponsesPreviousResponseId,
   withResponsesPreviousResponseId,
@@ -28,7 +29,7 @@ import {
   extractUnsupportedParameterName,
 } from '../orchestration/unsupportedParameterRecovery.js';
 import { detectProxyFailure } from '../../services/proxyFailureJudge.js';
-import { isClientContinuationFailure, shouldRetryProxyRequest, shouldAbortSameSiteEndpointFallback } from '../../services/proxyRetryPolicy.js';
+import { isClientContinuationFailure, isContextWindowExceededRetryPolicy, isPreviousResponseNotFoundError, shouldRetryProxyRequest, shouldAbortSameSiteEndpointFallback } from '../../services/proxyRetryPolicy.js';
 import { getProxyAuthContext, getProxyResourceOwner } from '../../middleware/auth.js';
 import { normalizeInputFileBlock } from '../../transformers/shared/inputFile.js';
 import { promoteRequiredEndpointCandidateAfterProtocolError } from '../../transformers/shared/endpointCompatibility.js';
@@ -58,7 +59,10 @@ import { runCodexHttpSessionTask } from '../runtime/codexHttpSessionQueue.js';
 import {
   buildCodexSessionResponseStoreKey,
   clearCodexSessionResponseId,
+  clearLayer1TrimmedSession,
   getCodexSessionResponseId,
+  markLayer1TrimmedSession,
+  safeSetCodexSessionResponseId,
   setCodexSessionResponseId,
 } from '../runtime/codexSessionResponseStore.js';
 import {
@@ -112,6 +116,22 @@ import {
   hasReplayableResponsesContinuationContext,
   isResponsesContinuationRecoveryError,
 } from '../responsesContinuationRecovery.js';
+import {
+  evaluatePreRequestContextBudget,
+  getModelContextWindow,
+  isContextWindowExceededError as isContextWindowExceededGuard,
+  recordSessionTokenUsage,
+  getSessionTokenUsage,
+  clearSessionTokenUsage,
+  trimResponsesInputToTokenBudget,
+  shouldTriggerAutoCompact,
+} from '../capabilities/contextWindowGuard.js';
+import {
+  tryComputeIncrementalInput,
+  recordSessionBaseline,
+  clearSessionBaseline,
+  extractResponseOutputItems,
+} from '../capabilities/sessionInputBaseline.js';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object';
@@ -144,10 +164,54 @@ function isResponsesWebsocketHttpFallbackRequest(headers: Record<string, unknown
       && String(rawValue).trim() === '1');
 }
 
-function rememberCodexSessionResponseId(sessionId: string, payload: unknown): void {
-  const responseId = extractResponsesTerminalResponseId(payload);
-  if (!responseId) return;
-  setCodexSessionResponseId(sessionId, responseId);
+function safeRememberCodexSessionResponseId(sessionId: string, payload: unknown): void {
+  if (!sessionId) return;
+  safeSetCodexSessionResponseId(sessionId, payload);
+}
+
+/**
+ * Handles session cleanup when a context-window or continuation error is
+ * detected in a path that bypasses tryRecover (stream failures, etc.).
+ *
+ * Layer 3: Context exceeded → clear session so subsequent requests don't
+ * chain to a failed/nonexistent response.
+ *
+ * Returns true if the error was a context-window-exceeded error (caller
+ * may want to adjust its own handling).
+ */
+function handleContinuationFailureSessionCleanup(
+  errorText: string | null | undefined,
+  codexSessionStoreKey: string,
+): boolean {
+  if (!codexSessionStoreKey) return false;
+
+  if (isContextWindowExceededRetryPolicy(errorText)) {
+    // Layer 3: Context overflow — clear session state completely
+    clearCodexSessionResponseId(codexSessionStoreKey);
+    clearSessionTokenUsage(codexSessionStoreKey);
+    clearSessionBaseline(codexSessionStoreKey);
+    clearLayer1TrimmedSession(codexSessionStoreKey);
+    console.warn(
+      '[responses] context window exceeded — cleared session state (stream/inline path)',
+      { sessionId: codexSessionStoreKey },
+    );
+    return true;
+  }
+
+  if (isPreviousResponseNotFoundError(errorText)) {
+    // Consequence of context overflow — clear the dangling response ID
+    clearCodexSessionResponseId(codexSessionStoreKey);
+    clearSessionTokenUsage(codexSessionStoreKey);
+    clearSessionBaseline(codexSessionStoreKey);
+    clearLayer1TrimmedSession(codexSessionStoreKey);
+    console.warn(
+      '[responses] previous response not found — cleared session state (stream/inline path)',
+      { sessionId: codexSessionStoreKey },
+    );
+    return true;
+  }
+
+  return false;
 }
 
 function normalizeIncludeList(value: unknown): string[] {
@@ -323,6 +387,8 @@ export async function handleOpenAiResponsesSurfaceRequest(
     const failureToolkit = createSurfaceFailureToolkit({
       warningScope: 'responses',
       downstreamPath,
+      downstreamTransport: isResponsesWebsocketTransportRequest(request.headers as Record<string, unknown>) ? 'websocket' : 'http',
+      upstreamTransport: 'http', // updated after channel selection
       maxRetries,
       clientContext,
       downstreamApiKeyId,
@@ -365,6 +431,12 @@ export async function handleOpenAiResponsesSurfaceRequest(
     };
     const excludeChannelIds: number[] = [];
     let retryCount = 0;
+    let lastIncrementalOptimization: {
+      previousResponseId: string;
+      incrementalInput: unknown[];
+      baselineLength: number;
+      savedItems: number;
+    } | null = null;
 
     while (retryCount <= maxRetries) {
       const stickyPreferredChannelId = retryCount === 0
@@ -526,6 +598,10 @@ export async function handleOpenAiResponsesSurfaceRequest(
       );
       const executeEndpointResultForSiteApiBaseUrl = async (siteApiBaseUrl: string) => {
         const websocketHttpFallbackRequest = isResponsesWebsocketHttpFallbackRequest(request.headers as Record<string, unknown>);
+        // Update upstream transport now that we know the site platform
+        failureToolkit.setUpstreamTransport(
+          (isCodexSite && config.codexUpstreamWebsocketEnabled && !websocketHttpFallbackRequest) ? 'websocket' : 'http'
+        );
         if (oauth) {
           await trySurfaceOauthPreRefresh({ selected });
         }
@@ -534,22 +610,230 @@ export async function handleOpenAiResponsesSurfaceRequest(
           isCompactRequest,
         });
         const normalizedSitePlatform = String(selected.site.platform || '').trim().toLowerCase();
+        // ── Layer 1: Pre-request context budget check ────────────────────
+        // Check if the CURRENT request's input is approaching the model's
+        // context window. If so, trim the input array to fit within budget.
+        // This is the most effective token-saving measure — it directly
+        // reduces prompt_tokens sent to the upstream.
+        //
+        // Unified strategy: combine session-level prediction with request-level estimation
+        // to proactively trim input BEFORE sending to upstream.
+        //
+        // Key insight: prompt_tokens from upstream includes the FULL context
+        // (previous_response_id's cached content + new input). The input array
+        // alone may look small if previous_response_id is active, but the
+        // effective token count is much higher. So we must use session-level
+        // prompt_tokens (from last successful response) as the primary signal,
+        // and predict whether this request will exceed the context window.
+        let layer1ContextOverride: { skipPreviousResponseId: boolean; reason: string } | null = null;
+        let layer1TrimmedInput: Record<string, unknown> | null = null;
+
+        if (isCodexSite && codexSessionStoreKey && config.contextWindowGuardEnabled) {
+          const contextWindow = getModelContextWindow(modelName);
+          const trimTarget = Math.trunc(contextWindow * config.contextWindowGuardTrimTargetPercent / 100);
+
+          // ── Predictive check using session history ──────────────────────
+          // If we have a previous successful response's prompt_tokens,
+          // predict this request's effective token count using the growth rate.
+          const sessionUsage = getSessionTokenUsage(codexSessionStoreKey);
+          let predictedTokens = 0;
+          let shouldTrimPredictive = false;
+
+          if (sessionUsage && sessionUsage.lastSucceeded) {
+            predictedTokens = sessionUsage.predictedNextPromptTokens;
+            // Trim if predicted next request will exceed trim target
+            shouldTrimPredictive = predictedTokens >= trimTarget;
+            console.info(
+              '[responses] Layer 1 predictive check',
+              {
+                sessionId: codexSessionStoreKey,
+                lastPromptTokens: sessionUsage.promptTokens,
+                prevPromptTokens: sessionUsage.prevPromptTokens,
+                growthRate: sessionUsage.growthRate,
+                predictedTokens,
+                contextWindow,
+                trimTarget,
+                shouldTrim: shouldTrimPredictive,
+              },
+            );
+          }
+
+          // ── Request-level input size check (fallback) ──────────────────
+          // When no session history exists (first request in session),
+          // estimate tokens from the input array directly.
+          let estimatedInputTokens = 0;
+          let shouldTrimRequestLevel = false;
+
+          if (isRecord(normalizedResponsesBody) && Array.isArray(normalizedResponsesBody.input)) {
+            const inputArr = normalizedResponsesBody.input as unknown[];
+            // Estimate: ~3 chars per token for code-heavy content (more accurate than 4)
+            for (const item of inputArr) {
+              try {
+                estimatedInputTokens += Math.ceil(JSON.stringify(item).length / 3);
+              } catch {
+                estimatedInputTokens += 500;
+              }
+            }
+            shouldTrimRequestLevel = estimatedInputTokens >= trimTarget;
+            console.info(
+              '[responses] Layer 1 request-level check',
+              {
+                sessionId: codexSessionStoreKey,
+                inputItems: inputArr.length,
+                estimatedInputTokens,
+                contextWindow,
+                trimTarget,
+                shouldTrim: shouldTrimRequestLevel,
+              },
+            );
+          }
+
+          // ── Combine signals and decide ────────────────────────────────
+          // Trim if EITHER signal says we should.
+          // Use the higher token estimate as the basis for trimming.
+          const effectiveTokens = Math.max(predictedTokens, estimatedInputTokens);
+          const shouldTrim = shouldTrimPredictive || shouldTrimRequestLevel;
+
+          if (shouldTrim) {
+            console.warn(
+              '[responses] Layer 1 trimming input',
+              {
+                sessionId: codexSessionStoreKey,
+                predictedTokens,
+                estimatedInputTokens,
+                effectiveTokens,
+                contextWindow,
+                trimTarget,
+                reason: shouldTrimPredictive
+                  ? `predicted ${predictedTokens} tokens >= ${trimTarget} trim target`
+                  : `input estimated at ${estimatedInputTokens} tokens >= ${trimTarget} trim target`,
+              },
+            );
+
+            // Trim the input array
+            if (isRecord(normalizedResponsesBody) && Array.isArray(normalizedResponsesBody.input)) {
+              const trimResult = trimResponsesInputToTokenBudget(
+                normalizedResponsesBody as Record<string, unknown>,
+                trimTarget,
+                effectiveTokens,
+              );
+              if (trimResult.itemsRemoved > 0) {
+                layer1TrimmedInput = trimResult.body;
+                layer1ContextOverride = {
+                  skipPreviousResponseId: true,
+                  reason: shouldTrimPredictive
+                    ? `predicted ${predictedTokens} tokens >= ${trimTarget} — removed ${trimResult.itemsRemoved} oldest items`
+                    : `input estimated at ${estimatedInputTokens} tokens >= ${trimTarget} — removed ${trimResult.itemsRemoved} oldest items`,
+                };
+                clearCodexSessionResponseId(codexSessionStoreKey);
+                clearSessionBaseline(codexSessionStoreKey);
+                // Mark session as trimmed — prevent safeRememberCodexSessionResponseId
+                // from recording the trimmed response's ID (which would cause
+                // unsafe previous_response_id injection on next request)
+                markLayer1TrimmedSession(codexSessionStoreKey);
+                // Don't clear sessionTokenUsage — we need it for growth prediction
+                // The next success will update it with the trimmed request's actual prompt_tokens
+              }
+            } else {
+              // Can't trim (no input array), just skip previous_response_id
+              layer1ContextOverride = {
+                skipPreviousResponseId: true,
+                reason: shouldTrimPredictive
+                  ? `predicted ${predictedTokens} tokens >= ${trimTarget} — skipping previous_response_id`
+                  : `effective ${effectiveTokens} tokens >= ${trimTarget} — skipping previous_response_id`,
+              };
+              clearCodexSessionResponseId(codexSessionStoreKey);
+              clearSessionBaseline(codexSessionStoreKey);
+            }
+          } else if (sessionUsage && sessionUsage.promptTokens >= Math.trunc(contextWindow * config.contextWindowGuardAutoCompactPercent / 100)) {
+            // Auto-compact: skip previous_response_id but don't trim yet
+            layer1ContextOverride = {
+              skipPreviousResponseId: true,
+              reason: `session at ${sessionUsage.promptTokens} tokens >= ${config.contextWindowGuardAutoCompactPercent}% of ${contextWindow} — skipping previous_response_id`,
+            };
+            clearCodexSessionResponseId(codexSessionStoreKey);
+            clearSessionBaseline(codexSessionStoreKey);
+          } else {
+            // No trimming needed — clear the Layer 1 trimmed flag so that
+            // subsequent safeRememberCodexSessionResponseId can record IDs again.
+            // This handles the case where a session was trimmed in a previous
+            // turn but is now within budget.
+            clearLayer1TrimmedSession(codexSessionStoreKey);
+          }
+        }
+        // Apply Layer 1 trimmed input if applicable
+        const layer1Body = layer1TrimmedInput
+          ? layer1TrimmedInput as Record<string, unknown>
+          : normalizedResponsesBody;
         const buildEndpointRequest = (endpoint: 'chat' | 'messages' | 'responses') => {
           const upstreamStream = isStream || (forceResponsesUpstreamStream && endpoint === 'responses');
-          const responsesOriginalBody = (
+          // Use layer1Body (potentially trimmed) instead of raw normalizedResponsesBody
+          const activeBody = layer1TrimmedInput
+            ? (layer1TrimmedInput as Record<string, unknown>)
+            : normalizedResponsesBody;
+          const shouldInjectPreviousResponseId = (
             endpoint === 'responses'
             && isCodexSite
             && codexSessionStoreKey
+            && !layer1ContextOverride?.skipPreviousResponseId
             && shouldInferResponsesPreviousResponseId(
-              normalizedResponsesBody,
+              activeBody,
               getCodexSessionResponseId(codexSessionStoreKey),
             )
-          )
-            ? withResponsesPreviousResponseId(
-              normalizedResponsesBody,
+          );
+          // ── Incremental input optimization (省额度) ──────────────────────
+          // Mirrors Codex CLI's `get_incremental_items()` — when the new
+          // request's input starts with the previous baseline (last input +
+          // model output items), we only send the suffix as input, paired
+          // with previous_response_id. This dramatically reduces prompt tokens.
+          let incrementalOptimization: {
+            previousResponseId: string;
+            incrementalInput: unknown[];
+            baselineLength: number;
+            savedItems: number;
+          } | null = null;
+          let responsesOriginalBody: Record<string, unknown>;
+
+          if (isCodexSite && codexSessionStoreKey && !layer1ContextOverride?.skipPreviousResponseId) {
+            const newInput = activeBody.input;
+            if (Array.isArray(newInput)) {
+              incrementalOptimization = tryComputeIncrementalInput({
+                sessionId: codexSessionStoreKey,
+                newInput: newInput as Record<string, unknown>[],
+                model: modelName,
+              });
+            }
+          }
+
+          // Propagate to outer scope for baseline recording after success
+          lastIncrementalOptimization = incrementalOptimization;
+
+          if (incrementalOptimization) {
+            // Incremental diff succeeded — send only the new items
+            responsesOriginalBody = {
+              ...activeBody,
+              previous_response_id: incrementalOptimization.previousResponseId,
+              input: incrementalOptimization.incrementalInput,
+            };
+            console.info(
+              '[responses] incremental input optimization applied',
+              {
+                sessionId: codexSessionStoreKey,
+                baselineLength: incrementalOptimization.baselineLength,
+                savedItems: incrementalOptimization.savedItems,
+                newInputLength: incrementalOptimization.incrementalInput.length,
+                previousResponseId: incrementalOptimization.previousResponseId,
+              },
+            );
+          } else if (shouldInjectPreviousResponseId) {
+            // Fall back to just injecting previous_response_id (tool_output case)
+            responsesOriginalBody = withResponsesPreviousResponseId(
+              activeBody,
               getCodexSessionResponseId(codexSessionStoreKey)!,
-            )
-            : normalizedResponsesBody;
+            );
+          } else {
+            responsesOriginalBody = activeBody;
+          }
           const endpointRequest = buildUpstreamEndpointRequest({
             endpoint,
             modelName,
@@ -658,6 +942,84 @@ export async function handleOpenAiResponsesSurfaceRequest(
               return recovered;
             }
           }
+          // ── Layer 3: Context window exceeded recovery ─────────────────
+          // When the upstream returns a context_length_exceeded error, we must:
+          //   1. Clear the session response ID (the failed response is not chainable)
+          //   2. Strip previous_response_id if present
+          //   3. Trim the input array to fit within context budget (Layer 4)
+          //   4. Retry once with the trimmed request
+          // This mirrors Codex native: ContextWindowExceeded is a fatal error
+          // that requires session state cleanup.
+          if (
+            ctx.request.endpoint === 'responses'
+            && isContextWindowExceededRetryPolicy(ctx.rawErrText)
+          ) {
+            console.warn(
+              '[responses] context window exceeded — clearing session and trimming input',
+              {
+                model: selected.actualModel || requestedModel || '',
+                platform: selected.site.platform || '',
+                sessionId: codexSessionStoreKey || '',
+              },
+            );
+            // Step 1: Clear the failed response ID so it won't be used for chaining
+            if (codexSessionStoreKey) {
+              clearCodexSessionResponseId(codexSessionStoreKey);
+              clearSessionTokenUsage(codexSessionStoreKey);
+              clearSessionBaseline(codexSessionStoreKey);
+              clearLayer1TrimmedSession(codexSessionStoreKey);
+            }
+            // Step 2: Strip previous_response_id — the referenced response was
+            // either never created (context overflow) or is unusable
+            const contextOverflowRecovery = stripResponsesPreviousResponseId(ctx.request.body);
+            let recoveredBody = contextOverflowRecovery.body;
+            // Step 3: Trim input array to fit within model's context window (Layer 4)
+            if (isRecord(recoveredBody) && Array.isArray(recoveredBody.input)) {
+              const contextWindow = getModelContextWindow(modelName);
+              const targetTokens = Math.trunc(contextWindow * config.contextWindowGuardTrimTargetPercent / 100);
+              const trimResult = trimResponsesInputToTokenBudget(
+                recoveredBody,
+                targetTokens,
+                contextWindow, // Use full context window as current estimate (we don't know exact tokens)
+              );
+              if (trimResult.itemsRemoved > 0) {
+                console.warn(
+                  '[responses] trimmed input array for context recovery',
+                  {
+                    itemsRemoved: trimResult.itemsRemoved,
+                    targetTokens,
+                    contextWindow,
+                  },
+                );
+                recoveredBody = trimResult.body;
+              }
+            }
+            // Step 4: Retry once with the cleaned-up request
+            if (contextOverflowRecovery.removed || recoveredBody !== ctx.request.body) {
+              const recoveredRequest = {
+                ...ctx.request,
+                body: recoveredBody,
+              };
+              const recoveredResponse = await dispatchRequest(recoveredRequest, ctx.targetUrl);
+              if (recoveredResponse.ok) {
+                return {
+                  upstream: recoveredResponse,
+                  upstreamPath: recoveredRequest.path,
+                  request: recoveredRequest,
+                  targetUrl: ctx.targetUrl,
+                };
+              }
+              ctx.request = recoveredRequest;
+              ctx.response = recoveredResponse;
+              ctx.rawErrText = await readRuntimeResponseText(recoveredResponse).catch(() => 'unknown error');
+              // If the retry also failed with context overflow, give up — don't loop
+              if (isContextWindowExceededRetryPolicy(ctx.rawErrText)) {
+                console.warn('[responses] context recovery retry also exceeded context — giving up');
+              }
+            }
+            // Fall through to other recovery strategies or final failure
+          }
+          // ── Previous response not found recovery (existing logic) ───────
           if (
             ctx.request.endpoint === 'responses'
             && isResponsesPreviousResponseNotFoundError({
@@ -666,6 +1028,9 @@ export async function handleOpenAiResponsesSurfaceRequest(
           ) {
             if (codexSessionStoreKey) {
               clearCodexSessionResponseId(codexSessionStoreKey);
+              clearSessionTokenUsage(codexSessionStoreKey);
+              clearSessionBaseline(codexSessionStoreKey);
+              clearLayer1TrimmedSession(codexSessionStoreKey);
             }
             const previousResponseRecovery = stripResponsesPreviousResponseId(ctx.request.body);
             if (
@@ -683,9 +1048,64 @@ export async function handleOpenAiResponsesSurfaceRequest(
                   reason: 'tool_output_only_without_replay_context',
                 });
               }
+              // Layer 4 enhancement: also trim input when recovering from
+              // previous_response_not_found, since the root cause may be
+              // context overflow that caused the original response to fail
+              let recoveredBody = previousResponseRecovery.body;
+              if (isRecord(recoveredBody) && Array.isArray(recoveredBody.input)) {
+                const contextWindow = getModelContextWindow(modelName);
+                const targetTokens = Math.trunc(contextWindow * config.contextWindowGuardTrimTargetPercent / 100);
+                const trimResult = trimResponsesInputToTokenBudget(
+                  recoveredBody,
+                  targetTokens,
+                  contextWindow,
+                );
+                if (trimResult.itemsRemoved > 0) {
+                  console.warn(
+                    '[responses] trimmed input during previous_response_not_found recovery',
+                    { itemsRemoved: trimResult.itemsRemoved },
+                  );
+                  recoveredBody = trimResult.body;
+                }
+              }
               const recoveredRequest = {
                 ...ctx.request,
-                body: previousResponseRecovery.body,
+                body: recoveredBody,
+              };
+              const recoveredResponse = await dispatchRequest(recoveredRequest, ctx.targetUrl);
+              if (recoveredResponse.ok) {
+                return {
+                  upstream: recoveredResponse,
+                  upstreamPath: recoveredRequest.path,
+                  request: recoveredRequest,
+                  targetUrl: ctx.targetUrl,
+                };
+              }
+              ctx.request = recoveredRequest;
+              ctx.response = recoveredResponse;
+              ctx.rawErrText = await readRuntimeResponseText(recoveredResponse).catch(() => 'unknown error');
+            }
+          }
+          // ── Tool call mismatch recovery ────────────────────────────
+          // "No tool call found" or "No tool output found" — session state
+          // is inconsistent. Clear session and strip previous_response_id.
+          if (
+            ctx.request.endpoint === 'responses'
+            && isResponsesToolCallMismatchError({
+              rawErrText: ctx.rawErrText,
+            })
+          ) {
+            if (codexSessionStoreKey) {
+              clearCodexSessionResponseId(codexSessionStoreKey);
+              clearSessionTokenUsage(codexSessionStoreKey);
+              clearSessionBaseline(codexSessionStoreKey);
+              clearLayer1TrimmedSession(codexSessionStoreKey);
+            }
+            const toolCallRecovery = stripResponsesPreviousResponseId(ctx.request.body);
+            if (toolCallRecovery.removed) {
+              const recoveredRequest = {
+                ...ctx.request,
+                body: toolCallRecovery.body,
               };
               const recoveredResponse = await dispatchRequest(recoveredRequest, ctx.targetUrl);
               if (recoveredResponse.ok) {
@@ -964,6 +1384,21 @@ export async function handleOpenAiResponsesSurfaceRequest(
                 errorLabel: '[responses] post-stream bookkeeping failed:',
               },
             });
+            // Track token usage for context window guard (Layer 1 & 2)
+            if (codexSessionStoreKey) {
+              recordSessionTokenUsage({
+                sessionId: codexSessionStoreKey,
+                promptTokens: parsedUsage.promptTokens,
+                completionTokens: parsedUsage.completionTokens,
+                totalTokens: parsedUsage.totalTokens,
+                responseId: null, // Stream: response ID is captured by safeRememberCodexSessionResponseId
+                succeeded: true,
+              });
+              // Note: baseline recording for stream is done inside the stream
+              // session's onParsedPayload callback where individual output items
+              // are captured. For now we skip baseline recording in the stream
+              // finalize path since the payload is already consumed.
+            }
           } catch (error) {
             console.error('[responses] post-stream success logging failed:', error);
           }
@@ -1008,7 +1443,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
                 upstreamUsagePresent = upstreamUsagePresent || hasProxyUsagePayload(payload);
                 parsedUsage = mergeProxyUsage(parsedUsage, parseProxyUsage(payload));
                 if (codexSessionStoreKey) {
-                  rememberCodexSessionResponseId(codexSessionStoreKey, payload);
+                  safeRememberCodexSessionResponseId(codexSessionStoreKey, payload);
                 }
               }
             },
@@ -1029,7 +1464,8 @@ export async function handleOpenAiResponsesSurfaceRequest(
 	              if (streamResult.status === 'failed') {
                 const streamErrorMessage = streamResult.errorMessage || 'stream processing failed';
                 if (isClientContinuationFailure(streamErrorMessage)) {
-                  // Client continuation errors are not channel failures —
+                  // Client continuation errors are not channel failures
+                  handleContinuationFailureSessionCleanup(streamErrorMessage, codexSessionStoreKey);
                   // do NOT clear sticky session or record channel failure.
                   await failureToolkit.log({
                     selected,
@@ -1097,7 +1533,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
               upstreamData = unwrapGeminiCliPayload(upstreamData);
             }
             if (codexSessionStoreKey) {
-              rememberCodexSessionResponseId(codexSessionStoreKey, upstreamData);
+              safeRememberCodexSessionResponseId(codexSessionStoreKey, upstreamData);
             }
 
             parsedUsage = parseProxyUsage(upstreamData);
@@ -1106,7 +1542,8 @@ export async function handleOpenAiResponsesSurfaceRequest(
             const failure = detectProxyFailure({ rawText, usage: parsedUsage });
 	            if (failure) {
               if (isClientContinuationFailure(rawText)) {
-                // Client continuation errors are not channel failures —
+                // Client continuation errors are not channel failures
+                  handleContinuationFailureSessionCleanup(rawText, codexSessionStoreKey);
                 // do NOT clear sticky session, record failure, or cross-channel retry.
                 await failureToolkit.log({
                   selected,
@@ -1169,6 +1606,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
 	            if (streamResult.status === 'failed') {
               const streamErrorMessage = streamResult.errorMessage || 'stream processing failed';
               if (isClientContinuationFailure(streamErrorMessage)) {
+                handleContinuationFailureSessionCleanup(streamErrorMessage, codexSessionStoreKey);
                 await failureToolkit.log({
                   selected,
                   modelRequested: requestedModel,
@@ -1252,7 +1690,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
                   'data: [DONE]\n\n',
                 ]);
                 if (codexSessionStoreKey) {
-                  rememberCodexSessionResponseId(codexSessionStoreKey, collectedPayload);
+                  safeRememberCodexSessionResponseId(codexSessionStoreKey, collectedPayload);
                 }
                 reply.raw.end();
                 const latency = Date.now() - startTime;
@@ -1279,7 +1717,8 @@ export async function handleOpenAiResponsesSurfaceRequest(
               if (streamResult.status === 'failed') {
                 const streamErrorMessage = streamResult.errorMessage || 'stream processing failed';
                 if (isClientContinuationFailure(streamErrorMessage)) {
-                  await failureToolkit.log({
+                  handleContinuationFailureSessionCleanup(streamErrorMessage, codexSessionStoreKey);
+                await failureToolkit.log({
                     selected,
                     modelRequested: requestedModel,
                     status: 'failed',
@@ -1362,7 +1801,8 @@ export async function handleOpenAiResponsesSurfaceRequest(
 	          if (streamResult.status === 'failed') {
             const streamErrorMessage = streamResult.errorMessage || 'stream processing failed';
             if (isClientContinuationFailure(streamErrorMessage)) {
-              await failureToolkit.log({
+              handleContinuationFailureSessionCleanup(streamErrorMessage, codexSessionStoreKey);
+                await failureToolkit.log({
                 selected,
                 modelRequested: requestedModel,
                 status: 'failed',
@@ -1455,7 +1895,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
           upstreamData = unwrapGeminiCliPayload(upstreamData);
         }
         if (codexSessionStoreKey) {
-          rememberCodexSessionResponseId(codexSessionStoreKey, upstreamData);
+          safeRememberCodexSessionResponseId(codexSessionStoreKey, upstreamData);
         }
         const latency = Date.now() - startTime;
         const parsedUsage = parseProxyUsage(upstreamData);
@@ -1463,7 +1903,8 @@ export async function handleOpenAiResponsesSurfaceRequest(
         const failure = detectProxyFailure({ rawText, usage: parsedUsage });
 	        if (failure) {
           if (isClientContinuationFailure(rawText)) {
-            // Client continuation errors are not channel failures —
+            // Client continuation errors are not channel failures
+                  handleContinuationFailureSessionCleanup(rawText, codexSessionStoreKey);
             // do NOT clear sticky session, record failure, or cross-channel retry.
             await failureToolkit.log({
               selected,
@@ -1553,6 +1994,32 @@ export async function handleOpenAiResponsesSurfaceRequest(
               errorLabel: '[responses] post-response bookkeeping failed:',
             },
           });
+          // Track token usage for context window guard (Layer 1 & 2)
+          if (codexSessionStoreKey) {
+            recordSessionTokenUsage({
+              sessionId: codexSessionStoreKey,
+              promptTokens: parsedUsage.promptTokens,
+              completionTokens: parsedUsage.completionTokens,
+              totalTokens: parsedUsage.totalTokens,
+              responseId: extractResponsesTerminalResponseId(upstreamData) || null,
+              succeeded: true,
+            });
+            // Record baseline for incremental input optimization
+            const responseOutputItems = extractResponseOutputItems(upstreamData);
+            const responseId = extractResponsesTerminalResponseId(upstreamData);
+            const requestInput = (lastIncrementalOptimization != null)
+              ? (lastIncrementalOptimization as { incrementalInput: unknown[] }).incrementalInput as Record<string, unknown>[]
+              : (Array.isArray(normalizedResponsesBody.input) ? normalizedResponsesBody.input as Record<string, unknown>[] : []);
+            if (responseId) {
+              recordSessionBaseline({
+                sessionId: codexSessionStoreKey,
+                requestInput,
+                responseOutputItems,
+                responseId,
+                model: modelName,
+              });
+            }
+          }
 	        } catch (error) {
 	          console.error('[responses] post-response success logging failed:', error);
 	        }
@@ -1599,7 +2066,8 @@ export async function handleOpenAiResponsesSurfaceRequest(
           if (isSiteApiEndpointFailure) {
             const responseErrorText = err?.rawErrText || err?.message || 'unknown error';
             if (isClientContinuationFailure(responseErrorText)) {
-              // Client continuation errors are not channel failures —
+              // Client continuation errors are not channel failures
+                  handleContinuationFailureSessionCleanup(responseErrorText, codexSessionStoreKey);
               // do NOT clear sticky session, record failure, or cross-channel retry.
               await failureToolkit.log({
                 selected,

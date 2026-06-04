@@ -3,10 +3,20 @@ import WebSocket from 'ws';
 import {
   extractResponsesTerminalResponseId,
   isResponsesPreviousResponseNotFoundError,
+  isResponsesToolCallMismatchError,
   shouldInferResponsesPreviousResponseId,
   stripResponsesPreviousResponseId,
   withResponsesPreviousResponseId,
 } from '../../transformers/openai/responses/continuation.js';
+import {
+  isContextWindowExceededError,
+  clearSessionTokenUsage,
+  evaluatePreRequestContextBudget,
+  getSessionTokenUsage,
+  getModelContextWindow,
+  recordSessionTokenUsage,
+  trimResponsesInputToTokenBudget,
+} from '../capabilities/contextWindowGuard.js';
 import {
   buildCodexWebsocketHandshakeHeaders,
   buildCodexWebsocketRequestBody,
@@ -14,9 +24,13 @@ import {
 } from './codexWebsocketHeaders.js';
 import {
   clearCodexSessionResponseId,
+  clearLayer1TrimmedSession,
   getCodexSessionResponseId,
+  markLayer1TrimmedSession,
   setCodexSessionResponseId,
 } from './codexSessionResponseStore.js';
+import { clearSessionBaseline } from '../capabilities/sessionInputBaseline.js';
+import { config } from '../../config.js';
 import { createCodexWebsocketSessionStore } from './codexWebsocketSessionStore.js';
 import type {
   CodexWebsocketActiveRequest,
@@ -30,6 +44,7 @@ import type {
 const CODEX_WS_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const CODEX_WS_HANDSHAKE_TIMEOUT_MS = 30 * 1000;
 const CODEX_WS_MAX_SEND_RETRIES = 1;
+const CODEX_WS_HEARTBEAT_INTERVAL_MS = 30 * 1000; // Send ping every 30s to keep connection alive
 
 type CodexWebsocketDisconnectReason =
   | 'read_error'
@@ -177,6 +192,24 @@ function runtimeErrorReason(error: CodexWebsocketRuntimeError): string {
   return isRecord(error.payload) ? asTrimmedString(error.payload.reason) : '';
 }
 
+function shouldRetryFreshSocketFailure(error: CodexWebsocketRuntimeError): boolean {
+  const reason = runtimeErrorReason(error);
+  if (!(
+    reason === 'send_error'
+    || reason === 'write_error'
+    || reason === 'read_error'
+    || reason === 'upstream_closed'
+    || reason === 'connect_error'
+    || reason === 'connect_closed_before_open'
+  )) {
+    return false;
+  }
+  const payload = isRecord(error.payload) ? error.payload : null;
+  if (payload?.reusedSession !== false) return false;
+  if (typeof payload.eventCount === 'number' && payload.eventCount > 0) return false;
+  return error.events.length === 0;
+}
+
 async function waitForSocketOpen(socket: WebSocket): Promise<void> {
   if (socket.readyState === WebSocket.OPEN) return;
   if (socket.readyState !== WebSocket.CONNECTING) {
@@ -195,22 +228,50 @@ async function waitForSocketOpen(socket: WebSocket): Promise<void> {
     };
     const onError = (error: Error) => {
       cleanup();
-      reject(error);
+      reject(new CodexWebsocketRuntimeError(error.message || 'upstream websocket connect error', {
+        status: 502,
+        payload: {
+          reason: 'connect_error',
+          reusedSession: false,
+          eventCount: 0,
+          socketReadyState: socket.readyState,
+          rawErrorName: error.name,
+          rawErrorMessage: error.message,
+        },
+      }));
     };
-    const onClose = () => {
+    const onClose = (code: number, reasonBuffer: Buffer) => {
       cleanup();
-      reject(new Error('upstream websocket closed before opening'));
+      const closeReason = reasonBuffer.toString('utf8');
+      reject(new CodexWebsocketRuntimeError(closeReason || `upstream websocket closed before opening (${code})`, {
+        status: 502,
+        payload: {
+          reason: 'connect_closed_before_open',
+          reusedSession: false,
+          eventCount: 0,
+          socketReadyState: socket.readyState,
+          closeCode: code,
+          closeReason,
+        },
+      }));
     };
     const onUnexpectedResponse = (_request: unknown, response: IncomingMessage) => {
       cleanup();
       response.resume();
-      const status = response.statusCode || 502;
+      const upstreamStatus = response.statusCode || 502;
+      const status = upstreamStatus >= 400 ? upstreamStatus : 502;
       const is426 = status === 426;
+      const statusMessage = response.statusMessage || '';
       reject(new CodexWebsocketRuntimeError(
-        response.statusMessage || `upstream websocket upgrade failed with status ${status}`,
+        upstreamStatus >= 400
+          ? (statusMessage || `upstream websocket upgrade failed with status ${upstreamStatus}`)
+          : `upstream websocket upgrade failed: expected 101, got HTTP ${upstreamStatus}${statusMessage ? ` ${statusMessage}` : ''}`,
         {
           status,
           isUpgradeRequired426: is426,
+          payload: {
+            upstreamStatus,
+          },
         },
       ));
     };
@@ -242,6 +303,10 @@ async function closeSocket(socket: WebSocket | null): Promise<void> {
 
 function clearSessionSocket(session: CodexWebsocketSession, socket: WebSocket): void {
   if (session.socket !== socket) return;
+  if (session.heartbeatTimer) {
+    clearInterval(session.heartbeatTimer);
+    session.heartbeatTimer = null;
+  }
   session.socket = null;
   session.socketUrl = null;
   if (session.readLoopSocket === socket) {
@@ -280,6 +345,7 @@ function invalidateUpstreamConnection(
   socket: WebSocket,
   reason: CodexWebsocketDisconnectReason,
   error: Error,
+  details?: Record<string, unknown>,
 ): void {
   const active = session.activeRequest;
   if (active && active.socket === socket) {
@@ -290,7 +356,13 @@ function invalidateUpstreamConnection(
     active.reject(new CodexWebsocketRuntimeError(message, {
       events: [...active.events],
       status: reason === 'idle_timeout' ? 408 : 502,
-      payload: { reason },
+      payload: {
+        reason,
+        reusedSession: active.reusedSession,
+        eventCount: active.events.length,
+        socketReadyState: socket.readyState,
+        ...(details ?? {}),
+      },
     }));
   }
   clearSessionSocket(session, socket);
@@ -403,6 +475,23 @@ function routeUpstreamMessage(session: CodexWebsocketSession, socket: WebSocket,
       return;
     }
     rememberSessionResponseId(session.sessionId, parsed);
+    // Track token usage for context window guard (Layer 1 prediction)
+    try {
+      const response = isRecord(parsed) && isRecord(parsed.response) ? parsed.response : parsed;
+      const usage = isRecord(response) ? response.usage : undefined;
+      if (isRecord(usage) && typeof usage.prompt_tokens === 'number') {
+        recordSessionTokenUsage({
+          sessionId: session.sessionId,
+          promptTokens: usage.prompt_tokens as number,
+          completionTokens: typeof usage.completion_tokens === 'number' ? usage.completion_tokens as number : 0,
+          totalTokens: typeof usage.total_tokens === 'number' ? usage.total_tokens as number : 0,
+          responseId: extractResponsesTerminalResponseId(parsed),
+          succeeded: true,
+        });
+      }
+    } catch {
+      // Non-critical: token tracking failure should not break the request
+    }
     resolveActiveRequest(session, active);
   } catch {
     // Ignore malformed frames and wait for a terminal event.
@@ -422,14 +511,24 @@ function startUpstreamReadLoop(session: CodexWebsocketSession, socket: WebSocket
       // Ping/pong is best-effort; socket errors are handled by the read loop.
     }
   });
-  socket.on('close', () => {
+  socket.on('close', (code: number, reasonBuffer: Buffer) => {
     if (socket.readyState !== WebSocket.CLOSED) return;
     if (session.socket !== socket && session.activeRequest?.socket !== socket) return;
-    invalidateUpstreamConnection(session, socket, 'upstream_closed', new Error('upstream websocket closed'));
+    const closeReason = reasonBuffer.toString('utf8');
+    invalidateUpstreamConnection(
+      session,
+      socket,
+      'upstream_closed',
+      new Error(closeReason || `upstream websocket closed (${code})`),
+      { closeCode: code, closeReason },
+    );
   });
   socket.on('error', (error: Error) => {
     if (session.socket !== socket && session.activeRequest?.socket !== socket) return;
-    invalidateUpstreamConnection(session, socket, 'read_error', error);
+    invalidateUpstreamConnection(session, socket, 'read_error', error, {
+      rawErrorName: error.name,
+      rawErrorMessage: error.message,
+    });
   });
 }
 
@@ -468,6 +567,25 @@ async function ensureSessionSocket(
   session.socketUrl = requestUrl;
   session.authId = resolveRuntimeAuthId(input);
   session.lastActivityMs = Date.now();
+
+  // Start heartbeat to keep connection alive between requests
+  if (session.heartbeatTimer) clearInterval(session.heartbeatTimer);
+  session.heartbeatTimer = setInterval(() => {
+    const currentSocket = session.socket;
+    if (!currentSocket || currentSocket.readyState !== WebSocket.OPEN) {
+      if (session.heartbeatTimer) {
+        clearInterval(session.heartbeatTimer);
+        session.heartbeatTimer = null;
+      }
+      return;
+    }
+    try {
+      currentSocket.ping();
+    } catch {
+      // Best-effort: ping failure will be caught by the read loop
+    }
+  }, CODEX_WS_HEARTBEAT_INTERVAL_MS);
+
   emitTimeline(session, 'reconnect', {
     reason: 'connected',
     payload: { requestUrl },
@@ -522,7 +640,78 @@ async function sendSessionRequest(
   input: CodexWebsocketRuntimeSendInput,
 ): Promise<CodexWebsocketRuntimeResult> {
   let currentBody = buildContinuationAwareRuntimeBody(session.sessionId, input.body);
+
+  // ── Layer 1: Pre-request predictive trimming ──────────────────────
+  // Same logic as openAiResponsesSurface — predict whether this request
+  // will exceed the context window and proactively trim the input.
+  if (config.contextWindowGuardEnabled) {
+    const modelName = typeof currentBody.model === 'string' ? currentBody.model : '';
+    const contextWindow = getModelContextWindow(modelName);
+    const trimTarget = Math.trunc(contextWindow * config.contextWindowGuardTrimTargetPercent / 100);
+
+    // Predictive check: use last successful prompt_tokens + growth rate
+    const sessionUsage = getSessionTokenUsage(session.sessionId);
+    let predictedTokens = 0;
+    if (sessionUsage && sessionUsage.lastSucceeded) {
+      predictedTokens = sessionUsage.predictedNextPromptTokens;
+    }
+
+    // Request-level estimate from input array
+    let estimatedInputTokens = 0;
+    if (isRecord(currentBody) && Array.isArray(currentBody.input)) {
+      for (const item of currentBody.input as unknown[]) {
+        try {
+          estimatedInputTokens += Math.ceil(JSON.stringify(item).length / 3);
+        } catch {
+          estimatedInputTokens += 500;
+        }
+      }
+    }
+
+    const effectiveTokens = Math.max(predictedTokens, estimatedInputTokens);
+    const shouldTrim = predictedTokens >= trimTarget || estimatedInputTokens >= trimTarget;
+
+    if (shouldTrim && isRecord(currentBody) && Array.isArray(currentBody.input)) {
+      const trimResult = trimResponsesInputToTokenBudget(currentBody, trimTarget, effectiveTokens);
+      if (trimResult.itemsRemoved > 0) {
+        console.warn(
+          '[codex-ws] Layer 1 predictive trim — removing oldest items',
+          {
+            sessionId: session.sessionId,
+            predictedTokens,
+            estimatedInputTokens,
+            effectiveTokens,
+            trimTarget,
+            itemsRemoved: trimResult.itemsRemoved,
+          },
+        );
+        currentBody = trimResult.body as Record<string, unknown>;
+        // Strip previous_response_id since context changed
+        const stripped = stripResponsesPreviousResponseId(currentBody);
+        if (stripped.removed) {
+          currentBody = stripped.body;
+          clearCodexSessionResponseId(session.sessionId);
+        }
+        clearSessionBaseline(session.sessionId);
+        // Mark session as trimmed — prevent recording response ID
+        markLayer1TrimmedSession(session.sessionId);
+      }
+    } else if (sessionUsage && sessionUsage.promptTokens >= Math.trunc(contextWindow * config.contextWindowGuardAutoCompactPercent / 100)) {
+      // Auto-compact: skip previous_response_id
+      const stripped = stripResponsesPreviousResponseId(currentBody);
+      if (stripped.removed) {
+        currentBody = stripped.body;
+        clearCodexSessionResponseId(session.sessionId);
+        clearSessionBaseline(session.sessionId);
+      }
+    } else {
+      // No trimming needed — clear the Layer 1 trimmed flag
+      clearLayer1TrimmedSession(session.sessionId);
+    }
+  }
+
   let previousResponseRecoveryTried = false;
+  let contextOverflowRecoveryTried = false;
 
   for (;;) {
     try {
@@ -538,6 +727,39 @@ async function sendSessionRequest(
         throw error;
       }
 
+      // ── Layer 3: Context window exceeded recovery ─────────────────
+      // Mirrors Codex native: ContextWindowExceeded is fatal, clear session,
+      // strip previous_response_id, trim input, retry once.
+      if (
+        !contextOverflowRecoveryTried
+        && error instanceof CodexWebsocketRuntimeError
+        && isContextWindowExceededError(error.message)
+      ) {
+        console.warn(
+          '[codex-ws] context window exceeded — clearing session and trimming input',
+          { sessionId: session.sessionId },
+        );
+        contextOverflowRecoveryTried = true;
+        clearCodexSessionResponseId(session.sessionId);
+        clearSessionTokenUsage(session.sessionId);
+        clearLayer1TrimmedSession(session.sessionId);
+        const overflowRecovery = stripResponsesPreviousResponseId(currentBody);
+        let recoveredBody = overflowRecovery.body;
+        // Layer 4: Trim input array to fit within context budget
+        if (isRecord(recoveredBody) && Array.isArray(recoveredBody.input)) {
+          const modelName = typeof recoveredBody.model === 'string' ? recoveredBody.model : '';
+          const contextWindow = getModelContextWindow(modelName);
+          const targetTokens = Math.trunc(contextWindow * 75 / 100);
+          const trimResult = trimResponsesInputToTokenBudget(recoveredBody, targetTokens, contextWindow);
+          if (trimResult.itemsRemoved > 0) {
+            recoveredBody = trimResult.body;
+          }
+        }
+        currentBody = recoveredBody;
+        continue;
+      }
+
+      // ── Previous response not found recovery (existing logic) ───────
       if (
         previousResponseRecoveryTried
         || !(error instanceof CodexWebsocketRuntimeError)
@@ -546,13 +768,44 @@ async function sendSessionRequest(
           rawErrText: error.message,
         })
       ) {
+        // ── Tool call mismatch recovery ───────────────────────────────
+        // "No tool call found" or "No tool output found" — session state
+        // is inconsistent (usually after WS reconnection). Clear session
+        // and strip previous_response_id, then retry once.
+        if (
+          !previousResponseRecoveryTried
+          && error instanceof CodexWebsocketRuntimeError
+          && isResponsesToolCallMismatchError({
+            payload: error.payload ?? error.events[error.events.length - 1],
+            rawErrText: error.message,
+          })
+        ) {
+          const toolCallRecovery = stripResponsesPreviousResponseId(currentBody);
+          if (toolCallRecovery.removed) {
+            previousResponseRecoveryTried = true;
+            clearCodexSessionResponseId(session.sessionId);
+            clearSessionTokenUsage(session.sessionId);
+            clearLayer1TrimmedSession(session.sessionId);
+            currentBody = toolCallRecovery.body;
+            console.warn(
+              '[codex-ws] tool call mismatch — clearing session and retrying',
+              { sessionId: session.sessionId },
+            );
+            continue;
+          }
+        }
+
         if (
           error instanceof CodexWebsocketRuntimeError
           && session.socket === null
           && CODEX_WS_MAX_SEND_RETRIES > 0
           && !previousResponseRecoveryTried
-          && (runtimeErrorReason(error) === 'send_error' || runtimeErrorReason(error) === 'write_error')
+          && shouldRetryFreshSocketFailure(error)
         ) {
+          console.warn(
+            '[codex-ws] fresh websocket failed before upstream events — reconnecting once',
+            { sessionId: session.sessionId, reason: runtimeErrorReason(error), payload: error.payload },
+          );
           try {
             return await sendSessionRequestAttempt(session, {
               ...input,
@@ -572,6 +825,8 @@ async function sendSessionRequest(
 
       previousResponseRecoveryTried = true;
       clearCodexSessionResponseId(session.sessionId);
+      clearSessionTokenUsage(session.sessionId);
+      clearLayer1TrimmedSession(session.sessionId);
       currentBody = previousResponseRecovery.body;
     }
   }

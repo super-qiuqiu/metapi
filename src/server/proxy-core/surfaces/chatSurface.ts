@@ -33,6 +33,7 @@ import { anthropicMessagesTransformer } from '../../transformers/anthropic/messa
 import { shouldPreferResponsesForAnthropicContinuation } from '../../transformers/anthropic/messages/compatibility.js';
 import {
   isResponsesPreviousResponseNotFoundError,
+  isResponsesToolCallMismatchError,
   stripResponsesPreviousResponseId,
 } from '../../transformers/openai/responses/continuation.js';
 import { getProxyAuthContext, getProxyResourceOwner } from '../../middleware/auth.js';
@@ -195,6 +196,8 @@ export async function handleChatSurfaceRequest(
   const failureToolkit = createSurfaceFailureToolkit({
     warningScope: 'chat',
     downstreamPath,
+    downstreamTransport: 'http',
+    upstreamTransport: 'http',
     maxRetries,
     clientContext,
     downstreamApiKeyId,
@@ -448,6 +451,33 @@ export async function handleChatSurfaceRequest(
             const recoveredRequest = {
               ...ctx.request,
               body: previousResponseRecovery.body,
+            };
+            const recoveredResponse = await dispatchRequest(recoveredRequest, ctx.targetUrl);
+            if (recoveredResponse.ok) {
+              return {
+                upstream: recoveredResponse,
+                upstreamPath: recoveredRequest.path,
+                request: recoveredRequest,
+                targetUrl: ctx.targetUrl,
+              };
+            }
+            ctx.request = recoveredRequest;
+            ctx.response = recoveredResponse;
+            ctx.rawErrText = await readRuntimeResponseText(recoveredResponse).catch(() => 'unknown error');
+          }
+        }
+        // ── Tool call mismatch recovery ────────────────────────────────
+        if (
+          ctx.request.endpoint === 'responses'
+          && isResponsesToolCallMismatchError({
+            rawErrText: ctx.rawErrText,
+          })
+        ) {
+          const toolCallRecovery = stripResponsesPreviousResponseId(ctx.request.body);
+          if (toolCallRecovery.removed) {
+            const recoveredRequest = {
+              ...ctx.request,
+              body: toolCallRecovery.body,
             };
             const recoveredResponse = await dispatchRequest(recoveredRequest, ctx.targetUrl);
             if (recoveredResponse.ok) {
@@ -1225,6 +1255,8 @@ export async function handleClaudeCountTokensSurfaceRequest(
   const failureToolkit = createSurfaceFailureToolkit({
     warningScope: 'chat',
     downstreamPath,
+    downstreamTransport: 'http',
+    upstreamTransport: 'http',
     maxRetries,
     clientContext,
     downstreamApiKeyId,

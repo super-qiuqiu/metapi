@@ -66,6 +66,12 @@ describe('buildConfig', () => {
     expect(config.codexResponsesWebsocketBeta).toBe('responses_websockets=2099-01-01');
   });
 
+  it('defaults codex websocket same-account retries and allows overriding them', () => {
+    expect(buildConfig({}).codexUpstreamWebsocketSameAccountRetries).toBe(1);
+    expect(buildConfig({ CODEX_UPSTREAM_WEBSOCKET_SAME_ACCOUNT_RETRIES: '3' }).codexUpstreamWebsocketSameAccountRetries).toBe(3);
+    expect(buildConfig({ CODEX_UPSTREAM_WEBSOCKET_SAME_ACCOUNT_RETRIES: '-1' }).codexUpstreamWebsocketSameAccountRetries).toBe(0);
+  });
+
   it('accepts JSON request bodies larger than Fastify default 1 MiB', async () => {
     const app = Fastify(buildFastifyOptions(buildConfig({})));
     const largeText = 'a'.repeat(2 * 1024 * 1024);

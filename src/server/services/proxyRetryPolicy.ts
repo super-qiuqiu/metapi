@@ -42,15 +42,45 @@ const RETRYABLE_CHANNEL_LOCAL_PATTERNS: RegExp[] = [
   ...RETRYABLE_TIMEOUT_PATTERNS,
 ];
 
-const CLIENT_CONTINUATION_FAILURE_PATTERNS: RegExp[] = [
-  /previous_response_not_found/i,
-  /previous\s+response.*not\s+found/i,
+/**
+ * Context window overflow patterns — these are the *root cause* errors
+ * that should trigger session cleanup and prevent further chaining.
+ * Separated from general continuation failures so the proxy can apply
+ * targeted recovery (clear session, trim input).
+ */
+const CONTEXT_WINDOW_EXCEEDED_PATTERNS: RegExp[] = [
+  /context_length_exceeded/i,
   /exceeds\s+the\s+context/i,
   /context\s*window/i,
+  /input\s+too\s+long/i,
+  /maximum\s+context/i,
+];
+
+/**
+ * Previous-response-not-found patterns — these are *consequence* errors
+ * that occur after a context overflow when the client tries to chain
+ * to a response that was never successfully created.
+ */
+const PREVIOUS_RESPONSE_NOT_FOUND_PATTERNS: RegExp[] = [
+  /previous_response_not_found/i,
+  /previous\s+response.*not\s+found/i,
+];
+
+/**
+ * Other client-side continuation errors that are neither context overflow
+ * nor previous-response-not-found.
+ */
+const OTHER_CONTINUATION_FAILURE_PATTERNS: RegExp[] = [
   /missing\s+required\s+parameter/i,
   /\[objectparam\]/i,
   /tool-output-only continuation cannot be safely replayed/i,
   /unable to safely recover continuation/i,
+];
+
+const CLIENT_CONTINUATION_FAILURE_PATTERNS: RegExp[] = [
+  ...CONTEXT_WINDOW_EXCEEDED_PATTERNS,
+  ...PREVIOUS_RESPONSE_NOT_FOUND_PATTERNS,
+  ...OTHER_CONTINUATION_FAILURE_PATTERNS,
 ];
 
 const NON_RETRYABLE_REQUEST_PATTERNS: RegExp[] = [
@@ -102,6 +132,22 @@ function matchesAnyPattern(patterns: RegExp[], rawMessage?: string | null): bool
  */
 export function isClientContinuationFailure(errorText: string | null | undefined): boolean {
   return matchesAnyPattern(CLIENT_CONTINUATION_FAILURE_PATTERNS, errorText);
+}
+
+/**
+ * Returns true if the error is specifically a context window overflow.
+ * This is the *root cause* that requires session cleanup.
+ */
+export function isContextWindowExceededRetryPolicy(errorText: string | null | undefined): boolean {
+  return matchesAnyPattern(CONTEXT_WINDOW_EXCEEDED_PATTERNS, errorText);
+}
+
+/**
+ * Returns true if the error is specifically a "previous response not found" error.
+ * This is a *consequence* error that follows context overflow.
+ */
+export function isPreviousResponseNotFoundError(errorText: string | null | undefined): boolean {
+  return matchesAnyPattern(PREVIOUS_RESPONSE_NOT_FOUND_PATTERNS, errorText);
 }
 
 export function shouldRetryProxyRequest(status: number, upstreamErrorText?: string | null): boolean {
