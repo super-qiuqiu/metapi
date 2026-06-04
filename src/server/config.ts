@@ -60,7 +60,7 @@ export function normalizeTokenRouterFailureCooldownMaxSec(value: unknown): numbe
 }
 
 export function normalizeRoutingAlgorithm(value: unknown): 'legacy' | 'bandit' {
-  const normalized = String(value || 'legacy').trim().toLowerCase();
+  const normalized = String(value || 'bandit').trim().toLowerCase();
   return normalized === 'bandit' ? 'bandit' : 'legacy';
 }
 

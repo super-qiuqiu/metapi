@@ -65,6 +65,10 @@ interface RuntimeSettingsBody {
   responsesCompactFallbackToResponsesEnabled?: boolean;
   responsesRequireContinuitySession?: boolean;
   responsesStrictPreviousResponseRecovery?: boolean;
+  contextWindowGuardEnabled?: boolean;
+  contextWindowGuardAutoCompactPercent?: number;
+  contextWindowGuardHardTrimPercent?: number;
+  contextWindowGuardTrimTargetPercent?: number;
   disableCrossProtocolFallback?: boolean;
   proxySessionChannelConcurrencyLimit?: number;
   proxySessionChannelQueueWaitMs?: number;
@@ -476,6 +480,29 @@ function applyImportedSettingToRuntime(key: string, value: unknown) {
       config.responsesStrictPreviousResponseRecovery = value;
       return;
     }
+    case 'context_window_guard_enabled': {
+      if (typeof value !== 'boolean') return;
+      config.contextWindowGuardEnabled = value;
+      return;
+    }
+    case 'context_window_guard_auto_compact_percent': {
+      const v = Number(value);
+      if (!Number.isFinite(v) || v < 50 || v > 99) return;
+      config.contextWindowGuardAutoCompactPercent = Math.trunc(v);
+      return;
+    }
+    case 'context_window_guard_hard_trim_percent': {
+      const v = Number(value);
+      if (!Number.isFinite(v) || v < 60 || v > 99) return;
+      config.contextWindowGuardHardTrimPercent = Math.trunc(v);
+      return;
+    }
+    case 'context_window_guard_trim_target_percent': {
+      const v = Number(value);
+      if (!Number.isFinite(v) || v < 40 || v > 90) return;
+      config.contextWindowGuardTrimTargetPercent = Math.trunc(v);
+      return;
+    }
     case 'disable_cross_protocol_fallback': {
       if (typeof value !== 'boolean') return;
       config.disableCrossProtocolFallback = value;
@@ -859,6 +886,10 @@ function getRuntimeSettingsResponse(currentAdminIp = '') {
     responsesCompactFallbackToResponsesEnabled: config.responsesCompactFallbackToResponsesEnabled,
     responsesRequireContinuitySession: config.responsesRequireContinuitySession,
     responsesStrictPreviousResponseRecovery: config.responsesStrictPreviousResponseRecovery,
+    contextWindowGuardEnabled: config.contextWindowGuardEnabled,
+    contextWindowGuardAutoCompactPercent: config.contextWindowGuardAutoCompactPercent,
+    contextWindowGuardHardTrimPercent: config.contextWindowGuardHardTrimPercent,
+    contextWindowGuardTrimTargetPercent: config.contextWindowGuardTrimTargetPercent,
     disableCrossProtocolFallback: config.disableCrossProtocolFallback,
     proxySessionChannelConcurrencyLimit: config.proxySessionChannelConcurrencyLimit,
     proxySessionChannelQueueWaitMs: config.proxySessionChannelQueueWaitMs,
@@ -1430,6 +1461,60 @@ export async function settingsRoutes(app: FastifyInstance) {
       }
       config.responsesStrictPreviousResponseRecovery = nextValue;
       upsertSetting('responses_strict_previous_response_recovery', config.responsesStrictPreviousResponseRecovery);
+    }
+
+    // ── Context Window Guard settings ────────────────────────────────
+    if (body.contextWindowGuardEnabled !== undefined) {
+      let nextValue = true;
+      try {
+        nextValue = parseBooleanFlag(body.contextWindowGuardEnabled, '上下文窗口防护开关');
+      } catch (err: any) {
+        return reply.code(400).send({
+          success: false,
+          message: err?.message || '上下文窗口防护开关格式无效',
+        });
+      }
+      if (nextValue !== config.contextWindowGuardEnabled) {
+        changedLabels.push(nextValue ? '开启上下文窗口防护' : '关闭上下文窗口防护');
+      }
+      config.contextWindowGuardEnabled = nextValue;
+      upsertSetting('context_window_guard_enabled', config.contextWindowGuardEnabled);
+    }
+
+    if (body.contextWindowGuardAutoCompactPercent !== undefined) {
+      const v = Math.trunc(Number(body.contextWindowGuardAutoCompactPercent));
+      if (!Number.isFinite(v) || v < 50 || v > 99) {
+        return reply.code(400).send({ success: false, message: '自动压缩阈值必须在 50~99 之间' });
+      }
+      if (v !== config.contextWindowGuardAutoCompactPercent) {
+        changedLabels.push(`自动压缩阈值 → ${v}%`);
+      }
+      config.contextWindowGuardAutoCompactPercent = v;
+      upsertSetting('context_window_guard_auto_compact_percent', v);
+    }
+
+    if (body.contextWindowGuardHardTrimPercent !== undefined) {
+      const v = Math.trunc(Number(body.contextWindowGuardHardTrimPercent));
+      if (!Number.isFinite(v) || v < 60 || v > 99) {
+        return reply.code(400).send({ success: false, message: '硬截断阈值必须在 60~99 之间' });
+      }
+      if (v !== config.contextWindowGuardHardTrimPercent) {
+        changedLabels.push(`硬截断阈值 → ${v}%`);
+      }
+      config.contextWindowGuardHardTrimPercent = v;
+      upsertSetting('context_window_guard_hard_trim_percent', v);
+    }
+
+    if (body.contextWindowGuardTrimTargetPercent !== undefined) {
+      const v = Math.trunc(Number(body.contextWindowGuardTrimTargetPercent));
+      if (!Number.isFinite(v) || v < 40 || v > 90) {
+        return reply.code(400).send({ success: false, message: '截断目标百分比必须在 40~90 之间' });
+      }
+      if (v !== config.contextWindowGuardTrimTargetPercent) {
+        changedLabels.push(`截断目标 → ${v}%`);
+      }
+      config.contextWindowGuardTrimTargetPercent = v;
+      upsertSetting('context_window_guard_trim_target_percent', v);
     }
 
     if (body.disableCrossProtocolFallback !== undefined) {

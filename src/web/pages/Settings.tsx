@@ -54,9 +54,24 @@ const CHECKIN_INTERVAL_OPTIONS = Array.from({ length: 24 }, (_, index) => {
 });
 type DbDialect = 'sqlite' | 'mysql' | 'postgres';
 type RouteCooldownUnit = typeof ROUTE_COOLDOWN_UNIT_OPTIONS[number]['value'];
+type RoutingAlgorithm = 'legacy' | 'bandit';
+type RoutingBanditFeatureKey = keyof RoutingBanditFeatures;
+type RoutingBanditWeightKey = keyof RoutingBanditWeights;
 type SettingsPillTone = 'neutral' | 'primary' | 'danger' | 'warning';
 type PayloadRulesEditorSectionKey = PayloadRuleAction;
 type PayloadRulesEditorDrafts = Record<PayloadRulesEditorSectionKey, string>;
+type RoutingBanditFeatures = {
+  ewmaHealth: boolean;
+  expectedCost: boolean;
+  tsSampling: boolean;
+  p2c: boolean;
+};
+type RoutingBanditWeights = {
+  theta: number;
+  latency: number;
+  cost: number;
+  manual: number;
+};
 
 type RuntimeSettings = {
   checkinCron: string;
@@ -72,6 +87,10 @@ type RuntimeSettings = {
   codexStickyAccountEnabled: boolean;
   codexStickyAccountQuotaThresholdPercent: number;
   responsesCompactFallbackToResponsesEnabled: boolean;
+  contextWindowGuardEnabled: boolean;
+  contextWindowGuardAutoCompactPercent: number;
+  contextWindowGuardHardTrimPercent: number;
+  contextWindowGuardTrimTargetPercent: number;
   disableCrossProtocolFallback: boolean;
   proxySessionChannelConcurrencyLimit: number;
   proxySessionChannelQueueWaitMs: number;
@@ -80,6 +99,13 @@ type RuntimeSettings = {
   routeFailureCooldownMaxValue: number;
   routeFailureCooldownMaxUnit: RouteCooldownUnit;
   routingWeights: RoutingWeights;
+  routingAlgorithm: RoutingAlgorithm;
+  routingBanditFeatures: RoutingBanditFeatures;
+  routingBanditWeights: RoutingBanditWeights;
+  routingBanditGuardrailEnabled: boolean;
+  routingBanditGuardrailMinSamples: number;
+  routingBanditGuardrailMaxRetryableFailureRate: number;
+  routingBanditGuardrailMaxP95LatencyMs: number;
   systemProxyUrl: string;
   proxyErrorKeywords: string[];
   proxyEmptyContentFailEnabled: boolean;
@@ -280,6 +306,20 @@ const defaultWeights: RoutingWeights = {
   usageWeight: 0.3,
 };
 
+const defaultBanditFeatures: RoutingBanditFeatures = {
+  ewmaHealth: true,
+  expectedCost: true,
+  tsSampling: true,
+  p2c: true,
+};
+
+const defaultBanditWeights: RoutingBanditWeights = {
+  theta: 1,
+  latency: 0.25,
+  cost: 0.45,
+  manual: 0.15,
+};
+
 function getDialectDefaults(dialect: DbDialect) {
   if (dialect === 'mysql') {
     return { port: '3306', database: 'mysql' };
@@ -353,9 +393,13 @@ export default function Settings() {
     logCleanupRetentionDays: 30,
     modelAvailabilityProbeEnabled: false,
     codexUpstreamWebsocketEnabled: false,
-    codexStickyAccountEnabled: false,
+    codexStickyAccountEnabled: true,
     codexStickyAccountQuotaThresholdPercent: 10,
     responsesCompactFallbackToResponsesEnabled: false,
+    contextWindowGuardEnabled: true,
+    contextWindowGuardAutoCompactPercent: 80,
+    contextWindowGuardHardTrimPercent: 95,
+    contextWindowGuardTrimTargetPercent: 75,
     disableCrossProtocolFallback: false,
     proxySessionChannelConcurrencyLimit: 2,
     proxySessionChannelQueueWaitMs: 1500,
@@ -364,6 +408,13 @@ export default function Settings() {
     routeFailureCooldownMaxValue: 30,
     routeFailureCooldownMaxUnit: 'day',
     routingWeights: defaultWeights,
+    routingAlgorithm: 'bandit',
+    routingBanditFeatures: defaultBanditFeatures,
+    routingBanditWeights: defaultBanditWeights,
+    routingBanditGuardrailEnabled: true,
+    routingBanditGuardrailMinSamples: 60,
+    routingBanditGuardrailMaxRetryableFailureRate: 0.08,
+    routingBanditGuardrailMaxP95LatencyMs: 15000,
     systemProxyUrl: '',
     proxyErrorKeywords: [],
     proxyEmptyContentFailEnabled: false,
@@ -685,6 +736,13 @@ export default function Settings() {
           ? Math.trunc(runtimeInfo.codexStickyAccountQuotaThresholdPercent)
           : 10,
         responsesCompactFallbackToResponsesEnabled: !!runtimeInfo.responsesCompactFallbackToResponsesEnabled,
+        contextWindowGuardEnabled: runtimeInfo.contextWindowGuardEnabled !== false,
+        contextWindowGuardAutoCompactPercent: typeof runtimeInfo.contextWindowGuardAutoCompactPercent === 'number'
+          ? Math.trunc(runtimeInfo.contextWindowGuardAutoCompactPercent) : 80,
+        contextWindowGuardHardTrimPercent: typeof runtimeInfo.contextWindowGuardHardTrimPercent === 'number'
+          ? Math.trunc(runtimeInfo.contextWindowGuardHardTrimPercent) : 95,
+        contextWindowGuardTrimTargetPercent: typeof runtimeInfo.contextWindowGuardTrimTargetPercent === 'number'
+          ? Math.trunc(runtimeInfo.contextWindowGuardTrimTargetPercent) : 75,
         disableCrossProtocolFallback: !!runtimeInfo.disableCrossProtocolFallback,
         proxySessionChannelConcurrencyLimit: Number(runtimeInfo.proxySessionChannelConcurrencyLimit) >= 0
           ? Math.trunc(Number(runtimeInfo.proxySessionChannelConcurrencyLimit))
@@ -704,6 +762,25 @@ export default function Settings() {
           ...defaultWeights,
           ...(runtimeInfo.routingWeights || {}),
         },
+        routingAlgorithm: runtimeInfo.routingAlgorithm === 'legacy' ? 'legacy' : 'bandit',
+        routingBanditFeatures: {
+          ...defaultBanditFeatures,
+          ...(runtimeInfo.routingBanditFeatures || {}),
+        },
+        routingBanditWeights: {
+          ...defaultBanditWeights,
+          ...(runtimeInfo.routingBanditWeights || {}),
+        },
+        routingBanditGuardrailEnabled: runtimeInfo.routingBanditGuardrailEnabled !== false,
+        routingBanditGuardrailMinSamples: Number(runtimeInfo.routingBanditGuardrailMinSamples) >= 10
+          ? Math.trunc(Number(runtimeInfo.routingBanditGuardrailMinSamples))
+          : 60,
+        routingBanditGuardrailMaxRetryableFailureRate: Number(runtimeInfo.routingBanditGuardrailMaxRetryableFailureRate) > 0
+          ? Number(runtimeInfo.routingBanditGuardrailMaxRetryableFailureRate)
+          : 0.08,
+        routingBanditGuardrailMaxP95LatencyMs: Number(runtimeInfo.routingBanditGuardrailMaxP95LatencyMs) >= 100
+          ? Math.trunc(Number(runtimeInfo.routingBanditGuardrailMaxP95LatencyMs))
+          : 15000,
         systemProxyUrl: typeof runtimeInfo.systemProxyUrl === 'string' ? runtimeInfo.systemProxyUrl : '',
         proxyErrorKeywords: Array.isArray(runtimeInfo.proxyErrorKeywords)
           ? runtimeInfo.proxyErrorKeywords.filter((item: unknown) => typeof item === 'string')
@@ -903,6 +980,10 @@ export default function Settings() {
         codexStickyAccountEnabled: runtime.codexStickyAccountEnabled,
         codexStickyAccountQuotaThresholdPercent: runtime.codexStickyAccountQuotaThresholdPercent,
         responsesCompactFallbackToResponsesEnabled: runtime.responsesCompactFallbackToResponsesEnabled,
+        contextWindowGuardEnabled: runtime.contextWindowGuardEnabled,
+        contextWindowGuardAutoCompactPercent: runtime.contextWindowGuardAutoCompactPercent,
+        contextWindowGuardHardTrimPercent: runtime.contextWindowGuardHardTrimPercent,
+        contextWindowGuardTrimTargetPercent: runtime.contextWindowGuardTrimTargetPercent,
         proxySessionChannelConcurrencyLimit: runtime.proxySessionChannelConcurrencyLimit,
         proxySessionChannelQueueWaitMs: runtime.proxySessionChannelQueueWaitMs,
       });
@@ -920,6 +1001,16 @@ export default function Settings() {
         responsesCompactFallbackToResponsesEnabled: typeof res?.responsesCompactFallbackToResponsesEnabled === 'boolean'
           ? res.responsesCompactFallbackToResponsesEnabled
           : prev.responsesCompactFallbackToResponsesEnabled,
+        contextWindowGuardEnabled: res?.contextWindowGuardEnabled !== false,
+        contextWindowGuardAutoCompactPercent: typeof res?.contextWindowGuardAutoCompactPercent === 'number'
+          ? Math.trunc(res.contextWindowGuardAutoCompactPercent)
+          : prev.contextWindowGuardAutoCompactPercent,
+        contextWindowGuardHardTrimPercent: typeof res?.contextWindowGuardHardTrimPercent === 'number'
+          ? Math.trunc(res.contextWindowGuardHardTrimPercent)
+          : prev.contextWindowGuardHardTrimPercent,
+        contextWindowGuardTrimTargetPercent: typeof res?.contextWindowGuardTrimTargetPercent === 'number'
+          ? Math.trunc(res.contextWindowGuardTrimTargetPercent)
+          : prev.contextWindowGuardTrimTargetPercent,
         proxySessionChannelConcurrencyLimit: Number(res?.proxySessionChannelConcurrencyLimit) >= 0
           ? Math.trunc(Number(res.proxySessionChannelConcurrencyLimit))
           : prev.proxySessionChannelConcurrencyLimit,
@@ -1066,6 +1157,13 @@ export default function Settings() {
     try {
       await api.updateRuntimeSettings({
         routingWeights: runtime.routingWeights,
+        routingAlgorithm: runtime.routingAlgorithm,
+        routingBanditFeatures: runtime.routingBanditFeatures,
+        routingBanditWeights: runtime.routingBanditWeights,
+        routingBanditGuardrailEnabled: runtime.routingBanditGuardrailEnabled,
+        routingBanditGuardrailMinSamples: runtime.routingBanditGuardrailMinSamples,
+        routingBanditGuardrailMaxRetryableFailureRate: runtime.routingBanditGuardrailMaxRetryableFailureRate,
+        routingBanditGuardrailMaxP95LatencyMs: runtime.routingBanditGuardrailMaxP95LatencyMs,
         routingFallbackUnitCost: runtime.routingFallbackUnitCost,
         proxyFirstByteTimeoutSec: Number.isFinite(runtime.proxyFirstByteTimeoutSec)
           ? Math.max(0, Math.trunc(runtime.proxyFirstByteTimeoutSec))
@@ -1076,7 +1174,7 @@ export default function Settings() {
         ),
         disableCrossProtocolFallback: runtime.disableCrossProtocolFallback,
       });
-      toast.success('Routing weights saved');
+      toast.success('路由设置已保存');
     } catch (err: any) {
       toast.error(err?.message || '保存失败');
     } finally {
@@ -1874,6 +1972,89 @@ export default function Settings() {
               style={{ width: 16, height: 16, marginTop: 2, flexShrink: 0 }}
             />
           </label>
+          {/* ── Context Window Guard (4层上下文防护) ─────────────────── */}
+          <div style={{ marginTop: 8, marginBottom: 4, fontSize: 13, fontWeight: 700, color: 'var(--color-text-primary)', display: 'flex', alignItems: 'center', gap: 6 }}>
+            <span style={{ fontSize: 16 }}>🛡️</span> 上下文窗口防护
+            <span style={{ fontSize: 11, fontWeight: 400, color: 'var(--color-text-muted)', marginLeft: 4 }}>对标 Codex 原生 4 层 compaction 防护</span>
+          </div>
+          <label style={settingsModernToggleStyle}>
+            <div style={settingsModernToggleCopyStyle}>
+              <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text-secondary)' }}>启用上下文窗口防护</span>
+              <span style={{ fontSize: 12, lineHeight: 1.7, color: 'var(--color-text-muted)' }}>
+                4 层防护：① 请求前 token 预算检查 ② 上下文溢出时自动清除会话 ③ 自动截断过长输入 ④ 失败 response ID 不记录。对标 OpenAI Codex 原生 compaction 机制。
+              </span>
+            </div>
+            <input
+              type="checkbox"
+              checked={runtime.contextWindowGuardEnabled}
+              onChange={(e) => setRuntime((prev) => ({ ...prev, contextWindowGuardEnabled: e.target.checked }))}
+              style={{ width: 16, height: 16, marginTop: 2, flexShrink: 0 }}
+            />
+          </label>
+          <div style={{ ...settingsModernFieldCardStyle, opacity: runtime.contextWindowGuardEnabled ? 1 : 0.5, pointerEvents: runtime.contextWindowGuardEnabled ? 'auto' : 'none' }}>
+            <ResponsiveFormGrid columns={3}>
+              <div>
+                <div style={settingsModernFieldLabelStyle}>自动压缩阈值 (%)</div>
+                <input
+                  type="number"
+                  min={50}
+                  max={99}
+                  step={1}
+                  value={runtime.contextWindowGuardAutoCompactPercent}
+                  onChange={(e) => {
+                    const v = Math.trunc(Number(e.target.value));
+                    if (Number.isFinite(v) && v >= 50 && v <= 99) {
+                      setRuntime((prev) => ({ ...prev, contextWindowGuardAutoCompactPercent: v }));
+                    }
+                  }}
+                  style={inputStyle}
+                />
+                <div style={settingsModernFieldHintStyle}>
+                  当 token 用量占 context window 的百分比达到此值时，跳过 previous_response_id 注入，强制完整上下文发送。默认 80%。
+                </div>
+              </div>
+              <div>
+                <div style={settingsModernFieldLabelStyle}>硬截断阈值 (%)</div>
+                <input
+                  type="number"
+                  min={60}
+                  max={99}
+                  step={1}
+                  value={runtime.contextWindowGuardHardTrimPercent}
+                  onChange={(e) => {
+                    const v = Math.trunc(Number(e.target.value));
+                    if (Number.isFinite(v) && v >= 60 && v <= 99) {
+                      setRuntime((prev) => ({ ...prev, contextWindowGuardHardTrimPercent: v }));
+                    }
+                  }}
+                  style={inputStyle}
+                />
+                <div style={settingsModernFieldHintStyle}>
+                  达到此百分比时不仅跳过 previous_response_id，还会主动截断 input 数组以避免请求失败。默认 95%。
+                </div>
+              </div>
+              <div>
+                <div style={settingsModernFieldLabelStyle}>截断目标 (%)</div>
+                <input
+                  type="number"
+                  min={40}
+                  max={90}
+                  step={1}
+                  value={runtime.contextWindowGuardTrimTargetPercent}
+                  onChange={(e) => {
+                    const v = Math.trunc(Number(e.target.value));
+                    if (Number.isFinite(v) && v >= 40 && v <= 90) {
+                      setRuntime((prev) => ({ ...prev, contextWindowGuardTrimTargetPercent: v }));
+                    }
+                  }}
+                  style={inputStyle}
+                />
+                <div style={settingsModernFieldHintStyle}>
+                  截断 input 后的目标百分比（相对于 context window）。截断时保留 system/developer 消息和最新轮次。默认 75%。
+                </div>
+              </div>
+            </ResponsiveFormGrid>
+          </div>
           <ResponsiveFormGrid columns={2}>
             <div style={settingsModernFieldCardStyle}>
               <div style={settingsModernFieldLabelStyle}>会话通道并发上限</div>
@@ -2090,115 +2271,148 @@ export default function Settings() {
           </button>
         </div>
 
-        <div className="card animate-slide-up stagger-5" style={{ padding: 20 }}>
-          <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 10 }}>路由策略</div>
-          <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 12 }}>
-            先选择预设策略，只有需要精调时再展开高级参数。
-          </div>
-          <div style={{ marginBottom: 12, maxWidth: 280 }}>
-            <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>
-                无实测/配置/目录价时默认单价
+        <div className="card animate-slide-up stagger-5" style={settingsModernCardStyle} data-settings-card="routing-policy">
+          <div style={settingsModernHeaderStyle}>
+            <div style={settingsModernTitleBlockStyle}>
+              <div style={settingsModernTitleStyle}>路由策略栈</div>
+              <div style={settingsModernDescriptionStyle}>
+                这里配置全局选择算法、故障切换和评分参数。单条路由的 weighted / round_robin / stable_first，以及 OAuth 路由池策略在「路由」和「OAuth」页面配置。
+              </div>
             </div>
-            <input
-              type="number"
-              min={0.000001}
-              step={0.000001}
-              value={runtime.routingFallbackUnitCost}
-              onChange={(e) => {
-                const nextValue = Number(e.target.value);
-                setRuntime((prev) => ({
+            <div style={settingsModernPillRowStyle}>
+              <span style={getSettingsPillStyle(runtime.routingAlgorithm === 'bandit' ? 'primary' : 'neutral')}>
+                {runtime.routingAlgorithm === 'bandit' ? 'Bandit 算法' : 'Legacy 权重'}
+              </span>
+              <span style={getSettingsPillStyle(runtime.disableCrossProtocolFallback ? 'warning' : 'neutral')}>
+                {runtime.disableCrossProtocolFallback ? '禁用跨协议降级' : '允许跨协议降级'}
+              </span>
+            </div>
+          </div>
+
+          <div style={settingsModernCalloutStyle}>
+            <div style={settingsModernFieldLabelStyle}>当前代码中的路由层级</div>
+            <div style={{ ...settingsModernFieldHintStyle, marginTop: 0 }}>
+              请求先按群组显示名、精确模型、显示名、通配/正则匹配路由；再按路由级策略选择外层通道；如果命中 OAuth 路由池，再按池成员策略选择真实账号。
+            </div>
+          </div>
+
+          <ResponsiveFormGrid columns={2}>
+            <div style={settingsModernFieldCardStyle}>
+              <div style={settingsModernFieldLabelStyle}>全局通道算法</div>
+              <ModernSelect
+                size="sm"
+                value={runtime.routingAlgorithm}
+                onChange={(nextValue) => setRuntime((prev) => ({
                   ...prev,
-                  routingFallbackUnitCost: Number.isFinite(nextValue) && nextValue > 0 ? nextValue : prev.routingFallbackUnitCost,
-                }));
-              }}
-              style={inputStyle}
-            />
-          </div>
-          <div style={{ marginBottom: 12, maxWidth: 420 }}>
-            <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>
-              普通失败冷却上限
+                  routingAlgorithm: nextValue === 'bandit' ? 'bandit' : 'legacy',
+                }))}
+                options={[
+                  { value: 'legacy', label: 'Legacy：P 层内权重随机' },
+                  { value: 'bandit', label: 'Bandit：成功率 / 延迟 / 成本自适应' },
+                ]}
+                placeholder="选择算法"
+              />
+              <div style={settingsModernFieldHintStyle}>
+                只影响路由级策略为「权重随机」时的层内选择；轮询和稳定优先仍走各自逻辑。
+              </div>
             </div>
-            <div style={{ display: 'flex', gap: 10, alignItems: 'stretch', flexWrap: 'wrap' }}>
+
+            <div style={settingsModernFieldCardStyle}>
+              <div style={settingsModernFieldLabelStyle}>无价格信号默认单价</div>
               <input
                 type="number"
-                aria-label="路由失败冷却上限数值"
-                min={1}
-                step={1}
-                value={runtime.routeFailureCooldownMaxValue}
+                min={0.000001}
+                step={0.000001}
+                value={runtime.routingFallbackUnitCost}
                 onChange={(e) => {
                   const nextValue = Number(e.target.value);
                   setRuntime((prev) => ({
                     ...prev,
-                    routeFailureCooldownMaxValue: Number.isFinite(nextValue) && nextValue > 0
-                      ? Math.max(1, Math.trunc(nextValue))
-                      : prev.routeFailureCooldownMaxValue,
+                    routingFallbackUnitCost: Number.isFinite(nextValue) && nextValue > 0 ? nextValue : prev.routingFallbackUnitCost,
                   }));
                 }}
-                style={{ ...inputStyle, flex: '1 1 180px', marginBottom: 0 }}
+                style={inputStyle}
               />
-              <div style={{ width: 132, minWidth: 132 }}>
-                <ModernSelect
-                  size="sm"
-                  value={runtime.routeFailureCooldownMaxUnit}
-                  onChange={(nextValue) => {
-                    setRuntime((prev) => ({
-                      ...prev,
-                      routeFailureCooldownMaxUnit: nextValue as RouteCooldownUnit,
-                    }));
-                  }}
-                  options={ROUTE_COOLDOWN_UNIT_OPTIONS.map((option) => ({
-                    value: option.value,
-                    label: option.label,
-                  }))}
-                  placeholder="选择单位"
-                />
+              <div style={settingsModernFieldHintStyle}>
+                成本来源顺序：实测成本 → 账号配置成本 → 目录参考价 → 默认单价。
               </div>
             </div>
-            <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginTop: 6, lineHeight: 1.6 }}>
-              支持秒、分钟、小时、天。只封顶普通失败与轮询分级冷却；429 限额类冷却仍优先遵循上游 reset 提示，避免过早重试。
-            </div>
-          </div>
-          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 12 }}>
-            <button
-              onClick={() => applyRoutingPreset('balanced')}
-              className="btn btn-ghost"
-              style={{
-                border: activeRoutingProfile === 'balanced' ? '1px solid var(--color-primary)' : '1px solid var(--color-border)',
-                color: activeRoutingProfile === 'balanced' ? 'var(--color-primary)' : undefined,
-              }}
-            >
-              均衡
-            </button>
-            <button
-              onClick={() => applyRoutingPreset('stable')}
-              className="btn btn-ghost"
-              style={{
-                border: activeRoutingProfile === 'stable' ? '1px solid var(--color-primary)' : '1px solid var(--color-border)',
-                color: activeRoutingProfile === 'stable' ? 'var(--color-primary)' : undefined,
-              }}
-            >
-              稳定优先
-            </button>
-            <button
-              onClick={() => applyRoutingPreset('cost')}
-              className="btn btn-ghost"
-              style={{
-                border: activeRoutingProfile === 'cost' ? '1px solid var(--color-primary)' : '1px solid var(--color-border)',
-                color: activeRoutingProfile === 'cost' ? 'var(--color-primary)' : undefined,
-              }}
-            >
-              成本优先
-            </button>
-            <button
-              onClick={() => setShowAdvancedRouting((prev) => !prev)}
-              className="btn btn-ghost"
-              style={{ border: '1px solid var(--color-border)' }}
-            >
-              {showAdvancedRouting ? '收起高级参数' : '展开高级参数'}
-            </button>
-          </div>
+          </ResponsiveFormGrid>
 
-          <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, marginBottom: 12, cursor: 'pointer' }}>
+          <ResponsiveFormGrid columns={2}>
+            <div style={settingsModernFieldCardStyle}>
+              <div style={settingsModernFieldLabelStyle}>普通失败冷却上限</div>
+              <div style={{ display: 'flex', gap: 10, alignItems: 'stretch', flexWrap: 'wrap' }}>
+                <input
+                  type="number"
+                  aria-label="路由失败冷却上限数值"
+                  min={1}
+                  step={1}
+                  value={runtime.routeFailureCooldownMaxValue}
+                  onChange={(e) => {
+                    const nextValue = Number(e.target.value);
+                    setRuntime((prev) => ({
+                      ...prev,
+                      routeFailureCooldownMaxValue: Number.isFinite(nextValue) && nextValue > 0
+                        ? Math.max(1, Math.trunc(nextValue))
+                        : prev.routeFailureCooldownMaxValue,
+                    }));
+                  }}
+                  style={{ ...inputStyle, flex: '1 1 160px', marginBottom: 0 }}
+                />
+                <div style={{ width: 132, minWidth: 132 }}>
+                  <ModernSelect
+                    size="sm"
+                    value={runtime.routeFailureCooldownMaxUnit}
+                    onChange={(nextValue) => setRuntime((prev) => ({
+                      ...prev,
+                      routeFailureCooldownMaxUnit: nextValue as RouteCooldownUnit,
+                    }))}
+                    options={ROUTE_COOLDOWN_UNIT_OPTIONS.map((option) => ({
+                      value: option.value,
+                      label: option.label,
+                    }))}
+                    placeholder="选择单位"
+                  />
+                </div>
+              </div>
+              <div style={settingsModernFieldHintStyle}>
+                只封顶普通失败与轮询分级冷却；429 限额类仍优先遵循上游 reset。
+              </div>
+            </div>
+
+            <div style={settingsModernFieldCardStyle}>
+              <div style={settingsModernFieldLabelStyle}>首字超时（秒）</div>
+              <input
+                type="number"
+                min={0}
+                step={1}
+                aria-label="首字超时秒数"
+                value={runtime.proxyFirstByteTimeoutSec}
+                onChange={(e) => {
+                  const nextValue = Number(e.target.value);
+                  setRuntime((prev) => ({
+                    ...prev,
+                    proxyFirstByteTimeoutSec: Number.isFinite(nextValue) && nextValue >= 0
+                      ? Math.trunc(nextValue)
+                      : prev.proxyFirstByteTimeoutSec,
+                  }));
+                }}
+                style={inputStyle}
+              />
+              <div style={settingsModernFieldHintStyle}>
+                `0` 表示关闭。仅在完全没有首包 / 首 token 时触发，不会打断已开始输出的请求。
+              </div>
+            </div>
+          </ResponsiveFormGrid>
+
+          <label style={settingsModernToggleStyle}>
+            <div style={settingsModernToggleCopyStyle}>
+              <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text-secondary)' }}>失败时不尝试其他协议</span>
+              <span style={{ fontSize: 12, lineHeight: 1.7, color: 'var(--color-text-muted)' }}>
+                仅影响 chat / messages / responses 之间的协议切换；不会关闭同协议兼容重试、OAuth 刷新或通道级 failover。
+              </span>
+            </div>
             <input
               type="checkbox"
               checked={runtime.disableCrossProtocolFallback}
@@ -2206,68 +2420,136 @@ export default function Settings() {
                 ...prev,
                 disableCrossProtocolFallback: e.target.checked,
               }))}
-              style={{ marginTop: 2 }}
+              style={{ width: 16, height: 16, marginTop: 2, flexShrink: 0 }}
             />
-            <span>
-              <span style={{ display: 'block', fontSize: 13, fontWeight: 600, color: 'var(--color-text-primary)' }}>
-                失败时不尝试其他协议
-              </span>
-              <span style={{ display: 'block', fontSize: 12, color: 'var(--color-text-muted)', lineHeight: 1.7 }}>
-                仅影响 chat / messages / responses 之间的协议切换；不会关闭同协议兼容重试、OAuth 刷新或通道级重试。
-              </span>
-            </span>
           </label>
 
-          <div style={{ marginBottom: 12 }}>
-            <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>
-              首字超时（无首包 / 首 token）
+          {runtime.routingAlgorithm === 'legacy' ? (
+            <div style={settingsModernFieldCardStyle}>
+              <div style={settingsModernHeaderStyle}>
+                <div style={settingsModernTitleBlockStyle}>
+                  <div style={settingsModernFieldLabelStyle}>Legacy 权重随机参数</div>
+                  <div style={settingsModernFieldHintStyle}>
+                    这些参数用于 weighted 路由的 legacy 算法：P 值先分层，只有当前最高可用 P 层会参与评分随机。
+                  </div>
+                </div>
+                <div style={settingsModernPillRowStyle}>
+                  {(['balanced', 'stable', 'cost'] as const).map((preset) => (
+                    <button
+                      key={preset}
+                      type="button"
+                      onClick={() => applyRoutingPreset(preset)}
+                      className="btn btn-ghost"
+                      style={{
+                        border: activeRoutingProfile === preset ? '1px solid var(--color-primary)' : '1px solid var(--color-border)',
+                        color: activeRoutingProfile === preset ? 'var(--color-primary)' : undefined,
+                      }}
+                    >
+                      {preset === 'balanced' ? '均衡' : preset === 'stable' ? '稳定参数' : '成本参数'}
+                    </button>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={() => setShowAdvancedRouting((prev) => !prev)}
+                    className="btn btn-ghost"
+                    style={{ border: '1px solid var(--color-border)' }}
+                  >
+                    {showAdvancedRouting ? '收起参数' : '展开参数'}
+                  </button>
+                </div>
+              </div>
+              <div className={`anim-collapse ${showAdvancedRouting ? 'is-open' : ''}`.trim()}>
+                <div className="anim-collapse-inner" style={{ paddingTop: 2 }}>
+                  <ResponsiveFormGrid columns={2}>
+                    {([
+                      ['baseWeightFactor', '基础权重因子'],
+                      ['valueScoreFactor', '价值分因子'],
+                      ['costWeight', '成本权重'],
+                      ['balanceWeight', '余额权重'],
+                      ['usageWeight', '使用频次权重'],
+                    ] as Array<[keyof RoutingWeights, string]>).map(([key, label]) => (
+                      <div key={key}>
+                        <div style={settingsModernFieldLabelStyle}>{label}</div>
+                        <input
+                          type="number"
+                          min={0}
+                          step={0.1}
+                          value={runtime.routingWeights[key]}
+                          onChange={(e) => {
+                            const v = Number(e.target.value);
+                            setRuntime((prev) => ({
+                              ...prev,
+                              routingWeights: {
+                                ...prev.routingWeights,
+                                [key]: Number.isFinite(v) ? v : 0,
+                              },
+                            }));
+                          }}
+                          style={inputStyle}
+                        />
+                      </div>
+                    ))}
+                  </ResponsiveFormGrid>
+                </div>
+              </div>
             </div>
-            <input
-              type="number"
-              min={0}
-              step={1}
-              aria-label="首字超时秒数"
-              value={runtime.proxyFirstByteTimeoutSec}
-              onChange={(e) => {
-                const nextValue = Number(e.target.value);
-                setRuntime((prev) => ({
-                  ...prev,
-                  proxyFirstByteTimeoutSec: Number.isFinite(nextValue) && nextValue >= 0
-                    ? Math.trunc(nextValue)
-                    : prev.proxyFirstByteTimeoutSec,
-                }));
-              }}
-              style={inputStyle}
-            />
-            <div style={{ fontSize: 12, color: 'var(--color-text-muted)', lineHeight: 1.7, marginTop: 6 }}>
-              `0` 表示关闭。只有在指定时间内完全没有任何首包 / 首 token 返回时才切换，已经开始输出的请求不会被这项超时打断。
-            </div>
-          </div>
+          ) : null}
 
-          <div className={`anim-collapse ${showAdvancedRouting ? 'is-open' : ''}`.trim()}>
-            <div className="anim-collapse-inner" style={{ paddingTop: 2 }}>
-              <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr', gap: 12 }}>
+          {runtime.routingAlgorithm === 'bandit' ? (
+            <div style={settingsModernFieldCardStyle}>
+              <div style={settingsModernHeaderStyle}>
+              <div style={settingsModernTitleBlockStyle}>
+                <div style={settingsModernFieldLabelStyle}>Bandit 自适应参数</div>
+                <div style={settingsModernFieldHintStyle}>
+                  仅当全局通道算法选择 Bandit 时生效；守门触发后会逐步关闭探索或回滚到 Legacy。
+                </div>
+              </div>
+                <span style={getSettingsPillStyle('primary')}>生效中</span>
+              </div>
+            <ResponsiveFormGrid columns={2}>
               {([
-                ['baseWeightFactor', '基础权重因子'],
-                ['valueScoreFactor', '价值分因子'],
-                ['costWeight', '成本权重'],
-                ['balanceWeight', '余额权重'],
-                ['usageWeight', '使用频次权重'],
-              ] as Array<[keyof RoutingWeights, string]>).map(([key, label]) => (
+                ['ewmaHealth', 'EWMA 健康度'],
+                ['expectedCost', '预期成本'],
+                ['tsSampling', 'Thompson Sampling'],
+                ['p2c', 'Power of Two Choices'],
+              ] as Array<[RoutingBanditFeatureKey, string]>).map(([key, label]) => (
+                <label key={key} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--color-text-secondary)' }}>
+                  <input
+                    type="checkbox"
+                    checked={runtime.routingBanditFeatures[key]}
+                    onChange={(e) => setRuntime((prev) => ({
+                      ...prev,
+                      routingBanditFeatures: {
+                        ...prev.routingBanditFeatures,
+                        [key]: e.target.checked,
+                      },
+                    }))}
+                  />
+                  {label}
+                </label>
+              ))}
+            </ResponsiveFormGrid>
+            <ResponsiveFormGrid columns={2}>
+              {([
+                ['theta', '成功率权重'],
+                ['latency', '延迟惩罚'],
+                ['cost', '成本惩罚'],
+                ['manual', '手动权重'],
+              ] as Array<[RoutingBanditWeightKey, string]>).map(([key, label]) => (
                 <div key={key}>
-                  <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>{label}</div>
+                  <div style={settingsModernFieldLabelStyle}>{label}</div>
                   <input
                     type="number"
                     min={0}
-                    step={0.1}
-                    value={runtime.routingWeights[key]}
+                    step={0.05}
+                    value={runtime.routingBanditWeights[key]}
                     onChange={(e) => {
                       const v = Number(e.target.value);
                       setRuntime((prev) => ({
                         ...prev,
-                        routingWeights: {
-                          ...prev.routingWeights,
-                          [key]: Number.isFinite(v) ? v : 0,
+                        routingBanditWeights: {
+                          ...prev.routingBanditWeights,
+                          [key]: Number.isFinite(v) && v >= 0 ? v : prev.routingBanditWeights[key],
                         },
                       }));
                     }}
@@ -2275,18 +2557,76 @@ export default function Settings() {
                   />
                 </div>
               ))}
+            </ResponsiveFormGrid>
+            <ResponsiveFormGrid columns={3}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--color-text-secondary)' }}>
+                <input
+                  type="checkbox"
+                  checked={runtime.routingBanditGuardrailEnabled}
+                  onChange={(e) => setRuntime((prev) => ({ ...prev, routingBanditGuardrailEnabled: e.target.checked }))}
+                />
+                启用守门
+              </label>
+              <div>
+                <div style={settingsModernFieldLabelStyle}>守门最小样本</div>
+                <input
+                  type="number"
+                  min={10}
+                  step={1}
+                  value={runtime.routingBanditGuardrailMinSamples}
+                  onChange={(e) => {
+                    const v = Math.trunc(Number(e.target.value));
+                    if (Number.isFinite(v) && v >= 10) {
+                      setRuntime((prev) => ({ ...prev, routingBanditGuardrailMinSamples: v }));
+                    }
+                  }}
+                  style={inputStyle}
+                />
               </div>
+              <div>
+                <div style={settingsModernFieldLabelStyle}>最大可重试失败率</div>
+                <input
+                  type="number"
+                  min={0.01}
+                  max={1}
+                  step={0.01}
+                  value={runtime.routingBanditGuardrailMaxRetryableFailureRate}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (Number.isFinite(v) && v >= 0.01 && v <= 1) {
+                      setRuntime((prev) => ({ ...prev, routingBanditGuardrailMaxRetryableFailureRate: v }));
+                    }
+                  }}
+                  style={inputStyle}
+                />
+              </div>
+              <div>
+                <div style={settingsModernFieldLabelStyle}>最大 P95 延迟（ms）</div>
+                <input
+                  type="number"
+                  min={100}
+                  step={100}
+                  value={runtime.routingBanditGuardrailMaxP95LatencyMs}
+                  onChange={(e) => {
+                    const v = Math.trunc(Number(e.target.value));
+                    if (Number.isFinite(v) && v >= 100) {
+                      setRuntime((prev) => ({ ...prev, routingBanditGuardrailMaxP95LatencyMs: v }));
+                    }
+                  }}
+                  style={inputStyle}
+                />
+              </div>
+              </ResponsiveFormGrid>
             </div>
-          </div>
+          ) : null}
 
-          <div style={{ marginTop: 12 }}>
+          <div style={settingsModernActionsStyle}>
             <button onClick={saveRouting} disabled={savingRouting} className="btn btn-primary">
-              {savingRouting ? <><span className="spinner spinner-sm" style={{ borderTopColor: 'white', borderColor: 'rgba(255,255,255,0.3)' }} /> 保存中...</> : '保存路由策略'}
+              {savingRouting ? <><span className="spinner spinner-sm" style={{ borderTopColor: 'white', borderColor: 'rgba(255,255,255,0.3)' }} /> 保存中...</> : '保存路由策略栈'}
             </button>
           </div>
         </div>
 
-        {/* Global Brand Filter */}
         <div className="card animate-slide-up stagger-6" style={{ padding: 20 }}>
           <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 8 }}>全局品牌屏蔽</div>
           <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 12, lineHeight: 1.6 }}>

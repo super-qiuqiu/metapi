@@ -377,6 +377,22 @@ export type RuntimeRoutingWeightsPayload = {
   usageWeight?: number;
 };
 
+export type RuntimeRoutingAlgorithmPayload = "legacy" | "bandit";
+
+export type RuntimeRoutingBanditFeaturesPayload = {
+  ewmaHealth?: boolean;
+  expectedCost?: boolean;
+  tsSampling?: boolean;
+  p2c?: boolean;
+};
+
+export type RuntimeRoutingBanditWeightsPayload = {
+  theta?: number;
+  latency?: number;
+  cost?: number;
+  manual?: number;
+};
+
 export type RuntimeSettingsPayload = {
   proxyToken?: string;
   systemProxyUrl?: string;
@@ -386,6 +402,12 @@ export type RuntimeSettingsPayload = {
   codexStickyAccountEnabled?: boolean;
   codexStickyAccountQuotaThresholdPercent?: number;
   responsesCompactFallbackToResponsesEnabled?: boolean;
+  responsesRequireContinuitySession?: boolean;
+  responsesStrictPreviousResponseRecovery?: boolean;
+  contextWindowGuardEnabled?: boolean;
+  contextWindowGuardAutoCompactPercent?: number;
+  contextWindowGuardHardTrimPercent?: number;
+  contextWindowGuardTrimTargetPercent?: number;
   disableCrossProtocolFallback?: boolean;
   proxySessionChannelConcurrencyLimit?: number;
   proxySessionChannelQueueWaitMs?: number;
@@ -432,6 +454,19 @@ export type RuntimeSettingsPayload = {
   proxyFirstByteTimeoutSec?: number;
   tokenRouterFailureCooldownMaxSec?: number;
   routingWeights?: RuntimeRoutingWeightsPayload;
+  routingAlgorithm?: RuntimeRoutingAlgorithmPayload;
+  routingBanditFeatures?: RuntimeRoutingBanditFeaturesPayload;
+  routingBanditWeights?: RuntimeRoutingBanditWeightsPayload;
+  routingBanditFlushIntervalMs?: number;
+  routingBanditDecisionLogSampleRate?: number;
+  routingBanditGuardrailEnabled?: boolean;
+  routingBanditGuardrailMinSamples?: number;
+  routingBanditGuardrailMaxRetryableFailureRate?: number;
+  routingBanditGuardrailMaxP95LatencyMs?: number;
+  routingBanditGuardrailBaselineEnabled?: boolean;
+  routingBanditGuardrailBaselineMinSamples?: number;
+  routingBanditGuardrailMaxRetryableFailureRateDelta?: number;
+  routingBanditGuardrailMaxP95LatencyMultiplier?: number;
   proxyErrorKeywords?: string[] | string;
   proxyEmptyContentFailEnabled?: boolean;
   globalBlockedBrands?: string[];
