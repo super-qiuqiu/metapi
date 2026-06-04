@@ -9,6 +9,8 @@ type ActiveTooltip = {
   text: string;
   side: TooltipSide;
   align: TooltipAlign;
+  preserveLines: boolean;
+  compact: boolean;
 };
 
 type TooltipPosition = {
@@ -74,6 +76,8 @@ export default function TooltipLayer() {
       text,
       side: readTooltipSide(target),
       align: readTooltipAlign(target),
+      preserveLines: target.getAttribute('data-tooltip-preserve-lines') === 'true',
+      compact: target.getAttribute('data-tooltip-compact') === 'true',
     });
   }, [hideTooltip]);
 
@@ -204,7 +208,7 @@ export default function TooltipLayer() {
     <div className="tooltip-layer" aria-hidden="true">
       <div
         ref={bubbleRef}
-        className={`tooltip-bubble tooltip-bubble-${position?.side ?? activeTooltip.side} ${position ? 'is-visible' : ''}`.trim()}
+        className={`tooltip-bubble tooltip-bubble-${position?.side ?? activeTooltip.side} ${activeTooltip.preserveLines ? 'tooltip-bubble-preserve-lines' : ''} ${activeTooltip.compact ? 'tooltip-bubble-compact' : ''} ${position ? 'is-visible' : ''}`.trim()}
         style={position ? {
           position: 'fixed',
           left: position.left,

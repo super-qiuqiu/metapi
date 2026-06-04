@@ -2644,6 +2644,15 @@ body[data-tooltip-portal="true"] [data-tooltip]::before {
   transition: opacity 0.18s ease, transform 0.18s ease;
 }
 
+[data-tooltip][data-tooltip-preserve-lines="true"]::after {
+  white-space: pre-line;
+}
+
+[data-tooltip][data-tooltip-compact="true"]::after {
+  min-width: 0;
+  padding: 5px 8px;
+}
+
 [data-tooltip]::before {
   content: '';
   position: absolute;
@@ -2839,6 +2848,17 @@ body[data-tooltip-portal="true"] [data-tooltip]::before {
   opacity: 0;
   transform: scale(0.98);
   transition: opacity 0.18s ease, transform 0.18s ease;
+}
+
+.tooltip-bubble-preserve-lines {
+  white-space: pre-line;
+}
+
+.tooltip-bubble-compact {
+  width: fit-content;
+  min-width: 0;
+  max-width: 180px;
+  padding: 5px 8px;
 }
 
 .tooltip-bubble.is-visible {
