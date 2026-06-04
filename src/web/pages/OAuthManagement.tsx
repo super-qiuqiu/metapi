@@ -104,6 +104,8 @@ type OAuthRouteUnitModalState = {
   strategy: OAuthRouteUnitStrategy;
 };
 
+type OAuthAccountStatusAction = 'enable' | 'disable';
+
 type SessionRouteUnitFeedback = {
   action: 'created' | 'deleted';
   name: string;
@@ -1383,6 +1385,42 @@ export default function OAuthManagement() {
     }
   };
 
+  const handleToggleAccountStatus = async (connection: OAuthConnectionInfo) => {
+    const nextStatus = connection.accountStatus === 'disabled' ? 'active' : 'disabled';
+    const actionLabel = nextStatus === 'disabled' ? '禁用' : '启用';
+    const actionKey = `status:${connection.accountId}`;
+    setActionLoadingKey(actionKey);
+    try {
+      await api.updateAccount(connection.accountId, { status: nextStatus });
+      await loadConnections();
+      setSessionSuccess(`OAuth 连接已${actionLabel}`);
+    } catch (error: any) {
+      setSessionError(error?.message || `${actionLabel} OAuth 连接失败`);
+    } finally {
+      setActionLoadingKey('');
+    }
+  };
+
+  const handleBatchAccountStatus = async (action: OAuthAccountStatusAction) => {
+    if (selectedConnectionIds.length === 0) return;
+    const actionLabel = action === 'disable' ? '禁用' : '启用';
+    const actionKey = `status:${action}:selected`;
+    setActionLoadingKey(actionKey);
+    try {
+      const result = await api.batchUpdateAccounts({ ids: selectedConnectionIds, action });
+      await loadConnections();
+      if (result.failedItems?.length > 0) {
+        setSessionInfo(`批量${actionLabel}完成，${result.successIds?.length || 0} 个成功，${result.failedItems.length} 个失败`);
+      } else {
+        setSessionSuccess(`已批量${actionLabel} ${result.successIds?.length || selectedConnectionIds.length} 个 OAuth 连接`);
+      }
+    } catch (error: any) {
+      setSessionError(error?.message || `批量${actionLabel} OAuth 连接失败`);
+    } finally {
+      setActionLoadingKey('');
+    }
+  };
+
   const handleDeleteSelected = async () => {
     if (selectedConnectionIds.length === 0) return;
     if (typeof window !== 'undefined' && typeof window.confirm === 'function') {
@@ -2410,6 +2448,16 @@ export default function OAuthManagement() {
                   </button>
                   <button
                     type="button"
+                    className={connection.accountStatus === 'disabled' ? 'btn btn-link btn-link-primary' : 'btn btn-link btn-link-danger'}
+                    onClick={() => handleToggleAccountStatus(connection)}
+                    disabled={actionLoadingKey === `status:${connection.accountId}`}
+                  >
+                    {actionLoadingKey === `status:${connection.accountId}`
+                      ? '处理中...'
+                      : (connection.accountStatus === 'disabled' ? '启用连接' : '禁用连接')}
+                  </button>
+                  <button
+                    type="button"
                     className="btn btn-link btn-link-info"
                     onClick={() => openRebindDrawer(connection)}
                   >
@@ -2549,6 +2597,16 @@ export default function OAuthManagement() {
               <button type="button" className="btn btn-link btn-link-primary" onClick={() => handleRefreshModels(connection.accountId)} disabled={actionLoadingKey === `models:${connection.accountId}`}>
                 {actionLoadingKey === `models:${connection.accountId}` ? '刷新中...' : '刷新模型'}
               </button>
+              <button
+                type="button"
+                className={connection.accountStatus === 'disabled' ? 'btn btn-link btn-link-primary' : 'btn btn-link btn-link-danger'}
+                onClick={() => handleToggleAccountStatus(connection)}
+                disabled={actionLoadingKey === `status:${connection.accountId}`}
+              >
+                {actionLoadingKey === `status:${connection.accountId}`
+                  ? '处理中...'
+                  : (connection.accountStatus === 'disabled' ? '启用连接' : '禁用连接')}
+              </button>
               <button type="button" className="btn btn-link btn-link-info" onClick={() => openProxySettingsDrawer(connection)}>
                 代理设置
               </button>
@@ -2669,6 +2727,22 @@ export default function OAuthManagement() {
               disabled={actionLoadingKey === 'models:selected'}
             >
               {actionLoadingKey === 'models:selected' ? '刷新中...' : '批量刷新模型'}
+            </button>
+            <button
+              type="button"
+              className="btn btn-ghost oauth-outline-button"
+              onClick={() => handleBatchAccountStatus('enable')}
+              disabled={actionLoadingKey === 'status:enable:selected'}
+            >
+              {actionLoadingKey === 'status:enable:selected' ? '处理中...' : '批量启用'}
+            </button>
+            <button
+              type="button"
+              className="btn btn-ghost oauth-outline-button"
+              onClick={() => handleBatchAccountStatus('disable')}
+              disabled={actionLoadingKey === 'status:disable:selected'}
+            >
+              {actionLoadingKey === 'status:disable:selected' ? '处理中...' : '批量禁用'}
             </button>
             <button
               type="button"
