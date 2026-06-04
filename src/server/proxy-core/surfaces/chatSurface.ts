@@ -62,6 +62,8 @@ import { detectDownstreamClientContext } from '../downstreamClientContext.js';
 import { getProxyMaxChannelRetries } from '../../services/proxyChannelRetry.js';
 import { shouldAbortSameSiteEndpointFallback } from '../../services/proxyRetryPolicy.js';
 import { resolveChannelProxyUrl } from '../../services/siteProxy.js';
+import { applyOpenAiServiceTierPolicy } from '../serviceTierPolicy.js';
+import { maybeHandleWebSearchOnlySimulation } from '../webSearchSimulation.js';
 import {
   acquireSurfaceChannelLease,
   bindSurfaceStickyChannel,
@@ -161,6 +163,17 @@ export async function handleChatSurfaceRequest(
     upstreamBody,
     claudeOriginalBody,
   } = requestEnvelope.parsed;
+  if (downstreamFormat === 'claude') {
+    const handledSearch = await maybeHandleWebSearchOnlySimulation({
+      app: request.server,
+      request,
+      reply,
+      downstreamFormat: 'claude',
+      body: (claudeOriginalBody || request.body || {}) as Record<string, unknown>,
+      openAiBody: upstreamBody,
+    });
+    if (handledSearch) return;
+  }
   if (!await ensureModelAllowedForDownstreamKey(request, reply, requestedModel)) return;
   const downstreamPolicy = getDownstreamRoutingPolicy(request);
   const forcedChannelId = getTesterForcedChannelId({
@@ -350,6 +363,29 @@ export async function handleChatSurfaceRequest(
         options: { forceNormalizeClaudeBody?: boolean } = {},
       ) => {
         const upstreamStream = isStream || (forceResponsesUpstreamStream && endpoint === 'responses');
+        const bodyForEndpoint = endpoint === 'responses'
+          ? (() => {
+            const policyResult = applyOpenAiServiceTierPolicy({
+              body: resolvedOpenAiBody,
+              context: {
+                requestedModel,
+                actualModel: modelName,
+                sitePlatform: selected.site.platform,
+                accountType: oauth?.planType,
+              },
+              rules: (config as any).openAiServiceTierRules,
+            });
+            if (!policyResult.ok) {
+              const error = new SiteApiEndpointRequestError(policyResult.payload.error.message, {
+                status: policyResult.statusCode,
+                rawErrText: JSON.stringify(policyResult.payload),
+              });
+              (error as SiteApiEndpointRequestError & { serviceTierBlocked?: boolean }).serviceTierBlocked = true;
+              throw error;
+            }
+            return policyResult.body;
+          })()
+          : resolvedOpenAiBody;
         const endpointRequest = buildUpstreamEndpointRequest({
           endpoint,
           modelName,
@@ -359,7 +395,7 @@ export async function handleChatSurfaceRequest(
           oauthProjectId: oauth?.projectId,
           sitePlatform: selected.site.platform,
           siteUrl: siteApiBaseUrl,
-          openaiBody: resolvedOpenAiBody,
+          openaiBody: bodyForEndpoint,
           downstreamFormat,
           claudeOriginalBody,
           forceNormalizeClaudeBody: options.forceNormalizeClaudeBody,
@@ -1131,8 +1167,24 @@ export async function handleChatSurfaceRequest(
           err instanceof SiteApiEndpointRequestError
         || err?.name === 'SiteApiEndpointRequestError'
         || err?.siteApiEndpointUpstreamFailure === true
+        || err?.serviceTierBlocked === true
         || (endpointFailureStatus !== null && endpointFailureStatus >= 500)
       );
+      if (err?.serviceTierBlocked === true) {
+        let payload: unknown = null;
+        try {
+          payload = JSON.parse(err.rawErrText || '');
+        } catch {
+          payload = {
+            error: {
+              message: err.message || 'service_tier is blocked by policy',
+              type: 'invalid_request_error',
+            },
+          };
+        }
+        await finalizeDebugFailure(endpointFailureStatus || 400, payload, null);
+        return reply.code(endpointFailureStatus || 400).send(payload);
+      }
       if (isSiteApiEndpointFailure) {
         const failureOutcome = await failureToolkit.handleUpstreamFailure({
           selected,
@@ -1574,8 +1626,24 @@ export async function handleClaudeCountTokensSurfaceRequest(
         error instanceof SiteApiEndpointRequestError
         || error?.name === 'SiteApiEndpointRequestError'
         || error?.siteApiEndpointUpstreamFailure === true
+        || error?.serviceTierBlocked === true
         || (endpointFailureStatus !== null && endpointFailureStatus >= 500)
       );
+      if (error?.serviceTierBlocked === true) {
+        let payload: unknown = null;
+        try {
+          payload = JSON.parse(error.rawErrText || '');
+        } catch {
+          payload = {
+            error: {
+              message: error.message || 'service_tier is blocked by policy',
+              type: 'invalid_request_error',
+            },
+          };
+        }
+        await finalizeDebugFailure(endpointFailureStatus || 400, payload, null);
+        return reply.code(endpointFailureStatus || 400).send(payload);
+      }
       if (isSiteApiEndpointFailure) {
         const failureOutcome = await failureToolkit.handleUpstreamFailure({
           selected,

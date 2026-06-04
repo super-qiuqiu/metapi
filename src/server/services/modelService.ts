@@ -28,6 +28,7 @@ import { buildStoredOauthStateFromAccount, getOauthInfoFromAccount } from './oau
 import { refreshOauthAccessTokenSingleflight } from './oauth/refreshSingleflight.js';
 import { listEnabledOauthRouteUnitsWithMembers } from './oauth/routeUnitService.js';
 import { requireSiteApiBaseUrl } from './siteApiEndpointService.js';
+import { probeRuntimeModel, type RuntimeModelProbeStatus } from './runtimeModelProbe.js';
 import {
   discoverAntigravityModelsFromCloud,
   discoverClaudeModelsFromCloud,
@@ -384,6 +385,136 @@ export type OauthDiscoveryResult = {
   previousAccountTokens: any[];
   previousTokenModelAvailability: any[];
 };
+
+export type ProbeSiteModelsResult = {
+  success: boolean;
+  error?: string;
+  scope: 'single' | 'all';
+  probed: number;
+  unsupported: number;
+  details: Array<{ modelName: string; status: RuntimeModelProbeStatus; latencyMs: number | null; reason?: string }>;
+};
+
+export type ProbeSiteModelsProgress =
+  | { type: 'start'; scope: 'single' | 'all'; modelsCount: number; modelsToProbe: string[] }
+  | { type: 'model'; modelName: string; status: RuntimeModelProbeStatus; latencyMs: number | null; latencyExceeded?: true; reason?: string }
+  | { type: 'action'; modelName: string; action: 'disabled' };
+
+export async function probeSiteModels(
+  siteId: number,
+  options?: { scope?: 'single' | 'all'; modelName?: string; concurrency?: number; latencyThresholdMs?: number; signal?: AbortSignal },
+  onProgress?: (event: ProbeSiteModelsProgress) => void,
+): Promise<ProbeSiteModelsResult> {
+  const empty = (scope: 'single' | 'all', error: string): ProbeSiteModelsResult =>
+    ({ success: false, error, scope, probed: 0, unsupported: 0, details: [] });
+
+  const site = await db.select().from(schema.sites).where(eq(schema.sites.id, siteId)).get();
+  if (!site) return empty('single', '站点不存在');
+
+  const account = await db.select().from(schema.accounts)
+    .where(and(eq(schema.accounts.siteId, siteId), eq(schema.accounts.status, 'active')))
+    .get();
+  if (!account) return empty('single', '该站点没有可用的活跃账号');
+
+  const modelRows = await db.select({ modelName: schema.modelAvailability.modelName })
+    .from(schema.modelAvailability)
+    .where(and(
+      eq(schema.modelAvailability.accountId, account.id),
+      eq(schema.modelAvailability.available, true),
+    ))
+    .all();
+
+  const scope = (options?.scope ?? (site.postRefreshProbeScope === 'all' ? 'all' : 'single')) as 'single' | 'all';
+  const availableModels = modelRows.map((row) => row.modelName.trim()).filter((modelName) => modelName.length > 0);
+  if (availableModels.length === 0) {
+    return empty(scope, '该站点暂无已发现模型，请先刷新模型列表');
+  }
+
+  let modelsToProbe: string[];
+  if (scope === 'all') {
+    modelsToProbe = availableModels;
+  } else {
+    const configuredModel = ((options?.modelName ?? site.postRefreshProbeModel) || '').trim().toLowerCase();
+    const found = configuredModel
+      ? (availableModels.find((modelName) => modelName.toLowerCase() === configuredModel) ?? availableModels[0])
+      : availableModels[0];
+    modelsToProbe = [found];
+  }
+
+  onProgress?.({ type: 'start', scope, modelsCount: modelsToProbe.length, modelsToProbe });
+
+  const concurrency = Math.max(1, options?.concurrency ?? 10);
+  const detailsMap = new Map<string, { modelName: string; status: RuntimeModelProbeStatus; latencyMs: number | null; reason?: string }>();
+
+  let cursor = 0;
+  async function worker() {
+    while (cursor < modelsToProbe.length) {
+      if (options?.signal?.aborted) break;
+      const modelName = modelsToProbe[cursor++];
+      try {
+        const result = await probeRuntimeModel({
+          site,
+          account,
+          modelName,
+          timeoutMs: config.modelAvailabilityProbeTimeoutMs,
+        });
+        const threshold = options?.latencyThresholdMs ?? 0;
+        const latencyExceeded = result.status === 'supported'
+          && threshold > 0
+          && result.latencyMs != null
+          && result.latencyMs > threshold;
+        const status: RuntimeModelProbeStatus = latencyExceeded ? 'unsupported' : result.status;
+        const reason = latencyExceeded
+          ? `响应延迟 ${result.latencyMs}ms 超过阈值 ${threshold}ms`
+          : result.reason;
+        detailsMap.set(modelName, { modelName, status, latencyMs: result.latencyMs, reason });
+        onProgress?.(latencyExceeded
+          ? { type: 'model', modelName, status, latencyMs: result.latencyMs, latencyExceeded: true, reason }
+          : { type: 'model', modelName, status, latencyMs: result.latencyMs, reason });
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : '探测异常';
+        console.warn(`[probe-site-now] probe failed for site ${siteId} model ${modelName}`, error);
+        detailsMap.set(modelName, { modelName, status: 'inconclusive', latencyMs: null, reason });
+        onProgress?.({ type: 'model', modelName, status: 'inconclusive', latencyMs: null, reason });
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(concurrency, modelsToProbe.length) }, worker));
+
+  const details = modelsToProbe.map((modelName) => detailsMap.get(modelName)!).filter(Boolean);
+  const unsupportedModels = details
+    .filter((detail) => detail.status === 'unsupported' || detail.status === 'inconclusive')
+    .map((detail) => detail.modelName);
+
+  if (unsupportedModels.length > 0) {
+    const checkedAt = new Date().toISOString();
+    for (const modelName of unsupportedModels) {
+      await db.update(schema.modelAvailability)
+        .set({ available: false, checkedAt })
+        .where(and(
+          eq(schema.modelAvailability.accountId, account.id),
+          eq(schema.modelAvailability.modelName, modelName),
+        ))
+        .run();
+      await db.insert(schema.siteDisabledModels)
+        .values({ siteId, modelName })
+        .onConflictDoNothing()
+        .run();
+      onProgress?.({ type: 'action', modelName, action: 'disabled' });
+    }
+
+    const reason = unsupportedModels.length === 1
+      ? `手动探测失败：模型 ${unsupportedModels[0]} 不可用`
+      : `手动探测失败：${unsupportedModels.length} 个模型不可用（${unsupportedModels.slice(0, 3).join('、')}${unsupportedModels.length > 3 ? '…' : ''}）`;
+    await setAccountRuntimeHealth(account.id, { state: 'unhealthy', reason, source: 'manual-probe', checkedAt });
+    rebuildTokenRoutesFromAvailability().catch((error) => {
+      console.warn('[probe-site-now] route rebuild failed', error);
+    });
+  }
+
+  return { success: true, scope, probed: details.length, unsupported: unsupportedModels.length, details };
+}
 
 export async function discoverOauthModels(input: {
   accountId: number;

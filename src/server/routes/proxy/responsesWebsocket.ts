@@ -17,11 +17,13 @@ import {
 import { runWithSiteApiEndpointPool, SiteApiEndpointRequestError } from '../../services/siteApiEndpointService.js';
 import { tokenRouter } from '../../services/tokenRouter.js';
 import { buildOauthProviderHeaders } from '../../services/oauth/service.js';
+import { getOauthInfoFromAccount } from '../../services/oauth/oauthAccount.js';
 import { estimateProxyCost } from '../../services/modelPricingService.js';
 import { hasProxyUsagePayload, mergeProxyUsage, parseProxyUsage } from '../../services/proxyUsageParser.js';
 import { openAiResponsesTransformer } from '../../transformers/openai/responses/index.js';
 import { buildUpstreamEndpointRequest } from './upstreamEndpoint.js';
 import { config } from '../../config.js';
+import { applyOpenAiServiceTierPolicy } from '../../proxy-core/serviceTierPolicy.js';
 
 const installedApps = new WeakSet<FastifyInstance>();
 const WS_TURN_STATE_HEADER = 'x-codex-turn-state';
@@ -48,6 +50,10 @@ type NormalizedResponsesWebsocketRequest =
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function getServiceTierPolicyRules(): unknown {
+  return (config as typeof config & { openAiServiceTierRules?: unknown }).openAiServiceTierRules;
 }
 
 function asTrimmedString(value: unknown): string {
@@ -885,6 +891,24 @@ async function handleResponsesWebsocketConnection(
             writeResponsesWebsocketError(socket, 403, 'model is not allowed for this downstream key');
             return;
           }
+          const serviceTierPolicy = applyOpenAiServiceTierPolicy({
+            body: parsed,
+            context: {
+              requestedModel: requestModel,
+            },
+            rules: getServiceTierPolicyRules(),
+          });
+          if (!serviceTierPolicy.ok) {
+            writeResponsesWebsocketError(
+              socket,
+              serviceTierPolicy.statusCode,
+              serviceTierPolicy.payload.error.message,
+              serviceTierPolicy.payload,
+            );
+            return;
+          }
+          parsed.service_tier = serviceTierPolicy.body.service_tier;
+          if (serviceTierPolicy.body.service_tier === undefined) delete parsed.service_tier;
 
           let effectiveSelectedChannel = selectedChannel;
           if (pinnedChannelId !== null && selectedChannel && selectedChannel.channel.id === pinnedChannelId) {
@@ -932,6 +956,34 @@ async function handleResponsesWebsocketConnection(
               asTrimmedString(normalized.request.model) || requestModel,
               isCodexFreePlanAccount(effectiveSelectedChannel),
             );
+          }
+
+          const selectedServiceTierPolicy = applyOpenAiServiceTierPolicy({
+            body: normalized.request,
+            context: {
+              requestedModel: requestModel,
+              actualModel: asTrimmedString(effectiveSelectedChannel?.actualModel),
+              sitePlatform: asTrimmedString(effectiveSelectedChannel?.site?.platform),
+              accountType: getOauthInfoFromAccount(effectiveSelectedChannel?.account)?.planType,
+            },
+            rules: getServiceTierPolicyRules(),
+          });
+          if (!selectedServiceTierPolicy.ok) {
+            writeResponsesWebsocketError(
+              socket,
+              selectedServiceTierPolicy.statusCode,
+              selectedServiceTierPolicy.payload.error.message,
+              selectedServiceTierPolicy.payload,
+            );
+            return;
+          }
+          normalized.request = selectedServiceTierPolicy.body;
+          normalized.nextRequestSnapshot = {
+            ...normalized.nextRequestSnapshot,
+            service_tier: selectedServiceTierPolicy.body.service_tier,
+          };
+          if (selectedServiceTierPolicy.body.service_tier === undefined) {
+            delete normalized.nextRequestSnapshot.service_tier;
           }
 
           previousLastRequest = lastRequest;
