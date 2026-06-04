@@ -23,6 +23,11 @@ export function formatUtcSqlDateTime(value: Date): string {
   return `${value.getUTCFullYear()}-${pad2(value.getUTCMonth() + 1)}-${pad2(value.getUTCDate())} ${pad2(value.getUTCHours())}:${pad2(value.getUTCMinutes())}:${pad2(value.getUTCSeconds())}`;
 }
 
+export function formatBeijingSqlDateTime(value: Date): string {
+  const beijingTime = new Date(value.getTime() + 8 * HOUR_MS);
+  return `${beijingTime.getUTCFullYear()}-${pad2(beijingTime.getUTCMonth() + 1)}-${pad2(beijingTime.getUTCDate())} ${pad2(beijingTime.getUTCHours())}:${pad2(beijingTime.getUTCMinutes())}:${pad2(beijingTime.getUTCSeconds())}`;
+}
+
 function parseEpochDateTime(raw: number): Date | null {
   if (!Number.isFinite(raw)) return null;
   if (raw > 1_000_000_000_000) {

@@ -294,6 +294,8 @@ async function logProxy(
       clientConfidence: clientContext?.clientConfidence || null,
       errorMessage: normalizedErrorMessage,
       retryCount,
+      downstreamTransport: 'http',
+      upstreamTransport: 'http',
       createdAt,
     });
   } catch (error) {

@@ -104,3 +104,24 @@ export function formatCheckinLogTime(
 ): string {
   return formatDateTimeLocal(value, locale, timeZone);
 }
+
+
+export function formatStoredBeijingDateTime(
+  value: string | null | undefined,
+  locale = 'zh-CN',
+): string {
+  const raw = String(value || '').trim();
+  if (!raw) return '-';
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(raw)) {
+    return formatWithParts(`${raw.replace(' ', 'T')}+08:00`, {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    }, locale, 'Asia/Shanghai');
+  }
+  return formatDateTimeLocal(value, locale, 'Asia/Shanghai');
+}

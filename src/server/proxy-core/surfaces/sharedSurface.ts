@@ -1,4 +1,4 @@
-import { formatUtcSqlDateTime } from '../../services/localTimeService.js';
+import { formatBeijingSqlDateTime } from '../../services/localTimeService.js';
 import { resolveChannelProxyUrl, withSiteRecordProxyRequestInit } from '../../services/siteProxy.js';
 import type { SiteProxyConfigLike } from '../../services/siteProxy.js';
 import { tokenRouter } from '../../services/tokenRouter.js';
@@ -237,11 +237,13 @@ export async function writeSurfaceProxyLog(input: {
   billingDetails?: unknown;
   upstreamPath?: string | null;
   usageSource?: 'upstream' | 'self-log' | 'unknown' | null;
+  downstreamTransport?: string | null;
+  upstreamTransport?: string | null;
   clientContext?: DownstreamClientContext | null;
   downstreamApiKeyId?: number | null;
 }): Promise<void> {
   try {
-    const createdAt = formatUtcSqlDateTime(new Date());
+    const createdAt = formatBeijingSqlDateTime(new Date());
     const normalizedErrorMessage = composeProxyLogMessage({
       clientKind: input.clientContext?.clientKind && input.clientContext.clientKind !== 'generic'
         ? input.clientContext.clientKind
@@ -276,6 +278,8 @@ export async function writeSurfaceProxyLog(input: {
       clientConfidence: input.clientContext?.clientConfidence || null,
       errorMessage: normalizedErrorMessage,
       retryCount: input.retryCount,
+      downstreamTransport: input.downstreamTransport ?? null,
+      upstreamTransport: input.upstreamTransport ?? null,
       createdAt,
     });
   } catch (error) {
@@ -512,6 +516,8 @@ export async function recordSurfaceSuccess(input: {
 export function createSurfaceFailureToolkit(input: {
   warningScope: SurfaceWarningScope;
   downstreamPath: string;
+  downstreamTransport?: string | null;
+  upstreamTransport?: string | null;
   maxRetries: number;
   clientContext?: DownstreamClientContext | null;
   downstreamApiKeyId?: number | null;
@@ -546,6 +552,8 @@ export function createSurfaceFailureToolkit(input: {
       errorMessage: args.errorMessage,
       retryCount: args.retryCount,
       downstreamPath: input.downstreamPath,
+      downstreamTransport: input.downstreamTransport ?? null,
+      upstreamTransport: currentUpstreamTransport,
       promptTokens: args.promptTokens,
       completionTokens: args.completionTokens,
       totalTokens: args.totalTokens,
@@ -562,6 +570,8 @@ export function createSurfaceFailureToolkit(input: {
     ? { action: 'retry' as const }
     : null;
 
+  let currentUpstreamTransport = input.upstreamTransport ?? 'http';
+
   const runBestEffort = (label: string, fn: () => Promise<unknown>) => {
     void Promise.resolve()
       .then(fn)
@@ -572,6 +582,9 @@ export function createSurfaceFailureToolkit(input: {
 
   return {
     log,
+    setUpstreamTransport(transport: string) {
+      currentUpstreamTransport = transport;
+    },
     async handleUpstreamFailure(args: {
       selected: SurfaceSelectedChannel;
       requestedModel: string;

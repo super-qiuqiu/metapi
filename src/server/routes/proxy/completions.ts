@@ -11,7 +11,7 @@ import { ensureModelAllowedForDownstreamKey, getDownstreamRoutingPolicy, recordD
 import { withSiteRecordProxyRequestInit } from '../../services/siteProxy.js';
 import { getProxyUrlFromExtraConfig } from '../../services/accountExtraConfig.js';
 import { composeProxyLogMessage } from '../../services/proxyLogMessage.js';
-import { formatUtcSqlDateTime } from '../../services/localTimeService.js';
+import { formatBeijingSqlDateTime } from '../../services/localTimeService.js';
 import { detectProxyFailure } from '../../services/proxyFailureJudge.js';
 import { resolveProxyLogBilling } from './proxyBilling.js';
 import { getProxyAuthContext } from '../../middleware/auth.js';
@@ -402,7 +402,7 @@ async function logProxy(
   firstByteLatencyMs: number | null,
 ) {
   try {
-    const createdAt = formatUtcSqlDateTime(new Date());
+    const createdAt = formatBeijingSqlDateTime(new Date());
     const normalizedErrorMessage = composeProxyLogMessage({
       clientKind: clientContext?.clientKind && clientContext.clientKind !== 'generic'
         ? clientContext.clientKind

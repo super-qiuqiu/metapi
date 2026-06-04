@@ -7,6 +7,7 @@ import {
   hasProxyLogStreamTimingColumns,
   hasProxyLogTransportColumns,
 } from '../db/index.js';
+import { formatBeijingSqlDateTime } from './localTimeService.js';
 
 export type ProxyLogInsertInput = {
   routeId?: number | null;
@@ -328,7 +329,7 @@ export async function insertProxyLog(input: ProxyLogInsertInput): Promise<void> 
     estimatedCost: input.estimatedCost ?? 0,
     errorMessage: input.errorMessage ?? null,
     retryCount: input.retryCount ?? 0,
-    createdAt: input.createdAt ?? null,
+    createdAt: input.createdAt ?? formatBeijingSqlDateTime(new Date()),
   };
   const serializedBillingDetails = input.billingDetails == null
     ? null

@@ -29,7 +29,7 @@ import SiteBadgeLink from "../components/SiteBadgeLink.js";
 import { MobileCard, MobileField } from "../components/MobileCard.js";
 import ResponsiveFilterPanel from "../components/ResponsiveFilterPanel.js";
 import { useIsMobile } from "../components/useIsMobile.js";
-import { formatDateTimeLocal } from "./helpers/checkinLogTime.js";
+import { formatDateTimeLocal, formatStoredBeijingDateTime } from "./helpers/checkinLogTime.js";
 import ModernSelect from "../components/ModernSelect.js";
 import { parseProxyLogPathMeta } from "./helpers/proxyLogPathMeta.js";
 import { tr } from "../i18n.js";
@@ -116,6 +116,7 @@ const DEBUG_REFRESH_BACKOFF_STEP_MS = 3000;
 const LOG_REFRESH_INTERVAL_MS = 2000;
 const LOG_REFRESH_BACKOFF_MS = 10000;
 const LOG_REFRESH_BACKOFF_STEP_MS = 3000;
+const LATENCY_FORMAT_TOOLTIP = "总耗时 / 首字时间\n生成速度 token/s";
 const formInputStyle: React.CSSProperties = {
   width: "100%",
   padding: "10px 14px",
@@ -317,9 +318,101 @@ function formatStreamModeLabel(isStream: boolean | null | undefined) {
   return isStream ? "流式" : "非流";
 }
 
+function formatTransportLabel(downstream: string | null | undefined, upstream: string | null | undefined): string | null {
+  const parts: string[] = [];
+  if (downstream) {
+    parts.push(`下游${downstream === 'websocket' ? 'WS' : 'HTTP'}`);
+  }
+  if (upstream) {
+    parts.push(`上游${upstream === 'websocket' ? 'WS' : 'HTTP'}`);
+  }
+  return parts.length > 0 ? parts.join(' / ') : null;
+}
+
 function formatFirstByteLabel(ms: number | null | undefined) {
   if (!Number.isFinite(ms) || typeof ms !== "number" || ms < 0) return null;
   return `首字 ${formatLatency(ms)}`;
+}
+
+function formatGenerationSpeed(log: Pick<ProxyLogRenderItem, "latencyMs" | "firstByteLatencyMs" | "completionTokens">) {
+  const completionTokens = typeof log.completionTokens === "number" && Number.isFinite(log.completionTokens)
+    ? log.completionTokens
+    : 0;
+  if (completionTokens <= 0) return "— token/s";
+  const firstByteMs = typeof log.firstByteLatencyMs === "number" && Number.isFinite(log.firstByteLatencyMs)
+    ? Math.max(0, log.firstByteLatencyMs)
+    : 0;
+  const generationMs = Math.max(1, log.latencyMs - firstByteMs);
+  const speed = completionTokens / (generationMs / 1000);
+  if (!Number.isFinite(speed) || speed <= 0) return "— token/s";
+  return `${speed >= 100 ? speed.toFixed(0) : speed.toFixed(1)} token/s`;
+}
+
+function renderLatencyWithFirstByte(
+  log: Pick<ProxyLogRenderItem, "latencyMs" | "firstByteLatencyMs" | "completionTokens">,
+  options?: { align?: React.CSSProperties["alignItems"] },
+) {
+  const firstByteLabel = formatFirstByteLabel(log.firstByteLatencyMs);
+  const totalAndFirstByte = firstByteLabel
+    ? `${formatLatency(log.latencyMs)} / ${firstByteLabel.replace(/^首字\s*/, "")}`
+    : `${formatLatency(log.latencyMs)} / —`;
+  const generationSpeed = formatGenerationSpeed(log);
+  return (
+    <div
+      style={{
+        display: "inline-flex",
+        flexDirection: "column",
+        alignItems: options?.align || "center",
+        gap: 3,
+        fontSize: 12,
+        fontVariantNumeric: "tabular-nums",
+        lineHeight: 1.35,
+      }}
+    >
+      <span
+        style={{
+          fontWeight: 600,
+          color: latencyColor(log.latencyMs),
+        }}
+      >
+        {totalAndFirstByte}
+      </span>
+      <span style={{ color: "var(--color-text-muted)", fontWeight: 600 }}>
+        {generationSpeed}
+      </span>
+    </div>
+  );
+}
+
+function TimingFormatHelpIcon() {
+  return (
+    <span
+      aria-label="用时格式说明"
+      data-tooltip={LATENCY_FORMAT_TOOLTIP}
+      data-tooltip-side="bottom"
+      data-tooltip-preserve-lines="true"
+      data-tooltip-compact="true"
+      tabIndex={0}
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        width: 14,
+        height: 14,
+        marginLeft: 4,
+        borderRadius: "50%",
+        border: "1px solid var(--color-border)",
+        color: "var(--color-text-muted)",
+        fontSize: 10,
+        fontWeight: 700,
+        lineHeight: 1,
+        cursor: "help",
+        verticalAlign: "middle",
+      }}
+    >
+      ?
+    </span>
+  );
 }
 
 function formatCompactNumber(value: number, digits = 6) {
@@ -2664,15 +2757,15 @@ export default function ProxyLogs() {
               const isExpanded = expanded === log.id;
               const clientDisplay = resolveProxyLogClientDisplay(detailLog);
               const streamModeLabel = formatStreamModeLabel(detailLog.isStream);
+              const transportLabel = formatTransportLabel(detailLog.downstreamTransport, detailLog.upstreamTransport);
               const firstByteLabel = formatFirstByteLabel(
                 detailLog.firstByteLatencyMs,
               );
-
               return (
                 <MobileCard
                   key={log.id}
                   title={detailLog.modelRequested || "unknown"}
-                  subtitle={formatDateTimeLocal(log.createdAt)}
+                  subtitle={formatStoredBeijingDateTime(log.createdAt)}
                   compact
                   headerActions={
                     <span
@@ -2724,29 +2817,23 @@ export default function ProxyLogs() {
                         {streamModeLabel}
                       </span>
                     ) : null}
-                    {firstByteLabel ? (
+                    {transportLabel ? (
                       <span
-                        className="badge"
-                        style={{
-                          fontSize: 10,
-                          color: firstByteColor(
-                            detailLog.firstByteLatencyMs ?? 0,
-                          ),
-                          background: firstByteBgColor(
-                            detailLog.firstByteLatencyMs ?? 0,
-                          ),
-                          borderColor: "transparent",
-                        }}
+                        className="badge badge-muted"
+                        style={{ fontSize: 10 }}
                       >
-                        {firstByteLabel}
+                        {transportLabel}
                       </span>
                     ) : null}
                   </div>
                   <div className="mobile-summary-grid">
                     <div className="mobile-summary-metric">
-                      <div className="mobile-summary-metric-label">用时</div>
+                      <div className="mobile-summary-metric-label">
+                        用时
+                        <TimingFormatHelpIcon />
+                      </div>
                       <div className="mobile-summary-metric-value">
-                        {formatLatency(log.latencyMs)}
+                        {renderLatencyWithFirstByte(detailLog, { align: "flex-start" })}
                       </div>
                     </div>
                     <div className="mobile-summary-metric">
@@ -2774,7 +2861,7 @@ export default function ProxyLogs() {
                     <div className="mobile-card-extra">
                       <MobileField
                         label="时间"
-                        value={formatDateTimeLocal(log.createdAt)}
+                        value={formatStoredBeijingDateTime(log.createdAt)}
                       />
                       <MobileField
                         label="站点"
@@ -2790,6 +2877,9 @@ export default function ProxyLogs() {
                       />
                       {streamModeLabel ? (
                         <MobileField label="模式" value={streamModeLabel} />
+                      ) : null}
+                      {transportLabel ? (
+                        <MobileField label="协议" value={transportLabel} />
                       ) : null}
                       {firstByteLabel ? (
                         <MobileField
@@ -2871,7 +2961,10 @@ export default function ProxyLogs() {
                 <th>站点</th>
                 <th>客户端</th>
                 <th>{tr("状态")}</th>
-                <th style={{ textAlign: "center" }}>用时</th>
+                <th style={{ textAlign: "center" }}>
+                  用时
+                  <TimingFormatHelpIcon />
+                </th>
                 <th style={{ textAlign: "right" }}>输入</th>
                 <th style={{ textAlign: "right" }}>输出</th>
                 <th style={{ textAlign: "right" }}>花费</th>
@@ -2899,9 +2992,11 @@ export default function ProxyLogs() {
                 const streamModeLabel = formatStreamModeLabel(
                   detailLog.isStream,
                 );
+                const transportLabel = formatTransportLabel(detailLog.downstreamTransport, detailLog.upstreamTransport);
                 const firstByteLabel = formatFirstByteLabel(
                   detailLog.firstByteLatencyMs,
                 );
+                const timingBadgesVisible = !!(streamModeLabel || transportLabel);
 
                 return (
                   <React.Fragment key={log.id}>
@@ -2947,7 +3042,7 @@ export default function ProxyLogs() {
                           color: "var(--color-text-secondary)",
                         }}
                       >
-                        {formatDateTimeLocal(log.createdAt)}
+                        {formatStoredBeijingDateTime(log.createdAt)}
                       </td>
                       <td>
                         <div
@@ -2972,7 +3067,7 @@ export default function ProxyLogs() {
                               {downstreamKeySummary}
                             </div>
                           ) : null}
-                          {streamModeLabel || firstByteLabel ? (
+                          {timingBadgesVisible ? (
                             <div
                               style={{
                                 display: "flex",
@@ -2988,21 +3083,12 @@ export default function ProxyLogs() {
                                   {streamModeLabel}
                                 </span>
                               ) : null}
-                              {firstByteLabel ? (
+                              {transportLabel ? (
                                 <span
-                                  className="badge"
-                                  style={{
-                                    fontSize: 10,
-                                    color: firstByteColor(
-                                      detailLog.firstByteLatencyMs ?? 0,
-                                    ),
-                                    background: firstByteBgColor(
-                                      detailLog.firstByteLatencyMs ?? 0,
-                                    ),
-                                    borderColor: "transparent",
-                                  }}
+                                  className="badge badge-muted"
+                                  style={{ fontSize: 10 }}
                                 >
-                                  {firstByteLabel}
+                                  {transportLabel}
                                 </span>
                               ) : null}
                             </div>
@@ -3051,19 +3137,7 @@ export default function ProxyLogs() {
                         </span>
                       </td>
                       <td style={{ textAlign: "center" }}>
-                        <span
-                          style={{
-                            fontVariantNumeric: "tabular-nums",
-                            fontSize: 12,
-                            fontWeight: 600,
-                            color: latencyColor(log.latencyMs),
-                            background: latencyBgColor(log.latencyMs),
-                            padding: "2px 8px",
-                            borderRadius: 4,
-                          }}
-                        >
-                          {formatLatency(log.latencyMs)}
-                        </span>
+                        {renderLatencyWithFirstByte(detailLog)}
                       </td>
                       <td
                         style={{
@@ -3193,6 +3267,19 @@ export default function ProxyLogs() {
                                             }}
                                           >
                                             {streamModeLabel}
+                                          </strong>
+                                        </>
+                                      )}
+                                      {transportLabel && (
+                                        <>
+                                          ，协议:{" "}
+                                          <strong
+                                            style={{
+                                              color:
+                                                "var(--color-text-primary)",
+                                            }}
+                                          >
+                                            {transportLabel}
                                           </strong>
                                         </>
                                       )}

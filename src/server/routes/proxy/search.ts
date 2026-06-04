@@ -9,7 +9,7 @@ import { ensureModelAllowedForDownstreamKey, getDownstreamRoutingPolicy, recordD
 import { withSiteRecordProxyRequestInit } from '../../services/siteProxy.js';
 import { getProxyUrlFromExtraConfig } from '../../services/accountExtraConfig.js';
 import { composeProxyLogMessage } from '../../services/proxyLogMessage.js';
-import { formatUtcSqlDateTime } from '../../services/localTimeService.js';
+import { formatBeijingSqlDateTime } from '../../services/localTimeService.js';
 import { getProxyAuthContext } from '../../middleware/auth.js';
 import { buildUpstreamUrl } from './upstreamUrl.js';
 import { detectDownstreamClientContext, type DownstreamClientContext } from '../../proxy-core/downstreamClientContext.js';
@@ -235,7 +235,7 @@ async function logProxy(
   firstByteLatencyMs: number | null = null,
 ) {
   try {
-    const createdAt = formatUtcSqlDateTime(new Date());
+    const createdAt = formatBeijingSqlDateTime(new Date());
     await insertProxyLog({
       routeId: selected.channel.routeId,
       channelId: selected.channel.id,
