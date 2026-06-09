@@ -163,30 +163,28 @@ metapi/
 
 ### Commit Messages / 提交信息
 
-Use conventional commit format / 使用约定式提交格式:
+格式 / Format:
 
-```
-<type>: <description>
-
-[optional body]
+```bash
+git commit -m "type(scope): 中文描述" -m "<中文 body>"
 ```
 
-Types / 类型:
-- `feat`: New feature / 新功能
-- `fix`: Bug fix / 错误修复
-- `docs`: Documentation / 文档
-- `refactor`: Code refactoring / 代码重构
-- `test`: Tests / 测试
-- `chore`: Build/tooling / 构建/工具
+**Type**: `feat`、`fix`、`docs`、`refactor`、`test`、`chore`
+**Scope**: 英文模块短词（如 `routing`、`proxy`、`settings`）
+**Description/Body 规则**:
+- 必须包含 body，不允许只有 description 而无 body 的单行提交
+- 使用中文表达，避免全英文句子
+- 允许必要英文单词（模块名、协议名、接口名），但应控制数量
+- body 用条目描述变更点，优先写影响面与行为变化
 
-Examples / 示例:
+示例 / Examples:
 ```
-feat: add AnyRouter platform adapter
-fix: handle empty model list in dashboard
-docs: update Docker deployment guide
-refactor: extract route selection logic
-test: add tests for checkin reward parser
-chore: upgrade Vite to 6.0
+feat(routing): 新增 AnyRouter 平台适配器
+fix(dashboard): 修复模型列表为空时的渲染崩溃
+docs: 更新 Docker 部署指南
+refactor(proxy): 抽取路由选择逻辑为独立模块
+test(checkin): 补全签到奖励解析器的单元测试
+chore: 升级 Vite 至 6.0
 ```
 
 ### What Not to Commit / 不要提交的内容
