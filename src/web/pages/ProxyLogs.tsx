@@ -421,14 +421,49 @@ function formatCompactNumber(value: number, digits = 6) {
   return formatted || "0";
 }
 
-function formatPerMillionPrice(value: number) {
-  return `$${formatCompactNumber(value)} / 1M tokens`;
+function normalizeBillingNumber(value: number | null | undefined) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function formatOptionalCompactNumber(value: number | null | undefined) {
+  const normalized = normalizeBillingNumber(value);
+  return normalized == null ? null : formatCompactNumber(normalized);
+}
+
+function formatOptionalPerMillionPrice(value: number | null | undefined) {
+  const formatted = formatOptionalCompactNumber(value);
+  return formatted == null ? null : `$${formatted} / 1M tokens`;
+}
+
+function formatOptionalTokenCount(value: number | null | undefined) {
+  const normalized = normalizeBillingNumber(value);
+  return normalized == null ? null : normalized.toLocaleString();
+}
+
+function hasPositiveBillingNumber(value: number | null | undefined) {
+  const normalized = normalizeBillingNumber(value);
+  return normalized != null && normalized > 0;
 }
 
 function formatBillingDetailSummary(log: ProxyLogRenderItem) {
   const detail = log.billingDetails;
   if (!detail) return null;
-  return `模型倍率 ${formatCompactNumber(detail.pricing.modelRatio)}，输出倍率 ${formatCompactNumber(detail.pricing.completionRatio)}，缓存倍率 ${formatCompactNumber(detail.pricing.cacheRatio)}，缓存创建倍率 ${formatCompactNumber(detail.pricing.cacheCreationRatio)}，分组倍率 ${formatCompactNumber(detail.pricing.groupRatio)}`;
+  const pricing = detail.pricing;
+  if (!pricing) return null;
+  const pricingParts: Array<[string, number | null | undefined]> = [
+    ["模型倍率", pricing.modelRatio],
+    ["输出倍率", pricing.completionRatio],
+    ["缓存倍率", pricing.cacheRatio],
+    ["缓存创建倍率", pricing.cacheCreationRatio],
+    ["分组倍率", pricing.groupRatio],
+  ];
+  const parts = pricingParts
+    .map(([label, value]) => {
+      const formatted = formatOptionalCompactNumber(value);
+      return formatted == null ? null : `${label} ${formatted}`;
+    })
+    .filter(Boolean);
+  return parts.length > 0 ? parts.join("，") : null;
 }
 
 function formatProxyLogUsageSource(
@@ -442,6 +477,100 @@ function formatProxyLogUsageSource(
 
 function formatProxyLogTokenValue(value: number | null | undefined): string {
   return typeof value === "number" ? value.toLocaleString() : "--";
+}
+
+function formatCodexContextStrategy(strategy: ProxyLogRenderItem["contextTelemetry"] extends infer T ? T extends { contextStrategy?: infer S } ? S | undefined : never : never): string | null {
+  if (strategy === "full") return "full";
+  if (strategy === "incremental") return "incremental";
+  if (strategy === "compact") return "compact";
+  if (strategy === "trim") return "trim";
+  if (strategy === "fallback_no_previous_response") return "no previous_response";
+  return null;
+}
+
+function formatNullableBoolean(value: boolean | null | undefined): string {
+  if (value === true) return "是";
+  if (value === false) return "否";
+  return "--";
+}
+
+function renderCodexContextStrategyBadge(log: ProxyLogRenderItem) {
+  const strategy = log.contextTelemetry?.contextStrategy;
+  const label = formatCodexContextStrategy(strategy);
+  if (!label) return null;
+  const badgeClass = strategy === "compact"
+    ? "badge-primary"
+    : strategy === "incremental"
+      ? "badge-success"
+      : strategy === "trim" || strategy === "fallback_no_previous_response"
+        ? "badge-warning"
+        : "badge-muted";
+  return (
+    <span className={`badge ${badgeClass}`} style={{ fontSize: 10, alignSelf: "flex-start" }}>
+      {label}
+    </span>
+  );
+}
+
+function renderCodexContextTelemetrySummary(log: ProxyLogRenderItem) {
+  const telemetry = log.contextTelemetry;
+  if (!telemetry) return null;
+  const strategy = formatCodexContextStrategy(telemetry.contextStrategy) || "未知";
+  return [
+    `策略 ${strategy}`,
+    `client ${formatProxyLogTokenValue(telemetry.clientFullInputTokensEstimate)}`,
+    `sent ${formatProxyLogTokenValue(telemetry.upstreamSentInputTokensEstimate)}`,
+    `prompt ${formatProxyLogTokenValue(telemetry.upstreamPromptTokens)}`,
+    typeof telemetry.savedInputTokensEstimate === "number" ? `saved ${formatProxyLogTokenValue(telemetry.savedInputTokensEstimate)}` : null,
+    telemetry.compactTriggered ? "compact 已触发" : null,
+  ].filter(Boolean).join(" · ");
+}
+
+function renderCodexContextTelemetryDetail(log: ProxyLogRenderItem) {
+  const telemetry = log.contextTelemetry;
+  if (!telemetry) return null;
+  const rows = [
+    ["客户端 full input 估算", formatProxyLogTokenValue(telemetry.clientFullInputTokensEstimate)],
+    ["实际上游 sent input 估算", formatProxyLogTokenValue(telemetry.upstreamSentInputTokensEstimate)],
+    ["upstream prompt usage", formatProxyLogTokenValue(telemetry.upstreamPromptTokens)],
+    ["策略选择", formatCodexContextStrategy(telemetry.contextStrategy) || "未知"],
+    ["compact 是否触发", formatNullableBoolean(telemetry.compactTriggered)],
+    ["compact 是否尝试", formatNullableBoolean(telemetry.compactAttempted)],
+    ["compact 是否成功", formatNullableBoolean(telemetry.compactSucceeded)],
+    ["previous_response_id", formatNullableBoolean(telemetry.previousResponseIdUsed)],
+    ["节省 input 估算", formatProxyLogTokenValue(telemetry.savedInputTokensEstimate)],
+    ["compact 原因", telemetry.compactReason || "--"],
+    ["fallback 原因", telemetry.fallbackReason || "--"],
+  ];
+  return (
+    <div style={{ display: "flex", gap: 6, alignItems: "flex-start" }}>
+      <span style={{ fontWeight: 600, color: "var(--color-primary)", flexShrink: 0 }}>
+        Codex 上下文
+      </span>
+      <div style={{ display: "grid", gap: 4, minWidth: 0 }}>
+        <div style={{ color: "var(--color-text-muted)" }}>
+          每轮记录 client full、上游 sent、upstream prompt usage、策略与 compact 触发状态。
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 6 }}>
+          {rows.map(([label, value]) => (
+            <div
+              key={label}
+              style={{
+                padding: "6px 8px",
+                border: "1px solid var(--color-border-light)",
+                borderRadius: 6,
+                background: "var(--color-bg-card)",
+                minWidth: 0,
+              }}
+            >
+              <div style={{ color: "var(--color-text-muted)", fontSize: 11 }}>{label}</div>
+              <div style={{ color: "var(--color-text-primary)", fontWeight: 600, wordBreak: "break-word" }}>{value}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function renderDownstreamKeySummary(log: ProxyLogRenderItem) {
@@ -459,43 +588,82 @@ function buildBillingProcessLines(log: ProxyLogRenderItem) {
   const detail = log.billingDetails;
   if (!detail) return [];
 
-  const lines = [
-    `提示价格：${formatPerMillionPrice(detail.breakdown.inputPerMillion)}`,
-    `补全价格：${formatPerMillionPrice(detail.breakdown.outputPerMillion)}`,
-  ];
+  const breakdown = detail.breakdown;
+  const usage = detail.usage;
+  if (!breakdown || !usage) return [];
 
-  if (detail.usage.cacheReadTokens > 0) {
-    lines.push(
-      `缓存价格：${formatPerMillionPrice(detail.breakdown.cacheReadPerMillion)} (缓存倍率: ${formatCompactNumber(detail.pricing.cacheRatio)})`,
-    );
-  }
-
-  if (detail.usage.cacheCreationTokens > 0) {
-    lines.push(
-      `缓存创建价格：${formatPerMillionPrice(detail.breakdown.cacheCreationPerMillion)} (缓存创建倍率: ${formatCompactNumber(detail.pricing.cacheCreationRatio)})`,
-    );
-  }
-
-  const parts = [
-    `提示 ${detail.usage.billablePromptTokens.toLocaleString()} tokens / 1M tokens * $${formatCompactNumber(detail.breakdown.inputPerMillion)}`,
-  ];
-
-  if (detail.usage.cacheReadTokens > 0) {
-    parts.push(
-      `缓存 ${detail.usage.cacheReadTokens.toLocaleString()} tokens / 1M tokens * $${formatCompactNumber(detail.breakdown.cacheReadPerMillion)}`,
-    );
-  }
-
-  if (detail.usage.cacheCreationTokens > 0) {
-    parts.push(
-      `缓存创建 ${detail.usage.cacheCreationTokens.toLocaleString()} tokens / 1M tokens * $${formatCompactNumber(detail.breakdown.cacheCreationPerMillion)}`,
-    );
-  }
-
-  parts.push(
-    `补全 ${detail.usage.completionTokens.toLocaleString()} tokens / 1M tokens * $${formatCompactNumber(detail.breakdown.outputPerMillion)} = $${detail.breakdown.totalCost.toFixed(6)}`,
+  const inputPrice = formatOptionalPerMillionPrice(breakdown.inputPerMillion);
+  const outputPrice = formatOptionalPerMillionPrice(breakdown.outputPerMillion);
+  const cacheReadPrice = formatOptionalPerMillionPrice(
+    breakdown.cacheReadPerMillion,
   );
-  lines.push(parts.join(" + "));
+  const cacheCreationPrice = formatOptionalPerMillionPrice(
+    breakdown.cacheCreationPerMillion,
+  );
+  const cacheRatio = formatOptionalCompactNumber(detail.pricing?.cacheRatio);
+  const cacheCreationRatio = formatOptionalCompactNumber(
+    detail.pricing?.cacheCreationRatio,
+  );
+
+  const lines = [
+    inputPrice ? `提示价格：${inputPrice}` : null,
+    outputPrice ? `补全价格：${outputPrice}` : null,
+  ].filter((line): line is string => Boolean(line));
+
+  if (hasPositiveBillingNumber(usage.cacheReadTokens) && cacheReadPrice) {
+    lines.push(cacheRatio
+      ? `缓存价格：${cacheReadPrice} (缓存倍率: ${cacheRatio})`
+      : `缓存价格：${cacheReadPrice}`);
+  }
+
+  if (hasPositiveBillingNumber(usage.cacheCreationTokens) && cacheCreationPrice) {
+    lines.push(cacheCreationRatio
+      ? `缓存创建价格：${cacheCreationPrice} (缓存创建倍率: ${cacheCreationRatio})`
+      : `缓存创建价格：${cacheCreationPrice}`);
+  }
+
+  const parts: string[] = [];
+  const billablePromptTokens = formatOptionalTokenCount(
+    usage.billablePromptTokens,
+  );
+  const inputPriceNumber = formatOptionalCompactNumber(breakdown.inputPerMillion);
+  if (billablePromptTokens && inputPriceNumber) {
+    parts.push(
+      `提示 ${billablePromptTokens} tokens / 1M tokens * $${inputPriceNumber}`,
+    );
+  }
+
+  const cacheReadTokens = formatOptionalTokenCount(usage.cacheReadTokens);
+  const cacheReadPriceNumber = formatOptionalCompactNumber(
+    breakdown.cacheReadPerMillion,
+  );
+  if (hasPositiveBillingNumber(usage.cacheReadTokens) && cacheReadTokens && cacheReadPriceNumber) {
+    parts.push(
+      `缓存 ${cacheReadTokens} tokens / 1M tokens * $${cacheReadPriceNumber}`,
+    );
+  }
+
+  const cacheCreationTokens = formatOptionalTokenCount(
+    usage.cacheCreationTokens,
+  );
+  const cacheCreationPriceNumber = formatOptionalCompactNumber(
+    breakdown.cacheCreationPerMillion,
+  );
+  if (hasPositiveBillingNumber(usage.cacheCreationTokens) && cacheCreationTokens && cacheCreationPriceNumber) {
+    parts.push(
+      `缓存创建 ${cacheCreationTokens} tokens / 1M tokens * $${cacheCreationPriceNumber}`,
+    );
+  }
+
+  const completionTokens = formatOptionalTokenCount(usage.completionTokens);
+  const outputPriceNumber = formatOptionalCompactNumber(breakdown.outputPerMillion);
+  const totalCost = normalizeBillingNumber(breakdown.totalCost);
+  if (completionTokens && outputPriceNumber && totalCost != null) {
+    parts.push(
+      `补全 ${completionTokens} tokens / 1M tokens * $${outputPriceNumber} = $${totalCost.toFixed(6)}`,
+    );
+  }
+  if (parts.length > 0) lines.push(parts.join(" + "));
 
   return lines;
 }
@@ -2825,6 +2993,7 @@ export default function ProxyLogs() {
                         {transportLabel}
                       </span>
                     ) : null}
+                    {renderCodexContextStrategyBadge(detailLog)}
                   </div>
                   <div className="mobile-summary-grid">
                     <div className="mobile-summary-metric">
@@ -2961,6 +3130,7 @@ export default function ProxyLogs() {
                 <th>站点</th>
                 <th>客户端</th>
                 <th>{tr("状态")}</th>
+                <th>上下文策略</th>
                 <th style={{ textAlign: "center" }}>
                   用时
                   <TimingFormatHelpIcon />
@@ -3136,6 +3306,11 @@ export default function ProxyLogs() {
                           {log.status === "success" ? "成功" : "失败"}
                         </span>
                       </td>
+                      <td style={{ fontSize: 12 }}>
+                        {renderCodexContextStrategyBadge(detailLog) || (
+                          <span style={{ color: "var(--color-text-muted)" }}>--</span>
+                        )}
+                      </td>
                       <td style={{ textAlign: "center" }}>
                         {renderLatencyWithFirstByte(detailLog)}
                       </td>
@@ -3193,7 +3368,7 @@ export default function ProxyLogs() {
                     </tr>
                     {expanded === log.id && (
                       <tr style={{ background: "var(--color-bg)" }}>
-                        <td colSpan={11} style={{ padding: 0 }}>
+                        <td colSpan={12} style={{ padding: 0 }}>
                           <div className="anim-collapse is-open">
                             <div className="anim-collapse-inner">
                               <div
@@ -3369,6 +3544,7 @@ export default function ProxyLogs() {
                                           pathMeta.usageSource,
                                       ) || "未知"}
                                     </div>
+                                    {renderCodexContextTelemetryDetail(detailLog)}
                                     <div
                                       style={{
                                         display: "flex",
@@ -3403,8 +3579,9 @@ export default function ProxyLogs() {
                                 </div>
 
                                 {detailLog.billingDetails &&
-                                  detailLog.billingDetails.usage
-                                    .cacheReadTokens > 0 && (
+                                  hasPositiveBillingNumber(
+                                    detailLog.billingDetails.usage?.cacheReadTokens,
+                                  ) && (
                                     <div style={{ display: "flex", gap: 6 }}>
                                       <span
                                         style={{
@@ -3416,14 +3593,17 @@ export default function ProxyLogs() {
                                         缓存 Tokens
                                       </span>
                                       <span>
-                                        {detailLog.billingDetails.usage.cacheReadTokens.toLocaleString()}
+                                        {formatOptionalTokenCount(
+                                          detailLog.billingDetails.usage?.cacheReadTokens,
+                                        )}
                                       </span>
                                     </div>
                                   )}
 
                                 {detailLog.billingDetails &&
-                                  detailLog.billingDetails.usage
-                                    .cacheCreationTokens > 0 && (
+                                  hasPositiveBillingNumber(
+                                    detailLog.billingDetails.usage?.cacheCreationTokens,
+                                  ) && (
                                     <div style={{ display: "flex", gap: 6 }}>
                                       <span
                                         style={{
@@ -3435,7 +3615,9 @@ export default function ProxyLogs() {
                                         缓存创建 Tokens
                                       </span>
                                       <span>
-                                        {detailLog.billingDetails.usage.cacheCreationTokens.toLocaleString()}
+                                        {formatOptionalTokenCount(
+                                          detailLog.billingDetails.usage?.cacheCreationTokens,
+                                        )}
                                       </span>
                                     </div>
                                   )}

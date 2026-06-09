@@ -409,6 +409,16 @@ function normalizeProxyLogUsageSource(
   return null;
 }
 
+function parseProxyLogContextTelemetry(
+  billingDetails: Record<string, unknown> | null,
+): Record<string, unknown> | null {
+  const telemetry = billingDetails?.contextTelemetry;
+  if (!telemetry || typeof telemetry !== "object" || Array.isArray(telemetry)) {
+    return null;
+  }
+  return telemetry as Record<string, unknown>;
+}
+
 function buildProxyLogClientOptions(
   rows: Array<{
     clientFamily?: string | null;
@@ -646,13 +656,16 @@ function mapProxyLogRow(
   },
 ) {
   const clientMeta = resolveProxyLogClientMeta(row.proxy_logs);
+  const rawBillingDetails = parseProxyLogBillingDetails(row.proxy_logs.billingDetails);
+  const billingDetails = options?.includeBillingDetails ? rawBillingDetails : null;
   const legacyMeta = parseProxyLogMessageMeta(
     typeof row.proxy_logs.errorMessage === "string"
       ? row.proxy_logs.errorMessage
       : "",
   );
+  const { billingDetails: _rawBillingDetailsValue, ...proxyLogPublicFields } = row.proxy_logs;
   return {
-    ...row.proxy_logs,
+    ...proxyLogPublicFields,
     isStream:
       row.proxy_logs.isStream == null ? null : Boolean(row.proxy_logs.isStream),
     downstreamTransport: row.proxy_logs.downstreamTransport ?? null,
@@ -663,11 +676,10 @@ function mapProxyLogRow(
         : null,
     ...(options?.includeBillingDetails
       ? {
-          billingDetails: parseProxyLogBillingDetails(
-            row.proxy_logs.billingDetails,
-          ),
+          billingDetails,
         }
       : {}),
+    contextTelemetry: parseProxyLogContextTelemetry(rawBillingDetails),
     clientFamily: clientMeta.clientFamily,
     clientAppId: clientMeta.clientAppId,
     clientAppName: clientMeta.clientAppName,
@@ -811,7 +823,7 @@ export async function statsRoutes(app: FastifyInstance) {
           .offset(offset)
           .all();
       },
-      { includeBillingDetails: false },
+      { includeBillingDetails: true },
     )) as Array<{
       proxy_logs: Record<string, unknown> & { billingDetails?: string | null };
       accounts: { username?: string | null } | null;
@@ -925,16 +937,20 @@ export async function statsRoutes(app: FastifyInstance) {
 
     const clientOptionRowsPromise = withProxyLogSelectFields(
       ({ fields, includeClientFields }) => {
-        if (!includeClientFields) {
-          return Promise.resolve([]);
-        }
+        const selectFields = includeClientFields
+          ? {
+              clientFamily: fields.clientFamily!,
+              clientAppId: fields.clientAppId!,
+              clientAppName: fields.clientAppName!,
+            }
+          : {
+              clientFamily: schema.proxyLogs.clientFamily,
+              clientAppId: schema.proxyLogs.clientAppId,
+              clientAppName: schema.proxyLogs.clientAppName,
+            };
 
         let query = db
-          .select({
-            clientFamily: fields.clientFamily!,
-            clientAppId: fields.clientAppId!,
-            clientAppName: fields.clientAppName!,
-          })
+          .select(selectFields)
           .from(schema.proxyLogs)
           .leftJoin(
             schema.accounts,
@@ -955,9 +971,9 @@ export async function statsRoutes(app: FastifyInstance) {
 
         return query
           .groupBy(
-            fields.clientFamily!,
-            fields.clientAppId!,
-            fields.clientAppName!,
+            selectFields.clientFamily,
+            selectFields.clientAppId,
+            selectFields.clientAppName,
           )
           .all();
       },

@@ -483,35 +483,50 @@ export type ProxyLogClientConfidence = "exact" | "heuristic" | "unknown" | null;
 export type ProxyLogUsageSource = "upstream" | "self-log" | "unknown" | null;
 
 export type ProxyLogBillingDetails = {
-  quotaType: number;
-  usage: {
-    promptTokens: number;
-    completionTokens: number;
-    totalTokens: number;
-    cacheReadTokens: number;
-    cacheCreationTokens: number;
-    billablePromptTokens: number;
-    promptTokensIncludeCache: boolean | null;
+  quotaType?: number;
+  usage?: {
+    promptTokens?: number;
+    completionTokens?: number;
+    totalTokens?: number;
+    cacheReadTokens?: number;
+    cacheCreationTokens?: number;
+    billablePromptTokens?: number;
+    promptTokensIncludeCache?: boolean | null;
   };
-  pricing: {
-    modelRatio: number;
-    completionRatio: number;
-    cacheRatio: number;
-    cacheCreationRatio: number;
-    groupRatio: number;
+  pricing?: {
+    modelRatio?: number;
+    completionRatio?: number;
+    cacheRatio?: number;
+    cacheCreationRatio?: number;
+    groupRatio?: number;
   };
-  breakdown: {
-    inputPerMillion: number;
-    outputPerMillion: number;
-    cacheReadPerMillion: number;
-    cacheCreationPerMillion: number;
-    inputCost: number;
-    outputCost: number;
-    cacheReadCost: number;
-    cacheCreationCost: number;
-    totalCost: number;
+  breakdown?: {
+    inputPerMillion?: number;
+    outputPerMillion?: number;
+    cacheReadPerMillion?: number;
+    cacheCreationPerMillion?: number;
+    inputCost?: number;
+    outputCost?: number;
+    cacheReadCost?: number;
+    cacheCreationCost?: number;
+    totalCost?: number;
   };
+  [key: string]: unknown;
 } | null;
+
+export type CodexContextTelemetry = {
+  clientFullInputTokensEstimate?: number | null;
+  upstreamSentInputTokensEstimate?: number | null;
+  upstreamPromptTokens?: number | null;
+  contextStrategy?: 'full' | 'incremental' | 'compact' | 'trim' | 'fallback_no_previous_response' | null;
+  compactTriggered?: boolean | null;
+  compactReason?: string | null;
+  fallbackReason?: string | null;
+  savedInputTokensEstimate?: number | null;
+  previousResponseIdUsed?: boolean | null;
+  compactAttempted?: boolean | null;
+  compactSucceeded?: boolean | null;
+};
 
 export type ProxyLogListItem = {
   id: number;
@@ -541,6 +556,7 @@ export type ProxyLogListItem = {
   clientAppName?: string | null;
   clientConfidence?: ProxyLogClientConfidence;
   usageSource?: ProxyLogUsageSource;
+  contextTelemetry?: CodexContextTelemetry | null;
   promptTokens?: number | null;
   completionTokens?: number | null;
   estimatedCost?: number | null;

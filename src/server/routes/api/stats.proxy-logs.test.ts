@@ -151,7 +151,7 @@ describe("stats proxy logs routes", () => {
 
     const response = await app.inject({
       method: "GET",
-      url: "/api/stats/proxy-logs?limit=1&offset=1&status=failed&search=gpt",
+      url: `/api/stats/proxy-logs?limit=1&offset=1&status=failed&search=gpt&from=${encodeURIComponent("2026-03-09T08:00:00.000Z")}&to=${encodeURIComponent("2026-03-09T08:10:00.000Z")}`,
     });
 
     expect(response.statusCode).toBe(200);
@@ -564,7 +564,7 @@ describe("stats proxy logs routes", () => {
 
     const response = await app.inject({
       method: "GET",
-      url: "/api/stats/proxy-logs?client=app%3Acherry_studio",
+      url: `/api/stats/proxy-logs?client=app%3Acherry_studio&from=${encodeURIComponent("2026-03-09T11:00:00.000Z")}&to=${encodeURIComponent("2026-03-09T11:10:00.000Z")}`,
     });
 
     expect(response.statusCode).toBe(200);
@@ -779,7 +779,7 @@ describe("stats proxy logs routes", () => {
 
     const metaResponse = await app.inject({
       method: "GET",
-      url: "/api/stats/proxy-logs?view=meta&search=gpt",
+      url: `/api/stats/proxy-logs?view=meta&search=gpt&from=${encodeURIComponent("2026-03-09T13:00:00.000Z")}&to=${encodeURIComponent("2026-03-09T13:10:00.000Z")}`,
     });
 
     expect(metaResponse.statusCode).toBe(200);
@@ -814,4 +814,83 @@ describe("stats proxy logs routes", () => {
       ]),
     );
   });
+
+  it("exposes codex context telemetry from billing details in list and detail responses", async () => {
+    const site = await db
+      .insert(schema.sites)
+      .values({
+        name: "telemetry-site",
+        url: "https://telemetry.example.com",
+        platform: "codex",
+      })
+      .returning()
+      .get();
+
+    const account = await db
+      .insert(schema.accounts)
+      .values({
+        siteId: site.id,
+        username: "telemetry-user",
+        accessToken: "telemetry-token",
+        status: "active",
+      })
+      .returning()
+      .get();
+
+    const telemetry = {
+      clientFullInputTokensEstimate: 120000,
+      upstreamSentInputTokensEstimate: 28000,
+      upstreamPromptTokens: 31000,
+      contextStrategy: "compact",
+      compactTriggered: true,
+      compactReason: "client full input estimate 120000 >= soft threshold 50000",
+      fallbackReason: null,
+      savedInputTokensEstimate: 92000,
+      previousResponseIdUsed: false,
+      compactAttempted: true,
+      compactSucceeded: true,
+    };
+
+    const inserted = await db
+      .insert(schema.proxyLogs)
+      .values({
+        accountId: account.id,
+        modelRequested: "gpt-5.4-codex",
+        modelActual: "gpt-5.4-codex",
+        status: "success",
+        promptTokens: 31000,
+        completionTokens: 1200,
+        totalTokens: 32200,
+        estimatedCost: 0.42,
+        clientFamily: "codex",
+        createdAt: formatUtcSqlDateTime(new Date("2026-03-09T14:00:00.000Z")),
+        billingDetails: JSON.stringify({
+          contextTelemetry: telemetry,
+          usage: { promptTokens: 31000, completionTokens: 1200 },
+        }),
+      })
+      .returning()
+      .get();
+
+    const listResponse = await app.inject({
+      method: "GET",
+      url: `/api/stats/proxy-logs?limit=10&offset=0&from=${encodeURIComponent("2026-03-09T14:00:00.000Z")}&to=${encodeURIComponent("2026-03-09T14:10:00.000Z")}`,
+    });
+
+    expect(listResponse.statusCode).toBe(200);
+    const listBody = listResponse.json() as { items: Array<Record<string, unknown>> };
+    expect(listBody.items[0]?.contextTelemetry).toEqual(telemetry);
+    expect(listBody.items[0]).not.toHaveProperty("billingDetails");
+
+    const detailResponse = await app.inject({
+      method: "GET",
+      url: `/api/stats/proxy-logs/${inserted.id}`,
+    });
+
+    expect(detailResponse.statusCode).toBe(200);
+    const detailBody = detailResponse.json() as Record<string, unknown>;
+    expect(detailBody.contextTelemetry).toEqual(telemetry);
+    expect(detailBody.billingDetails).toEqual(expect.objectContaining({ contextTelemetry: telemetry }));
+  });
+
 });

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, create, type ReactTestInstance } from 'react-test-renderer';
+import { act, create, type ReactTestInstance, type ReactTestRenderer } from 'react-test-renderer';
+type WebTestRenderer = ReactTestRenderer;
 import { MemoryRouter } from 'react-router-dom';
 import ModernSelect from '../components/ModernSelect.js';
 import { ToastProvider } from '../components/Toast.js';
@@ -78,6 +79,19 @@ function buildListResponse(overrides?: Partial<{
         downstreamKeyName: '移动端灰度',
         downstreamKeyGroupName: '项目A',
         downstreamKeyTags: ['VIP', '灰度'],
+        contextTelemetry: {
+          clientFullInputTokensEstimate: 120000,
+          upstreamSentInputTokensEstimate: 28000,
+          upstreamPromptTokens: 31000,
+          contextStrategy: 'compact',
+          compactTriggered: true,
+          compactReason: 'client full input estimate 120000 >= soft threshold 50000',
+          fallbackReason: null,
+          savedInputTokensEstimate: 92000,
+          previousResponseIdUsed: false,
+          compactAttempted: true,
+          compactSucceeded: true,
+        },
       },
     ],
     total: 1,
@@ -179,6 +193,19 @@ describe('ProxyLogs server-driven page', () => {
       downstreamKeyName: '移动端灰度',
       downstreamKeyGroupName: '项目A',
       downstreamKeyTags: ['VIP', '灰度'],
+      contextTelemetry: {
+        clientFullInputTokensEstimate: 120000,
+        upstreamSentInputTokensEstimate: 28000,
+        upstreamPromptTokens: 31000,
+        contextStrategy: 'compact',
+        compactTriggered: true,
+        compactReason: 'client full input estimate 120000 >= soft threshold 50000',
+        fallbackReason: null,
+        savedInputTokensEstimate: 92000,
+        previousResponseIdUsed: false,
+        compactAttempted: true,
+        compactSucceeded: true,
+      },
       billingDetails: {
         breakdown: {
           inputPerMillion: 1,
@@ -282,11 +309,54 @@ describe('ProxyLogs server-driven page', () => {
       expect(text).toContain('推测');
       expect(text).toContain('下游 Key: 移动端灰度');
       expect(text).toContain('流式');
-      expect(text).toContain('首字');
+      expect(text).toContain('120ms / 35ms');
     } finally {
       await act(async () => {
         root?.unmount();
       });
+    }
+  });
+
+
+
+  it('renders codex context telemetry in list rows and expanded details', async () => {
+    let root!: WebTestRenderer;
+
+    try {
+      await act(async () => {
+        root = create(
+          <MemoryRouter initialEntries={['/logs']}>
+            <ToastProvider>
+              <ProxyLogs />
+            </ToastProvider>
+          </MemoryRouter>,
+        );
+      });
+      await flushMicrotasks();
+
+      const row = root!.root.find((node) => (
+        node.type === 'tr' && node.props['data-testid'] === 'proxy-log-row-101'
+      ));
+      expect(collectText(row)).toContain('compact');
+
+      await act(async () => {
+        row.props.onClick();
+      });
+      await flushMicrotasks();
+
+      const text = collectText(root!.root);
+      expect(text).toContain('Codex 上下文');
+      expect(text).toContain('客户端 full input 估算');
+      expect(text).toContain('120,000');
+      expect(text).toContain('实际上游 sent input 估算');
+      expect(text).toContain('28,000');
+      expect(text).toContain('upstream prompt usage');
+      expect(text).toContain('31,000');
+      expect(text).toContain('compact 是否触发');
+      expect(text).toContain('节省 input 估算');
+      expect(text).toContain('92,000');
+    } finally {
+      root?.unmount();
     }
   });
 
@@ -971,6 +1041,60 @@ describe('ProxyLogs server-driven page', () => {
 
       expect(apiMock.getProxyLogDetail).toHaveBeenCalledTimes(1);
       expect(apiMock.getProxyLogDetail).toHaveBeenCalledWith(101);
+    } finally {
+      root?.unmount();
+    }
+  });
+
+  it('renders expanded detail when legacy billing details have no pricing block', async () => {
+    apiMock.getProxyLogDetail.mockResolvedValue({
+      id: 101,
+      createdAt: '2026-03-09 16:00:00',
+      modelRequested: 'gpt-4o',
+      modelActual: 'gpt-4o',
+      status: 'success',
+      latencyMs: 120,
+      promptTokens: 10,
+      completionTokens: 5,
+      totalTokens: 15,
+      retryCount: 0,
+      estimatedCost: 1.23,
+      errorMessage: 'legacy billing detail',
+      username: 'tester',
+      siteName: 'main-site',
+      siteUrl: 'https://main-site.example.com',
+      billingDetails: {
+        source: 'pricing',
+        total: 1.25,
+      },
+    });
+
+    let root!: WebTestRenderer;
+
+    try {
+      await act(async () => {
+        root = create(
+          <MemoryRouter initialEntries={['/logs']}>
+            <ToastProvider>
+              <ProxyLogs />
+            </ToastProvider>
+          </MemoryRouter>,
+        );
+      });
+      await flushMicrotasks();
+
+      const row = root!.root.find((node) => (
+        node.type === 'tr' && node.props['data-testid'] === 'proxy-log-row-101'
+      ));
+
+      await act(async () => {
+        row.props.onClick();
+      });
+      await flushMicrotasks();
+
+      expect(apiMock.getProxyLogDetail).toHaveBeenCalledWith(101);
+      expect(collectText(root!.root)).toContain('tester');
+      expect(collectText(root!.root)).not.toContain('模型倍率');
     } finally {
       root?.unmount();
     }
