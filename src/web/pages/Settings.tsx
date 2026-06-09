@@ -87,9 +87,14 @@ type RuntimeSettings = {
   codexStickyAccountEnabled: boolean;
   codexStickyAccountQuotaThresholdPercent: number;
   responsesCompactFallbackToResponsesEnabled: boolean;
+  codexContextCompactionAutoEnabled: boolean;
+  codexContextCompactionSoftTokens: number;
+  codexContextCompactionTargetTokens: number;
+  codexContextCompactionCooldownTurns: number;
+  codexContextCompactionUnsupportedTtlMs: number;
+  codexContextCompactionMaxAttemptsPerSession: number;
   contextWindowGuardEnabled: boolean;
   contextWindowGuardAutoCompactPercent: number;
-  contextWindowGuardHardTrimPercent: number;
   contextWindowGuardTrimTargetPercent: number;
   disableCrossProtocolFallback: boolean;
   proxySessionChannelConcurrencyLimit: number;
@@ -396,9 +401,14 @@ export default function Settings() {
     codexStickyAccountEnabled: true,
     codexStickyAccountQuotaThresholdPercent: 10,
     responsesCompactFallbackToResponsesEnabled: false,
+    codexContextCompactionAutoEnabled: false,
+    codexContextCompactionSoftTokens: 50000,
+    codexContextCompactionTargetTokens: 30000,
+    codexContextCompactionCooldownTurns: 3,
+    codexContextCompactionUnsupportedTtlMs: 600000,
+    codexContextCompactionMaxAttemptsPerSession: 8,
     contextWindowGuardEnabled: true,
     contextWindowGuardAutoCompactPercent: 80,
-    contextWindowGuardHardTrimPercent: 95,
     contextWindowGuardTrimTargetPercent: 75,
     disableCrossProtocolFallback: false,
     proxySessionChannelConcurrencyLimit: 2,
@@ -736,11 +746,25 @@ export default function Settings() {
           ? Math.trunc(runtimeInfo.codexStickyAccountQuotaThresholdPercent)
           : 10,
         responsesCompactFallbackToResponsesEnabled: !!runtimeInfo.responsesCompactFallbackToResponsesEnabled,
+        codexContextCompactionAutoEnabled: !!runtimeInfo.codexContextCompactionAutoEnabled,
+        codexContextCompactionSoftTokens: Number(runtimeInfo.codexContextCompactionSoftTokens) >= 1000
+          ? Math.trunc(Number(runtimeInfo.codexContextCompactionSoftTokens))
+          : 50000,
+        codexContextCompactionTargetTokens: Number(runtimeInfo.codexContextCompactionTargetTokens) >= 1000
+          ? Math.trunc(Number(runtimeInfo.codexContextCompactionTargetTokens))
+          : 30000,
+        codexContextCompactionCooldownTurns: Number(runtimeInfo.codexContextCompactionCooldownTurns) >= 0
+          ? Math.trunc(Number(runtimeInfo.codexContextCompactionCooldownTurns))
+          : 3,
+        codexContextCompactionUnsupportedTtlMs: Number(runtimeInfo.codexContextCompactionUnsupportedTtlMs) >= 1000
+          ? Math.trunc(Number(runtimeInfo.codexContextCompactionUnsupportedTtlMs))
+          : 600000,
+        codexContextCompactionMaxAttemptsPerSession: Number(runtimeInfo.codexContextCompactionMaxAttemptsPerSession) >= 0
+          ? Math.trunc(Number(runtimeInfo.codexContextCompactionMaxAttemptsPerSession))
+          : 8,
         contextWindowGuardEnabled: runtimeInfo.contextWindowGuardEnabled !== false,
         contextWindowGuardAutoCompactPercent: typeof runtimeInfo.contextWindowGuardAutoCompactPercent === 'number'
           ? Math.trunc(runtimeInfo.contextWindowGuardAutoCompactPercent) : 80,
-        contextWindowGuardHardTrimPercent: typeof runtimeInfo.contextWindowGuardHardTrimPercent === 'number'
-          ? Math.trunc(runtimeInfo.contextWindowGuardHardTrimPercent) : 95,
         contextWindowGuardTrimTargetPercent: typeof runtimeInfo.contextWindowGuardTrimTargetPercent === 'number'
           ? Math.trunc(runtimeInfo.contextWindowGuardTrimTargetPercent) : 75,
         disableCrossProtocolFallback: !!runtimeInfo.disableCrossProtocolFallback,
@@ -973,6 +997,10 @@ export default function Settings() {
   };
 
   const saveProxyTransportSettings = async () => {
+    if (runtime.codexContextCompactionTargetTokens >= runtime.codexContextCompactionSoftTokens) {
+      toast.error('Codex 压缩目标 tokens 必须小于软阈值 tokens');
+      return;
+    }
     setSavingProxyTransport(true);
     try {
       const res = await api.updateRuntimeSettings({
@@ -980,9 +1008,14 @@ export default function Settings() {
         codexStickyAccountEnabled: runtime.codexStickyAccountEnabled,
         codexStickyAccountQuotaThresholdPercent: runtime.codexStickyAccountQuotaThresholdPercent,
         responsesCompactFallbackToResponsesEnabled: runtime.responsesCompactFallbackToResponsesEnabled,
+        codexContextCompactionAutoEnabled: runtime.codexContextCompactionAutoEnabled,
+        codexContextCompactionSoftTokens: runtime.codexContextCompactionSoftTokens,
+        codexContextCompactionTargetTokens: runtime.codexContextCompactionTargetTokens,
+        codexContextCompactionCooldownTurns: runtime.codexContextCompactionCooldownTurns,
+        codexContextCompactionUnsupportedTtlMs: runtime.codexContextCompactionUnsupportedTtlMs,
+        codexContextCompactionMaxAttemptsPerSession: runtime.codexContextCompactionMaxAttemptsPerSession,
         contextWindowGuardEnabled: runtime.contextWindowGuardEnabled,
         contextWindowGuardAutoCompactPercent: runtime.contextWindowGuardAutoCompactPercent,
-        contextWindowGuardHardTrimPercent: runtime.contextWindowGuardHardTrimPercent,
         contextWindowGuardTrimTargetPercent: runtime.contextWindowGuardTrimTargetPercent,
         proxySessionChannelConcurrencyLimit: runtime.proxySessionChannelConcurrencyLimit,
         proxySessionChannelQueueWaitMs: runtime.proxySessionChannelQueueWaitMs,
@@ -1001,13 +1034,28 @@ export default function Settings() {
         responsesCompactFallbackToResponsesEnabled: typeof res?.responsesCompactFallbackToResponsesEnabled === 'boolean'
           ? res.responsesCompactFallbackToResponsesEnabled
           : prev.responsesCompactFallbackToResponsesEnabled,
+        codexContextCompactionAutoEnabled: typeof res?.codexContextCompactionAutoEnabled === 'boolean'
+          ? res.codexContextCompactionAutoEnabled
+          : prev.codexContextCompactionAutoEnabled,
+        codexContextCompactionSoftTokens: Number(res?.codexContextCompactionSoftTokens) >= 1000
+          ? Math.trunc(Number(res.codexContextCompactionSoftTokens))
+          : prev.codexContextCompactionSoftTokens,
+        codexContextCompactionTargetTokens: Number(res?.codexContextCompactionTargetTokens) >= 1000
+          ? Math.trunc(Number(res.codexContextCompactionTargetTokens))
+          : prev.codexContextCompactionTargetTokens,
+        codexContextCompactionCooldownTurns: Number(res?.codexContextCompactionCooldownTurns) >= 0
+          ? Math.trunc(Number(res.codexContextCompactionCooldownTurns))
+          : prev.codexContextCompactionCooldownTurns,
+        codexContextCompactionUnsupportedTtlMs: Number(res?.codexContextCompactionUnsupportedTtlMs) >= 1000
+          ? Math.trunc(Number(res.codexContextCompactionUnsupportedTtlMs))
+          : prev.codexContextCompactionUnsupportedTtlMs,
+        codexContextCompactionMaxAttemptsPerSession: Number(res?.codexContextCompactionMaxAttemptsPerSession) >= 0
+          ? Math.trunc(Number(res.codexContextCompactionMaxAttemptsPerSession))
+          : prev.codexContextCompactionMaxAttemptsPerSession,
         contextWindowGuardEnabled: res?.contextWindowGuardEnabled !== false,
         contextWindowGuardAutoCompactPercent: typeof res?.contextWindowGuardAutoCompactPercent === 'number'
           ? Math.trunc(res.contextWindowGuardAutoCompactPercent)
           : prev.contextWindowGuardAutoCompactPercent,
-        contextWindowGuardHardTrimPercent: typeof res?.contextWindowGuardHardTrimPercent === 'number'
-          ? Math.trunc(res.contextWindowGuardHardTrimPercent)
-          : prev.contextWindowGuardHardTrimPercent,
         contextWindowGuardTrimTargetPercent: typeof res?.contextWindowGuardTrimTargetPercent === 'number'
           ? Math.trunc(res.contextWindowGuardTrimTargetPercent)
           : prev.contextWindowGuardTrimTargetPercent,
@@ -1972,16 +2020,125 @@ export default function Settings() {
               style={{ width: 16, height: 16, marginTop: 2, flexShrink: 0 }}
             />
           </label>
+          <div style={{ marginTop: 8, marginBottom: 4, fontSize: 13, fontWeight: 700, color: 'var(--color-text-primary)', display: 'flex', alignItems: 'center', gap: 6 }}>
+            <span style={{ fontSize: 16 }}>🧠</span> Codex 上下文压缩策略
+            <span style={{ fontSize: 11, fontWeight: 400, color: 'var(--color-text-muted)', marginLeft: 4 }}>保存后立即热加载，并持久化到 settings</span>
+          </div>
+          <label style={settingsModernToggleStyle}>
+            <div style={settingsModernToggleCopyStyle}>
+              <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text-secondary)' }}>普通 Responses 自动触发 compact</span>
+              <span style={{ fontSize: 12, lineHeight: 1.7, color: 'var(--color-text-muted)' }}>
+                当客户端 full input 估算、上一轮上游 prompt tokens 或预测 prompt tokens 超过软阈值时，允许代理侧主动尝试 compact；失败会按 TTL 冷却，不阻断主请求。
+              </span>
+            </div>
+            <input
+              type="checkbox"
+              checked={runtime.codexContextCompactionAutoEnabled}
+              onChange={(e) => setRuntime((prev) => ({ ...prev, codexContextCompactionAutoEnabled: e.target.checked }))}
+              style={{ width: 16, height: 16, marginTop: 2, flexShrink: 0 }}
+            />
+          </label>
+          <div style={settingsModernFieldCardStyle}>
+            <ResponsiveFormGrid columns={3}>
+              <div>
+                <div style={settingsModernFieldLabelStyle}>软触发阈值 tokens</div>
+                <input
+                  type="number"
+                  min={1000}
+                  step={1000}
+                  value={runtime.codexContextCompactionSoftTokens}
+                  onChange={(e) => {
+                    const v = Math.trunc(Number(e.target.value));
+                    if (Number.isFinite(v) && v >= 1000) {
+                      setRuntime((prev) => ({ ...prev, codexContextCompactionSoftTokens: v }));
+                    }
+                  }}
+                  style={inputStyle}
+                />
+                <div style={settingsModernFieldHintStyle}>本轮 input 估算、上一轮上游 prompt 或预测 prompt 达到该值后，自动 compact 才有资格触发。默认 50k。</div>
+              </div>
+              <div>
+                <div style={settingsModernFieldLabelStyle}>压缩目标 tokens</div>
+                <input
+                  type="number"
+                  min={1000}
+                  step={1000}
+                  value={runtime.codexContextCompactionTargetTokens}
+                  onChange={(e) => {
+                    const v = Math.trunc(Number(e.target.value));
+                    if (Number.isFinite(v) && v >= 1000) {
+                      setRuntime((prev) => ({ ...prev, codexContextCompactionTargetTokens: v }));
+                    }
+                  }}
+                  style={inputStyle}
+                />
+                <div style={{ ...settingsModernFieldHintStyle, color: runtime.codexContextCompactionTargetTokens >= runtime.codexContextCompactionSoftTokens ? 'var(--color-danger)' : 'var(--color-text-muted)' }}>
+                  必须小于软触发阈值；用于控制 compact 后期望的 sent input 规模。默认 30k。
+                </div>
+              </div>
+              <div>
+                <div style={settingsModernFieldLabelStyle}>冷却轮数</div>
+                <input
+                  type="number"
+                  min={0}
+                  step={1}
+                  value={runtime.codexContextCompactionCooldownTurns}
+                  onChange={(e) => {
+                    const v = Math.trunc(Number(e.target.value));
+                    if (Number.isFinite(v) && v >= 0) {
+                      setRuntime((prev) => ({ ...prev, codexContextCompactionCooldownTurns: v }));
+                    }
+                  }}
+                  style={inputStyle}
+                />
+                <div style={settingsModernFieldHintStyle}>同一会话 compact 成功或失败后，间隔多少轮再允许下一次自动尝试。</div>
+              </div>
+              <div>
+                <div style={settingsModernFieldLabelStyle}>不支持缓存 TTL（毫秒）</div>
+                <input
+                  type="number"
+                  min={1000}
+                  step={1000}
+                  value={runtime.codexContextCompactionUnsupportedTtlMs}
+                  onChange={(e) => {
+                    const v = Math.trunc(Number(e.target.value));
+                    if (Number.isFinite(v) && v >= 1000) {
+                      setRuntime((prev) => ({ ...prev, codexContextCompactionUnsupportedTtlMs: v }));
+                    }
+                  }}
+                  style={inputStyle}
+                />
+                <div style={settingsModernFieldHintStyle}>上游明确不支持 compact 后的冷却时间，避免每轮重复探测。</div>
+              </div>
+              <div>
+                <div style={settingsModernFieldLabelStyle}>每会话最大尝试次数</div>
+                <input
+                  type="number"
+                  min={0}
+                  step={1}
+                  value={runtime.codexContextCompactionMaxAttemptsPerSession}
+                  onChange={(e) => {
+                    const v = Math.trunc(Number(e.target.value));
+                    if (Number.isFinite(v) && v >= 0) {
+                      setRuntime((prev) => ({ ...prev, codexContextCompactionMaxAttemptsPerSession: v }));
+                    }
+                  }}
+                  style={inputStyle}
+                />
+                <div style={settingsModernFieldHintStyle}>设为 0 可禁止自动 compact 尝试，但仍保留显式 compact 和增量输入。</div>
+              </div>
+            </ResponsiveFormGrid>
+          </div>
           {/* ── Context Window Guard (4层上下文防护) ─────────────────── */}
           <div style={{ marginTop: 8, marginBottom: 4, fontSize: 13, fontWeight: 700, color: 'var(--color-text-primary)', display: 'flex', alignItems: 'center', gap: 6 }}>
             <span style={{ fontSize: 16 }}>🛡️</span> 上下文窗口防护
-            <span style={{ fontSize: 11, fontWeight: 400, color: 'var(--color-text-muted)', marginLeft: 4 }}>对标 Codex 原生 4 层 compaction 防护</span>
+            <span style={{ fontSize: 11, fontWeight: 400, color: 'var(--color-text-muted)', marginLeft: 4 }}>预算检查、续接重置和溢出恢复的硬防线</span>
           </div>
           <label style={settingsModernToggleStyle}>
             <div style={settingsModernToggleCopyStyle}>
               <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text-secondary)' }}>启用上下文窗口防护</span>
               <span style={{ fontSize: 12, lineHeight: 1.7, color: 'var(--color-text-muted)' }}>
-                4 层防护：① 请求前 token 预算检查 ② 上下文溢出时自动清除会话 ③ 自动截断过长输入 ④ 失败 response ID 不记录。对标 OpenAI Codex 原生 compaction 机制。
+                4 层防护：① 请求前 token 预算检查 ② 接近窗口时重置 previous_response_id ③ 上下文溢出时裁剪输入并恢复 ④ 失败 response ID 不记录。
               </span>
             </div>
             <input
@@ -1994,7 +2151,7 @@ export default function Settings() {
           <div style={{ ...settingsModernFieldCardStyle, opacity: runtime.contextWindowGuardEnabled ? 1 : 0.5, pointerEvents: runtime.contextWindowGuardEnabled ? 'auto' : 'none' }}>
             <ResponsiveFormGrid columns={3}>
               <div>
-                <div style={settingsModernFieldLabelStyle}>自动压缩阈值 (%)</div>
+                <div style={settingsModernFieldLabelStyle}>续接重置阈值 (%)</div>
                 <input
                   type="number"
                   min={50}
@@ -2011,26 +2168,6 @@ export default function Settings() {
                 />
                 <div style={settingsModernFieldHintStyle}>
                   当 token 用量占 context window 的百分比达到此值时，跳过 previous_response_id 注入，强制完整上下文发送。默认 80%。
-                </div>
-              </div>
-              <div>
-                <div style={settingsModernFieldLabelStyle}>硬截断阈值 (%)</div>
-                <input
-                  type="number"
-                  min={60}
-                  max={99}
-                  step={1}
-                  value={runtime.contextWindowGuardHardTrimPercent}
-                  onChange={(e) => {
-                    const v = Math.trunc(Number(e.target.value));
-                    if (Number.isFinite(v) && v >= 60 && v <= 99) {
-                      setRuntime((prev) => ({ ...prev, contextWindowGuardHardTrimPercent: v }));
-                    }
-                  }}
-                  style={inputStyle}
-                />
-                <div style={settingsModernFieldHintStyle}>
-                  达到此百分比时不仅跳过 previous_response_id，还会主动截断 input 数组以避免请求失败。默认 95%。
                 </div>
               </div>
               <div>

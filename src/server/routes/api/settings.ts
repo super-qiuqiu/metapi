@@ -65,9 +65,14 @@ interface RuntimeSettingsBody {
   responsesCompactFallbackToResponsesEnabled?: boolean;
   responsesRequireContinuitySession?: boolean;
   responsesStrictPreviousResponseRecovery?: boolean;
+  codexContextCompactionAutoEnabled?: boolean;
+  codexContextCompactionSoftTokens?: number;
+  codexContextCompactionTargetTokens?: number;
+  codexContextCompactionCooldownTurns?: number;
+  codexContextCompactionUnsupportedTtlMs?: number;
+  codexContextCompactionMaxAttemptsPerSession?: number;
   contextWindowGuardEnabled?: boolean;
   contextWindowGuardAutoCompactPercent?: number;
-  contextWindowGuardHardTrimPercent?: number;
   contextWindowGuardTrimTargetPercent?: number;
   disableCrossProtocolFallback?: boolean;
   proxySessionChannelConcurrencyLimit?: number;
@@ -491,12 +496,6 @@ function applyImportedSettingToRuntime(key: string, value: unknown) {
       config.contextWindowGuardAutoCompactPercent = Math.trunc(v);
       return;
     }
-    case 'context_window_guard_hard_trim_percent': {
-      const v = Number(value);
-      if (!Number.isFinite(v) || v < 60 || v > 99) return;
-      config.contextWindowGuardHardTrimPercent = Math.trunc(v);
-      return;
-    }
     case 'context_window_guard_trim_target_percent': {
       const v = Number(value);
       if (!Number.isFinite(v) || v < 40 || v > 90) return;
@@ -890,9 +889,14 @@ function getRuntimeSettingsResponse(currentAdminIp = '') {
     responsesCompactFallbackToResponsesEnabled: config.responsesCompactFallbackToResponsesEnabled,
     responsesRequireContinuitySession: config.responsesRequireContinuitySession,
     responsesStrictPreviousResponseRecovery: config.responsesStrictPreviousResponseRecovery,
+    codexContextCompactionAutoEnabled: config.codexContextCompactionAutoEnabled,
+    codexContextCompactionSoftTokens: config.codexContextCompactionSoftTokens,
+    codexContextCompactionTargetTokens: config.codexContextCompactionTargetTokens,
+    codexContextCompactionCooldownTurns: config.codexContextCompactionCooldownTurns,
+    codexContextCompactionUnsupportedTtlMs: config.codexContextCompactionUnsupportedTtlMs,
+    codexContextCompactionMaxAttemptsPerSession: config.codexContextCompactionMaxAttemptsPerSession,
     contextWindowGuardEnabled: config.contextWindowGuardEnabled,
     contextWindowGuardAutoCompactPercent: config.contextWindowGuardAutoCompactPercent,
-    contextWindowGuardHardTrimPercent: config.contextWindowGuardHardTrimPercent,
     contextWindowGuardTrimTargetPercent: config.contextWindowGuardTrimTargetPercent,
     disableCrossProtocolFallback: config.disableCrossProtocolFallback,
     proxySessionChannelConcurrencyLimit: config.proxySessionChannelConcurrencyLimit,
@@ -1467,6 +1471,77 @@ export async function settingsRoutes(app: FastifyInstance) {
       upsertSetting('responses_strict_previous_response_recovery', config.responsesStrictPreviousResponseRecovery);
     }
 
+    if (body.codexContextCompactionAutoEnabled !== undefined) {
+      let nextValue = false;
+      try {
+        nextValue = parseBooleanFlag(body.codexContextCompactionAutoEnabled, 'Codex 自动压缩开关');
+      } catch (err: any) {
+        return reply.code(400).send({ success: false, message: err?.message || 'Codex 自动压缩开关格式无效' });
+      }
+      if (nextValue !== config.codexContextCompactionAutoEnabled) {
+        changedLabels.push(nextValue ? '开启 Codex 自动压缩' : '关闭 Codex 自动压缩');
+      }
+      config.codexContextCompactionAutoEnabled = nextValue;
+      upsertSetting('codex_context_compaction_auto_enabled', nextValue);
+    }
+
+    const nextSoftTokens = body.codexContextCompactionSoftTokens !== undefined
+      ? Math.trunc(Number(body.codexContextCompactionSoftTokens))
+      : config.codexContextCompactionSoftTokens;
+    const nextTargetTokens = body.codexContextCompactionTargetTokens !== undefined
+      ? Math.trunc(Number(body.codexContextCompactionTargetTokens))
+      : config.codexContextCompactionTargetTokens;
+
+    if (!Number.isFinite(nextSoftTokens) || nextSoftTokens < 1_000) {
+      return reply.code(400).send({ success: false, message: 'Codex 软压缩阈值必须不小于 1000 tokens' });
+    }
+    if (!Number.isFinite(nextTargetTokens) || nextTargetTokens < 1_000) {
+      return reply.code(400).send({ success: false, message: 'Codex 压缩目标必须不小于 1000 tokens' });
+    }
+    if (nextTargetTokens >= nextSoftTokens) {
+      return reply.code(400).send({ success: false, message: 'Codex 压缩目标必须小于软压缩阈值' });
+    }
+    if (body.codexContextCompactionSoftTokens !== undefined) {
+      if (nextSoftTokens !== config.codexContextCompactionSoftTokens) changedLabels.push(`Codex 软压缩阈值 → ${nextSoftTokens}`);
+      config.codexContextCompactionSoftTokens = nextSoftTokens;
+      upsertSetting('codex_context_compaction_soft_tokens', nextSoftTokens);
+    }
+    if (body.codexContextCompactionTargetTokens !== undefined) {
+      if (nextTargetTokens !== config.codexContextCompactionTargetTokens) changedLabels.push(`Codex 压缩目标 → ${nextTargetTokens}`);
+      config.codexContextCompactionTargetTokens = nextTargetTokens;
+      upsertSetting('codex_context_compaction_target_tokens', nextTargetTokens);
+    }
+
+    if (body.codexContextCompactionCooldownTurns !== undefined) {
+      const v = Math.trunc(Number(body.codexContextCompactionCooldownTurns));
+      if (!Number.isFinite(v) || v < 0) {
+        return reply.code(400).send({ success: false, message: 'Codex 压缩冷却轮数必须不小于 0' });
+      }
+      if (v !== config.codexContextCompactionCooldownTurns) changedLabels.push(`Codex 压缩冷却轮数 → ${v}`);
+      config.codexContextCompactionCooldownTurns = v;
+      upsertSetting('codex_context_compaction_cooldown_turns', v);
+    }
+
+    if (body.codexContextCompactionUnsupportedTtlMs !== undefined) {
+      const v = Math.trunc(Number(body.codexContextCompactionUnsupportedTtlMs));
+      if (!Number.isFinite(v) || v < 1_000) {
+        return reply.code(400).send({ success: false, message: 'Codex compact 不支持缓存 TTL 必须不小于 1000ms' });
+      }
+      if (v !== config.codexContextCompactionUnsupportedTtlMs) changedLabels.push(`Codex compact 不支持 TTL → ${v}ms`);
+      config.codexContextCompactionUnsupportedTtlMs = v;
+      upsertSetting('codex_context_compaction_unsupported_ttl_ms', v);
+    }
+
+    if (body.codexContextCompactionMaxAttemptsPerSession !== undefined) {
+      const v = Math.trunc(Number(body.codexContextCompactionMaxAttemptsPerSession));
+      if (!Number.isFinite(v) || v < 0) {
+        return reply.code(400).send({ success: false, message: 'Codex 每会话压缩尝试次数必须不小于 0' });
+      }
+      if (v !== config.codexContextCompactionMaxAttemptsPerSession) changedLabels.push(`Codex 每会话压缩尝试次数 → ${v}`);
+      config.codexContextCompactionMaxAttemptsPerSession = v;
+      upsertSetting('codex_context_compaction_max_attempts_per_session', v);
+    }
+
     // ── Context Window Guard settings ────────────────────────────────
     if (body.contextWindowGuardEnabled !== undefined) {
       let nextValue = true;
@@ -1495,18 +1570,6 @@ export async function settingsRoutes(app: FastifyInstance) {
       }
       config.contextWindowGuardAutoCompactPercent = v;
       upsertSetting('context_window_guard_auto_compact_percent', v);
-    }
-
-    if (body.contextWindowGuardHardTrimPercent !== undefined) {
-      const v = Math.trunc(Number(body.contextWindowGuardHardTrimPercent));
-      if (!Number.isFinite(v) || v < 60 || v > 99) {
-        return reply.code(400).send({ success: false, message: '硬截断阈值必须在 60~99 之间' });
-      }
-      if (v !== config.contextWindowGuardHardTrimPercent) {
-        changedLabels.push(`硬截断阈值 → ${v}%`);
-      }
-      config.contextWindowGuardHardTrimPercent = v;
-      upsertSetting('context_window_guard_hard_trim_percent', v);
     }
 
     if (body.contextWindowGuardTrimTargetPercent !== undefined) {

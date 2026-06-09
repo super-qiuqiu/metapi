@@ -15,6 +15,15 @@ describe('applyRuntimeSettings', () => {
     config.responsesCompactFallbackToResponsesEnabled = false;
     config.responsesRequireContinuitySession = false;
     config.responsesStrictPreviousResponseRecovery = false;
+    config.codexContextCompactionAutoEnabled = false;
+    config.codexContextCompactionSoftTokens = 50000;
+    config.codexContextCompactionTargetTokens = 30000;
+    config.codexContextCompactionCooldownTurns = 3;
+    config.codexContextCompactionUnsupportedTtlMs = 600000;
+    config.codexContextCompactionMaxAttemptsPerSession = 8;
+    config.contextWindowGuardEnabled = true;
+    config.contextWindowGuardAutoCompactPercent = 80;
+    config.contextWindowGuardTrimTargetPercent = 75;
     config.webhookEnabled = true;
     config.barkEnabled = true;
     config.serverChanEnabled = true;
@@ -29,6 +38,15 @@ describe('applyRuntimeSettings', () => {
       ['responses_compact_fallback_to_responses_enabled', JSON.stringify(true)],
       ['responses_require_continuity_session', JSON.stringify(true)],
       ['responses_strict_previous_response_recovery', JSON.stringify(true)],
+      ['codex_context_compaction_auto_enabled', JSON.stringify(true)],
+      ['codex_context_compaction_soft_tokens', JSON.stringify(64000)],
+      ['codex_context_compaction_target_tokens', JSON.stringify(28000)],
+      ['codex_context_compaction_cooldown_turns', JSON.stringify(5)],
+      ['codex_context_compaction_unsupported_ttl_ms', JSON.stringify(900000)],
+      ['codex_context_compaction_max_attempts_per_session', JSON.stringify(12)],
+      ['context_window_guard_enabled', JSON.stringify(false)],
+      ['context_window_guard_auto_compact_percent', JSON.stringify(70)],
+      ['context_window_guard_trim_target_percent', JSON.stringify(55)],
       ['webhook_enabled', JSON.stringify(false)],
       ['bark_enabled', JSON.stringify(false)],
       ['serverchan_enabled', JSON.stringify(false)],
@@ -43,6 +61,15 @@ describe('applyRuntimeSettings', () => {
     expect(config.responsesCompactFallbackToResponsesEnabled).toBe(true);
     expect(config.responsesRequireContinuitySession).toBe(true);
     expect(config.responsesStrictPreviousResponseRecovery).toBe(true);
+    expect(config.codexContextCompactionAutoEnabled).toBe(true);
+    expect(config.codexContextCompactionSoftTokens).toBe(64000);
+    expect(config.codexContextCompactionTargetTokens).toBe(28000);
+    expect(config.codexContextCompactionCooldownTurns).toBe(5);
+    expect(config.codexContextCompactionUnsupportedTtlMs).toBe(900000);
+    expect(config.codexContextCompactionMaxAttemptsPerSession).toBe(12);
+    expect(config.contextWindowGuardEnabled).toBe(false);
+    expect(config.contextWindowGuardAutoCompactPercent).toBe(70);
+    expect(config.contextWindowGuardTrimTargetPercent).toBe(55);
     expect(config.webhookEnabled).toBe(false);
     expect(config.barkEnabled).toBe(false);
     expect(config.serverChanEnabled).toBe(false);

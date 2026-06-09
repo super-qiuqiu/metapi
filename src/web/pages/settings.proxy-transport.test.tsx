@@ -57,6 +57,12 @@ describe('Settings proxy transport', () => {
       logCleanupRetentionDays: 14,
       codexUpstreamWebsocketEnabled: false,
       responsesCompactFallbackToResponsesEnabled: false,
+      codexContextCompactionAutoEnabled: false,
+      codexContextCompactionSoftTokens: 50000,
+      codexContextCompactionTargetTokens: 30000,
+      codexContextCompactionCooldownTurns: 3,
+      codexContextCompactionUnsupportedTtlMs: 600000,
+      codexContextCompactionMaxAttemptsPerSession: 8,
       proxySessionChannelConcurrencyLimit: 4,
       proxySessionChannelQueueWaitMs: 3200,
       routingFallbackUnitCost: 1,
@@ -76,6 +82,12 @@ describe('Settings proxy transport', () => {
       success: true,
       codexUpstreamWebsocketEnabled: true,
       responsesCompactFallbackToResponsesEnabled: true,
+      codexContextCompactionAutoEnabled: true,
+      codexContextCompactionSoftTokens: 64000,
+      codexContextCompactionTargetTokens: 28000,
+      codexContextCompactionCooldownTurns: 5,
+      codexContextCompactionUnsupportedTtlMs: 900000,
+      codexContextCompactionMaxAttemptsPerSession: 12,
       proxySessionChannelConcurrencyLimit: 6,
       proxySessionChannelQueueWaitMs: 4200,
     });
@@ -121,6 +133,24 @@ describe('Settings proxy transport', () => {
       const compactFallbackToggle = compactFallbackToggleLabel.findByType('input');
       expect(compactFallbackToggle.props.checked).toBe(false);
 
+      const autoCompactToggleLabel = root.root.find((node) => (
+        node.type === 'label'
+        && collectText(node).includes('普通 Responses 自动触发 compact')
+      ));
+      const autoCompactToggle = autoCompactToggleLabel.findByType('input');
+      expect(autoCompactToggle.props.checked).toBe(false);
+
+      const softTokensInput = root.root.find((node) => (
+        node.type === 'input'
+        && node.props.type === 'number'
+        && node.props.value === 50000
+      ));
+      const targetTokensInput = root.root.find((node) => (
+        node.type === 'input'
+        && node.props.type === 'number'
+        && node.props.value === 30000
+      ));
+
       const concurrencyInput = root.root.find((node) => (
         node.type === 'input'
         && node.props.type === 'number'
@@ -135,6 +165,9 @@ describe('Settings proxy transport', () => {
       await act(async () => {
         websocketToggle.props.onChange({ target: { checked: true } });
         compactFallbackToggle.props.onChange({ target: { checked: true } });
+        autoCompactToggle.props.onChange({ target: { checked: true } });
+        softTokensInput.props.onChange({ target: { value: '64000' } });
+        targetTokensInput.props.onChange({ target: { value: '28000' } });
         concurrencyInput.props.onChange({ target: { value: '6' } });
         queueWaitInput.props.onChange({ target: { value: '4200' } });
       });
@@ -152,12 +185,18 @@ describe('Settings proxy transport', () => {
       });
       await flushMicrotasks();
 
-      expect(apiMock.updateRuntimeSettings).toHaveBeenCalledWith({
+      expect(apiMock.updateRuntimeSettings).toHaveBeenCalledWith(expect.objectContaining({
         codexUpstreamWebsocketEnabled: true,
         responsesCompactFallbackToResponsesEnabled: true,
+        codexContextCompactionAutoEnabled: true,
+        codexContextCompactionSoftTokens: 64000,
+        codexContextCompactionTargetTokens: 28000,
+        codexContextCompactionCooldownTurns: 3,
+        codexContextCompactionUnsupportedTtlMs: 600000,
+        codexContextCompactionMaxAttemptsPerSession: 8,
         proxySessionChannelConcurrencyLimit: 6,
         proxySessionChannelQueueWaitMs: 4200,
-      });
+      }));
     } finally {
       root?.unmount();
     }

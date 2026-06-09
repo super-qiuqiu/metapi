@@ -404,9 +404,14 @@ export type RuntimeSettingsPayload = {
   responsesCompactFallbackToResponsesEnabled?: boolean;
   responsesRequireContinuitySession?: boolean;
   responsesStrictPreviousResponseRecovery?: boolean;
+  codexContextCompactionAutoEnabled?: boolean;
+  codexContextCompactionSoftTokens?: number;
+  codexContextCompactionTargetTokens?: number;
+  codexContextCompactionCooldownTurns?: number;
+  codexContextCompactionUnsupportedTtlMs?: number;
+  codexContextCompactionMaxAttemptsPerSession?: number;
   contextWindowGuardEnabled?: boolean;
   contextWindowGuardAutoCompactPercent?: number;
-  contextWindowGuardHardTrimPercent?: number;
   contextWindowGuardTrimTargetPercent?: number;
   disableCrossProtocolFallback?: boolean;
   proxySessionChannelConcurrencyLimit?: number;

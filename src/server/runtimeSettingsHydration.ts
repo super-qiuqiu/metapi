@@ -74,6 +74,51 @@ export function applyRuntimeSettings(settingsMap: Map<string, string>) {
     config.responsesStrictPreviousResponseRecovery = responsesStrictPreviousResponseRecovery;
   }
 
+  const codexContextCompactionAutoEnabled = parseSettingFromMap<boolean>(settingsMap, 'codex_context_compaction_auto_enabled');
+  if (typeof codexContextCompactionAutoEnabled === 'boolean') {
+    config.codexContextCompactionAutoEnabled = codexContextCompactionAutoEnabled;
+  }
+
+  const codexContextCompactionSoftTokens = parseSettingFromMap<number>(settingsMap, 'codex_context_compaction_soft_tokens');
+  if (typeof codexContextCompactionSoftTokens === 'number' && Number.isFinite(codexContextCompactionSoftTokens)) {
+    config.codexContextCompactionSoftTokens = Math.max(1_000, Math.trunc(codexContextCompactionSoftTokens));
+  }
+
+  const codexContextCompactionTargetTokens = parseSettingFromMap<number>(settingsMap, 'codex_context_compaction_target_tokens');
+  if (typeof codexContextCompactionTargetTokens === 'number' && Number.isFinite(codexContextCompactionTargetTokens)) {
+    config.codexContextCompactionTargetTokens = Math.max(1_000, Math.trunc(codexContextCompactionTargetTokens));
+  }
+
+  const codexContextCompactionCooldownTurns = parseSettingFromMap<number>(settingsMap, 'codex_context_compaction_cooldown_turns');
+  if (typeof codexContextCompactionCooldownTurns === 'number' && Number.isFinite(codexContextCompactionCooldownTurns)) {
+    config.codexContextCompactionCooldownTurns = Math.max(0, Math.trunc(codexContextCompactionCooldownTurns));
+  }
+
+  const codexContextCompactionUnsupportedTtlMs = parseSettingFromMap<number>(settingsMap, 'codex_context_compaction_unsupported_ttl_ms');
+  if (typeof codexContextCompactionUnsupportedTtlMs === 'number' && Number.isFinite(codexContextCompactionUnsupportedTtlMs)) {
+    config.codexContextCompactionUnsupportedTtlMs = Math.max(1_000, Math.trunc(codexContextCompactionUnsupportedTtlMs));
+  }
+
+  const codexContextCompactionMaxAttemptsPerSession = parseSettingFromMap<number>(settingsMap, 'codex_context_compaction_max_attempts_per_session');
+  if (typeof codexContextCompactionMaxAttemptsPerSession === 'number' && Number.isFinite(codexContextCompactionMaxAttemptsPerSession)) {
+    config.codexContextCompactionMaxAttemptsPerSession = Math.max(0, Math.trunc(codexContextCompactionMaxAttemptsPerSession));
+  }
+
+  const contextWindowGuardEnabled = parseSettingFromMap<boolean>(settingsMap, 'context_window_guard_enabled');
+  if (typeof contextWindowGuardEnabled === 'boolean') {
+    config.contextWindowGuardEnabled = contextWindowGuardEnabled;
+  }
+
+  const contextWindowGuardAutoCompactPercent = parseSettingFromMap<number>(settingsMap, 'context_window_guard_auto_compact_percent');
+  if (typeof contextWindowGuardAutoCompactPercent === 'number' && Number.isFinite(contextWindowGuardAutoCompactPercent)) {
+    config.contextWindowGuardAutoCompactPercent = Math.max(50, Math.min(99, Math.trunc(contextWindowGuardAutoCompactPercent)));
+  }
+
+  const contextWindowGuardTrimTargetPercent = parseSettingFromMap<number>(settingsMap, 'context_window_guard_trim_target_percent');
+  if (typeof contextWindowGuardTrimTargetPercent === 'number' && Number.isFinite(contextWindowGuardTrimTargetPercent)) {
+    config.contextWindowGuardTrimTargetPercent = Math.max(40, Math.min(90, Math.trunc(contextWindowGuardTrimTargetPercent)));
+  }
+
   const disableCrossProtocolFallback = parseSettingFromMap<boolean>(settingsMap, 'disable_cross_protocol_fallback');
   if (typeof disableCrossProtocolFallback === 'boolean') {
     config.disableCrossProtocolFallback = disableCrossProtocolFallback;
