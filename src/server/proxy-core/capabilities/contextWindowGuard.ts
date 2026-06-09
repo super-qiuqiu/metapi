@@ -57,27 +57,126 @@ export function getModelContextWindow(model: string): number {
 // Auto-compact threshold configuration
 // ---------------------------------------------------------------------------
 
-/** Percentage of context window at which auto-compact should trigger. */
-const AUTO_COMPACT_TRIGGER_PERCENT = () => config.contextWindowGuardAutoCompactPercent;
-
-/** Percentage of context window at which hard trim should trigger. */
-const HARD_TRIM_TRIGGER_PERCENT = () => config.contextWindowGuardHardTrimPercent;
+/** Percentage of context window at which continuation should be reset. */
+const CONTINUATION_RESET_TRIGGER_PERCENT = () => config.contextWindowGuardAutoCompactPercent;
 
 /** Target percentage of context window after trimming. */
 const TRIM_TARGET_PERCENT = () => config.contextWindowGuardTrimTargetPercent;
 
-/**
- * Returns true when the current token usage exceeds the auto-compact
- * trigger threshold for the given model.
- */
-export function shouldTriggerAutoCompact(
-  promptTokens: number,
-  model: string,
-): boolean {
-  if (promptTokens <= 0) return false;
-  const contextWindow = getModelContextWindow(model);
-  const threshold = Math.trunc(contextWindow * AUTO_COMPACT_TRIGGER_PERCENT() / 100);
-  return promptTokens >= threshold;
+export type ContextBudgetSessionUsage = {
+  promptTokens: number;
+  prevPromptTokens: number;
+  growthRate: number;
+  predictedNextPromptTokens: number;
+  lastSucceeded: boolean;
+};
+
+export type ContextBudgetDecision = {
+  contextWindow: number;
+  trimTargetTokens: number;
+  resetContinuationTokens: number;
+  inputTokensEstimate: number;
+  predictedPromptTokens: number;
+  sessionPromptTokens: number;
+  effectiveTokens: number;
+  shouldTrim: boolean;
+  shouldTrimPredictive: boolean;
+  shouldTrimInput: boolean;
+  shouldResetContinuation: boolean;
+  resetContinuationReason: string | null;
+  trimReason: string | null;
+};
+
+export function estimateResponsesInputTokens(value: unknown): number | null {
+  if (value == null) return null;
+  if (Array.isArray(value) && value.length === 0) return 0;
+  try {
+    const serialized = typeof value === 'string' ? value : JSON.stringify(value);
+    if (!serialized) return 0;
+    return Math.max(1, Math.ceil(serialized.length / 3));
+  } catch {
+    return null;
+  }
+}
+
+export function evaluateContextBudget(input: {
+  model: string;
+  inputTokensEstimate?: number | null;
+  sessionUsage?: ContextBudgetSessionUsage | null;
+}): ContextBudgetDecision {
+  const contextWindow = getModelContextWindow(input.model);
+  const trimTargetTokens = Math.trunc(contextWindow * TRIM_TARGET_PERCENT() / 100);
+  const resetContinuationTokens = Math.trunc(contextWindow * CONTINUATION_RESET_TRIGGER_PERCENT() / 100);
+  const inputTokensEstimate = Math.max(0, Math.trunc(input.inputTokensEstimate ?? 0));
+  const sessionPromptTokens = input.sessionUsage?.lastSucceeded
+    ? Math.max(0, Math.trunc(input.sessionUsage.promptTokens))
+    : 0;
+  const predictedPromptTokens = input.sessionUsage?.lastSucceeded
+    ? Math.max(0, Math.trunc(input.sessionUsage.predictedNextPromptTokens))
+    : 0;
+  const effectiveTokens = Math.max(predictedPromptTokens, inputTokensEstimate);
+  const shouldTrimPredictive = predictedPromptTokens >= trimTargetTokens;
+  const shouldTrimInput = inputTokensEstimate >= trimTargetTokens;
+  const shouldTrim = shouldTrimPredictive || shouldTrimInput;
+  const shouldResetContinuation = !shouldTrim && sessionPromptTokens >= resetContinuationTokens;
+
+  return {
+    contextWindow,
+    trimTargetTokens,
+    resetContinuationTokens,
+    inputTokensEstimate,
+    predictedPromptTokens,
+    sessionPromptTokens,
+    effectiveTokens,
+    shouldTrim,
+    shouldTrimPredictive,
+    shouldTrimInput,
+    shouldResetContinuation,
+    resetContinuationReason: shouldResetContinuation
+      ? `session at ${sessionPromptTokens} tokens >= ${CONTINUATION_RESET_TRIGGER_PERCENT()}% of ${contextWindow}`
+      : null,
+    trimReason: shouldTrimPredictive
+      ? `predicted ${predictedPromptTokens} tokens >= ${trimTargetTokens} trim target`
+      : shouldTrimInput
+        ? `input estimated at ${inputTokensEstimate} tokens >= ${trimTargetTokens} trim target`
+        : null,
+  };
+}
+
+export function shouldAttemptSoftContextCompact(input: {
+  clientInputTokensEstimate: number | null;
+  sessionUsage?: ContextBudgetSessionUsage | null;
+  softTokens: number;
+}): { shouldAttempt: boolean; reason: string | null } {
+  const softTokens = Math.max(0, Math.trunc(input.softTokens));
+  const clientInputTokensEstimate = typeof input.clientInputTokensEstimate === 'number'
+    ? Math.max(0, Math.trunc(input.clientInputTokensEstimate))
+    : 0;
+  if (clientInputTokensEstimate >= softTokens) {
+    return {
+      shouldAttempt: true,
+      reason: `client full input estimate ${clientInputTokensEstimate} >= soft threshold ${softTokens}`,
+    };
+  }
+  const sessionPromptTokens = input.sessionUsage?.lastSucceeded
+    ? Math.max(0, Math.trunc(input.sessionUsage.promptTokens))
+    : 0;
+  if (sessionPromptTokens >= softTokens) {
+    return {
+      shouldAttempt: true,
+      reason: `upstream prompt tokens ${sessionPromptTokens} >= soft threshold ${softTokens}`,
+    };
+  }
+  const predictedPromptTokens = input.sessionUsage?.lastSucceeded
+    ? Math.max(0, Math.trunc(input.sessionUsage.predictedNextPromptTokens))
+    : 0;
+  if (predictedPromptTokens >= softTokens) {
+    return {
+      shouldAttempt: true,
+      reason: `predicted prompt tokens ${predictedPromptTokens} >= soft threshold ${softTokens}`,
+    };
+  }
+  return { shouldAttempt: false, reason: null };
 }
 
 // ---------------------------------------------------------------------------
@@ -169,42 +268,6 @@ function isSystemLikeItem(item: unknown): boolean {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
-}
-
-// ---------------------------------------------------------------------------
-// Layer 1 — Pre-request context check
-// ---------------------------------------------------------------------------
-
-/**
- * Evaluates whether an outgoing request is likely to exceed the model's
- * context window based on accumulated session token usage.
- *
- * When the threshold is crossed, returns a trimming plan; otherwise null.
- */
-export function evaluatePreRequestContextBudget(input: {
-  promptTokens: number;
-  model: string;
-  sessionId: string | null;
-}): {
-  shouldCompact: boolean;
-  shouldTrim: boolean;
-  currentTokens: number;
-  contextWindow: number;
-  triggerThreshold: number;
-} {
-  const contextWindow = getModelContextWindow(input.model);
-  const triggerThreshold = Math.trunc(contextWindow * AUTO_COMPACT_TRIGGER_PERCENT() / 100);
-  const shouldCompact = input.promptTokens >= triggerThreshold;
-  // Hard trim when at configured percentage — we must avoid sending a request that will definitely fail
-  const shouldTrim = input.promptTokens >= Math.trunc(contextWindow * HARD_TRIM_TRIGGER_PERCENT() / 100);
-
-  return {
-    shouldCompact,
-    shouldTrim,
-    currentTokens: input.promptTokens,
-    contextWindow,
-    triggerThreshold,
-  };
 }
 
 // ---------------------------------------------------------------------------

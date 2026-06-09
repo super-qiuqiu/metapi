@@ -631,6 +631,22 @@ function materializeResponse(
   };
 }
 
+export function materializeResponsesStreamPayload(input: {
+  state: OpenAiResponsesAggregateState;
+  streamContext: StreamTransformContext;
+  usage: ResponsesUsageSummary;
+  responseTemplate?: Record<string, unknown> | null;
+  status?: 'completed' | 'failed' | 'incomplete';
+}): Record<string, unknown> {
+  return materializeResponse(
+    input.state,
+    input.streamContext,
+    input.usage,
+    input.responseTemplate,
+    input.status,
+  );
+}
+
 function serializeOriginalResponsesEvent(eventType: string, payload: Record<string, unknown>): string[] {
   return [serializeSse(eventType, payload)];
 }

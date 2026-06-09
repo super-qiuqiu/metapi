@@ -102,6 +102,20 @@ type SurfaceResolvedUsageSummary = {
   usageSource: 'upstream' | 'self-log' | 'unknown';
 };
 
+export type CodexContextTelemetry = {
+  clientFullInputTokensEstimate: number | null;
+  upstreamSentInputTokensEstimate: number | null;
+  upstreamPromptTokens: number | null;
+  contextStrategy: 'full' | 'incremental' | 'compact' | 'trim' | 'fallback_no_previous_response';
+  compactTriggered: boolean;
+  compactReason?: string | null;
+  fallbackReason?: string | null;
+  savedInputTokensEstimate?: number | null;
+  previousResponseIdUsed?: boolean | null;
+  compactAttempted?: boolean | null;
+  compactSucceeded?: boolean | null;
+};
+
 const SURFACE_OAUTH_PRE_REFRESH_THRESHOLD_MS = 5 * 60 * 1000;
 
 export async function selectSurfaceChannelForAttempt(input: {
@@ -237,6 +251,7 @@ export async function writeSurfaceProxyLog(input: {
   billingDetails?: unknown;
   upstreamPath?: string | null;
   usageSource?: 'upstream' | 'self-log' | 'unknown' | null;
+  contextTelemetry?: CodexContextTelemetry | null;
   downstreamTransport?: string | null;
   upstreamTransport?: string | null;
   clientContext?: DownstreamClientContext | null;
@@ -272,6 +287,7 @@ export async function writeSurfaceProxyLog(input: {
       totalTokens: input.totalTokens ?? null,
       estimatedCost: input.estimatedCost ?? 0,
       billingDetails: input.billingDetails ?? null,
+      contextTelemetry: input.contextTelemetry ?? null,
       clientFamily: input.clientContext?.clientKind || null,
       clientAppId: input.clientContext?.clientAppId || null,
       clientAppName: input.clientContext?.clientAppName || null,
@@ -375,6 +391,7 @@ export async function recordSurfaceSuccess(input: {
   latencyMs: number;
   retryCount: number;
   upstreamPath?: string | null;
+  contextTelemetry?: CodexContextTelemetry | null;
   logSuccess: (args: {
     selected: SurfaceSelectedChannel;
     modelRequested: string;
@@ -392,6 +409,7 @@ export async function recordSurfaceSuccess(input: {
     estimatedCost?: number;
     billingDetails?: unknown;
     upstreamPath?: string | null;
+    contextTelemetry?: CodexContextTelemetry | null;
   }) => Promise<void>;
   recordDownstreamCost?: (estimatedCost: number) => void;
   bestEffortMetrics?: {
@@ -495,6 +513,7 @@ export async function recordSurfaceSuccess(input: {
     estimatedCost,
     billingDetails,
     upstreamPath: input.upstreamPath,
+    contextTelemetry: input.contextTelemetry ?? null,
   });
 
   if (input.upstreamHeaders) {
@@ -539,6 +558,7 @@ export function createSurfaceFailureToolkit(input: {
     estimatedCost?: number;
     billingDetails?: unknown;
     upstreamPath?: string | null;
+    contextTelemetry?: CodexContextTelemetry | null;
   }) => {
     await writeSurfaceProxyLog({
       warningScope: input.warningScope,
@@ -561,6 +581,7 @@ export function createSurfaceFailureToolkit(input: {
       estimatedCost: args.estimatedCost,
       billingDetails: args.billingDetails,
       upstreamPath: args.upstreamPath,
+      contextTelemetry: args.contextTelemetry ?? null,
       clientContext: input.clientContext,
       downstreamApiKeyId: input.downstreamApiKeyId,
     });
@@ -596,6 +617,7 @@ export function createSurfaceFailureToolkit(input: {
       firstByteLatencyMs?: number | null;
       latencyMs: number;
       retryCount: number;
+      contextTelemetry?: CodexContextTelemetry | null;
     }): Promise<SurfaceFailureOutcome> {
       const rawErrText = args.rawErrText || args.errText;
       await tokenRouter.recordFailure(args.selected.channel.id, {
@@ -613,6 +635,7 @@ export function createSurfaceFailureToolkit(input: {
         latencyMs: args.latencyMs,
         errorMessage: args.errText,
         retryCount: args.retryCount,
+        contextTelemetry: args.contextTelemetry ?? null,
       });
       runBestEffort('record oauth quota reset hint', () => recordOauthQuotaResetHint({
         accountId: args.selected.account.id,
@@ -664,6 +687,7 @@ export function createSurfaceFailureToolkit(input: {
       completionTokens?: number | null;
       totalTokens?: number | null;
       upstreamPath?: string | null;
+      contextTelemetry?: CodexContextTelemetry | null;
     }): Promise<SurfaceFailureOutcome> {
       await tokenRouter.recordFailure(args.selected.channel.id, {
         status: args.failure.status,
@@ -684,6 +708,7 @@ export function createSurfaceFailureToolkit(input: {
         completionTokens: args.completionTokens,
         totalTokens: args.totalTokens,
         upstreamPath: args.upstreamPath,
+        contextTelemetry: args.contextTelemetry ?? null,
       });
 
       if (shouldRetryProxyRequest(args.failure.status, args.failure.reason)) {
@@ -717,6 +742,7 @@ export function createSurfaceFailureToolkit(input: {
       firstByteLatencyMs?: number | null;
       latencyMs: number;
       retryCount: number;
+      contextTelemetry?: CodexContextTelemetry | null;
     }): Promise<SurfaceFailureOutcome> {
       await tokenRouter.recordFailure(args.selected.channel.id, {
         errorText: args.errorMessage,
@@ -732,6 +758,7 @@ export function createSurfaceFailureToolkit(input: {
         latencyMs: args.latencyMs,
         errorMessage: args.errorMessage,
         retryCount: args.retryCount,
+        contextTelemetry: args.contextTelemetry ?? null,
       });
 
       const retry = maybeRetry(args.retryCount);
@@ -769,6 +796,7 @@ export function createSurfaceFailureToolkit(input: {
       upstreamPath?: string | null;
       httpStatus?: number;
       runtimeFailureStatus?: number | null;
+      contextTelemetry?: CodexContextTelemetry | null;
     }) {
       const errorMessage = args.errorMessage || 'stream processing failed';
       if (typeof args.runtimeFailureStatus === 'number') {
@@ -797,6 +825,7 @@ export function createSurfaceFailureToolkit(input: {
         completionTokens: args.completionTokens,
         totalTokens: args.totalTokens,
         upstreamPath: args.upstreamPath,
+        contextTelemetry: args.contextTelemetry ?? null,
       });
     },
   };

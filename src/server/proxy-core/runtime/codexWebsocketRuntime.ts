@@ -11,9 +11,9 @@ import {
 import {
   isContextWindowExceededError,
   clearSessionTokenUsage,
-  evaluatePreRequestContextBudget,
+  evaluateContextBudget,
+  estimateResponsesInputTokens,
   getSessionTokenUsage,
-  getModelContextWindow,
   recordSessionTokenUsage,
   trimResponsesInputToTokenBudget,
 } from '../capabilities/contextWindowGuard.js';
@@ -646,32 +646,18 @@ async function sendSessionRequest(
   // will exceed the context window and proactively trim the input.
   if (config.contextWindowGuardEnabled) {
     const modelName = typeof currentBody.model === 'string' ? currentBody.model : '';
-    const contextWindow = getModelContextWindow(modelName);
-    const trimTarget = Math.trunc(contextWindow * config.contextWindowGuardTrimTargetPercent / 100);
-
-    // Predictive check: use last successful prompt_tokens + growth rate
     const sessionUsage = getSessionTokenUsage(session.sessionId);
-    let predictedTokens = 0;
-    if (sessionUsage && sessionUsage.lastSucceeded) {
-      predictedTokens = sessionUsage.predictedNextPromptTokens;
-    }
+    const budgetDecision = evaluateContextBudget({
+      model: modelName,
+      inputTokensEstimate: estimateResponsesInputTokens(currentBody.input),
+      sessionUsage,
+    });
+    const predictedTokens = budgetDecision.predictedPromptTokens;
+    const estimatedInputTokens = budgetDecision.inputTokensEstimate;
+    const effectiveTokens = budgetDecision.effectiveTokens;
+    const trimTarget = budgetDecision.trimTargetTokens;
 
-    // Request-level estimate from input array
-    let estimatedInputTokens = 0;
-    if (isRecord(currentBody) && Array.isArray(currentBody.input)) {
-      for (const item of currentBody.input as unknown[]) {
-        try {
-          estimatedInputTokens += Math.ceil(JSON.stringify(item).length / 3);
-        } catch {
-          estimatedInputTokens += 500;
-        }
-      }
-    }
-
-    const effectiveTokens = Math.max(predictedTokens, estimatedInputTokens);
-    const shouldTrim = predictedTokens >= trimTarget || estimatedInputTokens >= trimTarget;
-
-    if (shouldTrim && isRecord(currentBody) && Array.isArray(currentBody.input)) {
+    if (budgetDecision.shouldTrim && isRecord(currentBody) && Array.isArray(currentBody.input)) {
       const trimResult = trimResponsesInputToTokenBudget(currentBody, trimTarget, effectiveTokens);
       if (trimResult.itemsRemoved > 0) {
         console.warn(
@@ -696,8 +682,7 @@ async function sendSessionRequest(
         // Mark session as trimmed — prevent recording response ID
         markLayer1TrimmedSession(session.sessionId);
       }
-    } else if (sessionUsage && sessionUsage.promptTokens >= Math.trunc(contextWindow * config.contextWindowGuardAutoCompactPercent / 100)) {
-      // Auto-compact: skip previous_response_id
+    } else if (budgetDecision.shouldResetContinuation) {
       const stripped = stripResponsesPreviousResponseId(currentBody);
       if (stripped.removed) {
         currentBody = stripped.body;
@@ -748,9 +733,15 @@ async function sendSessionRequest(
         // Layer 4: Trim input array to fit within context budget
         if (isRecord(recoveredBody) && Array.isArray(recoveredBody.input)) {
           const modelName = typeof recoveredBody.model === 'string' ? recoveredBody.model : '';
-          const contextWindow = getModelContextWindow(modelName);
-          const targetTokens = Math.trunc(contextWindow * 75 / 100);
-          const trimResult = trimResponsesInputToTokenBudget(recoveredBody, targetTokens, contextWindow);
+          const budgetDecision = evaluateContextBudget({
+            model: modelName,
+            inputTokensEstimate: estimateResponsesInputTokens(recoveredBody.input),
+          });
+          const trimResult = trimResponsesInputToTokenBudget(
+            recoveredBody,
+            budgetDecision.trimTargetTokens,
+            budgetDecision.contextWindow,
+          );
           if (trimResult.itemsRemoved > 0) {
             recoveredBody = trimResult.body;
           }

@@ -24,6 +24,7 @@ import {
 } from '../../services/upstreamEndpointRuntimeMemory.js';
 import { ensureModelAllowedForDownstreamKey, getDownstreamRoutingPolicy, recordDownstreamCostUsage } from '../../routes/proxy/downstreamPolicy.js';
 import { executeEndpointFlow, type BuiltEndpointRequest } from '../orchestration/endpointFlow.js';
+import { buildUpstreamUrl } from '../orchestration/upstreamRequest.js';
 import {
   dropUnsupportedParameterFromBody,
   extractUnsupportedParameterName,
@@ -94,6 +95,7 @@ import {
   selectSurfaceChannelForAttempt,
   trySurfaceOauthPreRefresh,
   trySurfaceOauthRefreshRecovery,
+  type CodexContextTelemetry,
 } from './sharedSurface.js';
 import {
   buildSurfaceProxyDebugResponseHeaders,
@@ -120,14 +122,15 @@ import {
   isResponsesContinuationRecoveryError,
 } from '../responsesContinuationRecovery.js';
 import {
-  evaluatePreRequestContextBudget,
+  evaluateContextBudget,
+  estimateResponsesInputTokens,
   getModelContextWindow,
   isContextWindowExceededError as isContextWindowExceededGuard,
   recordSessionTokenUsage,
   getSessionTokenUsage,
   clearSessionTokenUsage,
   trimResponsesInputToTokenBudget,
-  shouldTriggerAutoCompact,
+  shouldAttemptSoftContextCompact,
 } from '../capabilities/contextWindowGuard.js';
 import {
   tryComputeIncrementalInput,
@@ -170,6 +173,25 @@ function isResponsesWebsocketHttpFallbackRequest(headers: Record<string, unknown
 function safeRememberCodexSessionResponseId(sessionId: string, payload: unknown): void {
   if (!sessionId) return;
   safeSetCodexSessionResponseId(sessionId, payload);
+}
+
+function recordCodexSessionBaselineFromPayload(input: {
+  sessionId: string;
+  requestInput: Record<string, unknown>[] | null;
+  payload: unknown;
+  model: string;
+}): void {
+  if (!input.sessionId || !input.requestInput) return;
+  const responseId = extractResponsesTerminalResponseId(input.payload);
+  if (!responseId) return;
+  if (getCodexSessionResponseId(input.sessionId) !== responseId) return;
+  recordSessionBaseline({
+    sessionId: input.sessionId,
+    requestInput: input.requestInput,
+    responseOutputItems: extractResponseOutputItems(input.payload),
+    responseId,
+    model: input.model,
+  });
 }
 
 /**
@@ -333,6 +355,107 @@ function shouldRefreshOauthResponsesRequest(input: {
 }
 
 type UsageSummary = ReturnType<typeof parseProxyUsage>;
+
+
+type CodexAutoCompactSessionState = {
+  turn: number;
+  nextEligibleTurn: number;
+  attempts: number;
+  unsupportedUntilMs: number;
+};
+
+const codexAutoCompactSessions = new Map<string, CodexAutoCompactSessionState>();
+
+function getCodexAutoCompactSessionState(sessionId: string): CodexAutoCompactSessionState {
+  const key = sessionId.trim();
+  const existing = codexAutoCompactSessions.get(key);
+  if (existing) return existing;
+  const created: CodexAutoCompactSessionState = {
+    turn: 0,
+    nextEligibleTurn: 0,
+    attempts: 0,
+    unsupportedUntilMs: 0,
+  };
+  codexAutoCompactSessions.set(key, created);
+  return created;
+}
+
+function extractCompactOutputItems(payload: unknown): Record<string, unknown>[] {
+  if (!isRecord(payload)) return [];
+  if (Array.isArray(payload.output)) {
+    return payload.output.filter((item): item is Record<string, unknown> => isRecord(item));
+  }
+  const response = payload.response;
+  if (isRecord(response) && Array.isArray(response.output)) {
+    return response.output.filter((item): item is Record<string, unknown> => isRecord(item));
+  }
+  return [];
+}
+
+function buildCompactedMainInput(
+  inputItems: unknown[],
+  compactItems: Record<string, unknown>[],
+  targetTokens: number,
+): unknown[] {
+  if (compactItems.length === 0) return inputItems;
+  const first = inputItems[0];
+  const shouldKeepFirst = isRecord(first)
+    && typeof first.role === 'string'
+    && /^(system|developer)$/i.test(first.role.trim());
+  const prefix = shouldKeepFirst ? [first] : [];
+  const target = Math.max(1_000, Math.trunc(targetTokens));
+  const estimateItems = (items: unknown[]) => estimateResponsesInputTokens(items) ?? Number.MAX_SAFE_INTEGER;
+  const baseItems = [...prefix, ...compactItems];
+  const maxTailCount = Math.max(1, Math.min(6, inputItems.length));
+  const tailCandidates = inputItems.slice(Math.max(shouldKeepFirst ? 1 : 0, inputItems.length - maxTailCount));
+  const tail: unknown[] = [];
+
+  for (let index = tailCandidates.length - 1; index >= 0; index--) {
+    const candidateTail = [tailCandidates[index], ...tail];
+    const candidate = [...baseItems, ...candidateTail];
+    if (tail.length === 0 || estimateItems(candidate) <= target) {
+      tail.unshift(tailCandidates[index]);
+    }
+  }
+
+  return [
+    ...baseItems,
+    ...tail,
+  ];
+}
+
+function buildCodexContextTelemetry(input: {
+  clientFullInputTokensEstimate: number | null;
+  upstreamSentInputTokensEstimate?: number | null;
+  upstreamPromptTokens?: number | null;
+  contextStrategy?: CodexContextTelemetry['contextStrategy'];
+  compactTriggered?: boolean;
+  compactReason?: string | null;
+  fallbackReason?: string | null;
+  previousResponseIdUsed?: boolean | null;
+  compactAttempted?: boolean | null;
+  compactSucceeded?: boolean | null;
+}): CodexContextTelemetry {
+  const sentEstimate = input.upstreamSentInputTokensEstimate ?? null;
+  const fullEstimate = input.clientFullInputTokensEstimate;
+  const savedEstimate = (
+    typeof fullEstimate === 'number'
+    && typeof sentEstimate === 'number'
+  ) ? Math.max(0, fullEstimate - sentEstimate) : null;
+  return {
+    clientFullInputTokensEstimate: fullEstimate,
+    upstreamSentInputTokensEstimate: sentEstimate,
+    upstreamPromptTokens: input.upstreamPromptTokens ?? null,
+    contextStrategy: input.contextStrategy ?? 'full',
+    compactTriggered: input.compactTriggered ?? false,
+    compactReason: input.compactReason ?? null,
+    fallbackReason: input.fallbackReason ?? null,
+    savedInputTokensEstimate: savedEstimate,
+    previousResponseIdUsed: input.previousResponseIdUsed ?? null,
+    compactAttempted: input.compactAttempted ?? false,
+    compactSucceeded: input.compactSucceeded ?? false,
+  };
+}
 
 export async function handleOpenAiResponsesSurfaceRequest(
   request: FastifyRequest,
@@ -553,6 +676,39 @@ export async function handleOpenAiResponsesSurfaceRequest(
           throw error;
         }
       }
+      const clientFullInputTokensEstimate = estimateResponsesInputTokens(normalizedResponsesBody.input);
+      let contextTelemetry = buildCodexContextTelemetry({
+        clientFullInputTokensEstimate,
+        contextStrategy: isCompactRequest ? 'compact' : 'full',
+        compactTriggered: isCompactRequest,
+        compactReason: isCompactRequest ? 'explicit_compact_request' : null,
+        compactAttempted: isCompactRequest,
+      });
+      const updateContextTelemetry = (patch: Partial<CodexContextTelemetry>) => {
+        contextTelemetry = {
+          ...contextTelemetry,
+          ...patch,
+        };
+        if (
+          typeof contextTelemetry.clientFullInputTokensEstimate === 'number'
+          && typeof contextTelemetry.upstreamSentInputTokensEstimate === 'number'
+        ) {
+          contextTelemetry.savedInputTokensEstimate = Math.max(
+            0,
+            contextTelemetry.clientFullInputTokensEstimate - contextTelemetry.upstreamSentInputTokensEstimate,
+          );
+        }
+      };
+      const autoCompactSessionState = codexSessionStoreKey
+        ? getCodexAutoCompactSessionState(codexSessionStoreKey)
+        : null;
+      const sessionContextUsage = codexSessionStoreKey
+        ? getSessionTokenUsage(codexSessionStoreKey)
+        : null;
+      if (autoCompactSessionState) {
+        autoCompactSessionState.turn += 1;
+      }
+      let autoCompactAttemptedThisRequest = false;
       const openAiBody = openAiResponsesTransformer.inbound.toOpenAiBody(
         normalizedResponsesBody,
         modelName,
@@ -645,7 +801,6 @@ export async function handleOpenAiResponsesSurfaceRequest(
           sitePlatform: selected.site.platform,
           isCompactRequest,
         });
-        const normalizedSitePlatform = String(selected.site.platform || '').trim().toLowerCase();
         // ── Layer 1: Pre-request context budget check ────────────────────
         // Check if the CURRENT request's input is approaching the model's
         // context window. If so, trim the input array to fit within budget.
@@ -665,70 +820,35 @@ export async function handleOpenAiResponsesSurfaceRequest(
         let layer1TrimmedInput: Record<string, unknown> | null = null;
 
         if (isCodexSite && codexSessionStoreKey && config.contextWindowGuardEnabled) {
-          const contextWindow = getModelContextWindow(modelName);
-          const trimTarget = Math.trunc(contextWindow * config.contextWindowGuardTrimTargetPercent / 100);
+          const budgetDecision = evaluateContextBudget({
+            model: modelName,
+            inputTokensEstimate: clientFullInputTokensEstimate,
+            sessionUsage: sessionContextUsage,
+          });
+          const contextWindow = budgetDecision.contextWindow;
+          const trimTarget = budgetDecision.trimTargetTokens;
+          const predictedTokens = budgetDecision.predictedPromptTokens;
+          const estimatedInputTokens = budgetDecision.inputTokensEstimate;
+          const effectiveTokens = budgetDecision.effectiveTokens;
+          const shouldTrimPredictive = budgetDecision.shouldTrimPredictive;
+          const shouldTrim = budgetDecision.shouldTrim;
 
-          // ── Predictive check using session history ──────────────────────
-          // If we have a previous successful response's prompt_tokens,
-          // predict this request's effective token count using the growth rate.
-          const sessionUsage = getSessionTokenUsage(codexSessionStoreKey);
-          let predictedTokens = 0;
-          let shouldTrimPredictive = false;
-
-          if (sessionUsage && sessionUsage.lastSucceeded) {
-            predictedTokens = sessionUsage.predictedNextPromptTokens;
-            // Trim if predicted next request will exceed trim target
-            shouldTrimPredictive = predictedTokens >= trimTarget;
-            console.info(
-              '[responses] Layer 1 predictive check',
-              {
-                sessionId: codexSessionStoreKey,
-                lastPromptTokens: sessionUsage.promptTokens,
-                prevPromptTokens: sessionUsage.prevPromptTokens,
-                growthRate: sessionUsage.growthRate,
-                predictedTokens,
-                contextWindow,
-                trimTarget,
-                shouldTrim: shouldTrimPredictive,
-              },
-            );
-          }
-
-          // ── Request-level input size check (fallback) ──────────────────
-          // When no session history exists (first request in session),
-          // estimate tokens from the input array directly.
-          let estimatedInputTokens = 0;
-          let shouldTrimRequestLevel = false;
-
-          if (isRecord(normalizedResponsesBody) && Array.isArray(normalizedResponsesBody.input)) {
-            const inputArr = normalizedResponsesBody.input as unknown[];
-            // Estimate: ~3 chars per token for code-heavy content (more accurate than 4)
-            for (const item of inputArr) {
-              try {
-                estimatedInputTokens += Math.ceil(JSON.stringify(item).length / 3);
-              } catch {
-                estimatedInputTokens += 500;
-              }
-            }
-            shouldTrimRequestLevel = estimatedInputTokens >= trimTarget;
-            console.info(
-              '[responses] Layer 1 request-level check',
-              {
-                sessionId: codexSessionStoreKey,
-                inputItems: inputArr.length,
-                estimatedInputTokens,
-                contextWindow,
-                trimTarget,
-                shouldTrim: shouldTrimRequestLevel,
-              },
-            );
-          }
-
-          // ── Combine signals and decide ────────────────────────────────
-          // Trim if EITHER signal says we should.
-          // Use the higher token estimate as the basis for trimming.
-          const effectiveTokens = Math.max(predictedTokens, estimatedInputTokens);
-          const shouldTrim = shouldTrimPredictive || shouldTrimRequestLevel;
+          console.info(
+            '[responses] Layer 1 context budget check',
+            {
+              sessionId: codexSessionStoreKey,
+              lastPromptTokens: sessionContextUsage?.promptTokens ?? 0,
+              prevPromptTokens: sessionContextUsage?.prevPromptTokens ?? 0,
+              growthRate: sessionContextUsage?.growthRate ?? 0,
+              predictedTokens,
+              estimatedInputTokens,
+              effectiveTokens,
+              contextWindow,
+              trimTarget,
+              shouldTrim,
+              shouldResetContinuation: budgetDecision.shouldResetContinuation,
+            },
+          );
 
           if (shouldTrim) {
             console.warn(
@@ -755,6 +875,10 @@ export async function handleOpenAiResponsesSurfaceRequest(
               );
               if (trimResult.itemsRemoved > 0) {
                 layer1TrimmedInput = trimResult.body;
+                updateContextTelemetry({
+                  contextStrategy: 'trim',
+                  fallbackReason: budgetDecision.trimReason,
+                });
                 layer1ContextOverride = {
                   skipPreviousResponseId: true,
                   reason: shouldTrimPredictive
@@ -772,6 +896,12 @@ export async function handleOpenAiResponsesSurfaceRequest(
               }
             } else {
               // Can't trim (no input array), just skip previous_response_id
+              updateContextTelemetry({
+                contextStrategy: 'fallback_no_previous_response',
+                fallbackReason: shouldTrimPredictive
+                  ? `predicted ${predictedTokens} tokens >= ${trimTarget} — skipping previous_response_id`
+                  : `effective ${effectiveTokens} tokens >= ${trimTarget} — skipping previous_response_id`,
+              });
               layer1ContextOverride = {
                 skipPreviousResponseId: true,
                 reason: shouldTrimPredictive
@@ -781,11 +911,14 @@ export async function handleOpenAiResponsesSurfaceRequest(
               clearCodexSessionResponseId(codexSessionStoreKey);
               clearSessionBaseline(codexSessionStoreKey);
             }
-          } else if (sessionUsage && sessionUsage.promptTokens >= Math.trunc(contextWindow * config.contextWindowGuardAutoCompactPercent / 100)) {
-            // Auto-compact: skip previous_response_id but don't trim yet
+          } else if (budgetDecision.shouldResetContinuation) {
+            updateContextTelemetry({
+              contextStrategy: 'fallback_no_previous_response',
+              fallbackReason: `${budgetDecision.resetContinuationReason} — skipping previous_response_id`,
+            });
             layer1ContextOverride = {
               skipPreviousResponseId: true,
-              reason: `session at ${sessionUsage.promptTokens} tokens >= ${config.contextWindowGuardAutoCompactPercent}% of ${contextWindow} — skipping previous_response_id`,
+              reason: `${budgetDecision.resetContinuationReason} — skipping previous_response_id`,
             };
             clearCodexSessionResponseId(codexSessionStoreKey);
             clearSessionBaseline(codexSessionStoreKey);
@@ -885,6 +1018,14 @@ export async function handleOpenAiResponsesSurfaceRequest(
             downstreamHeaders: request.headers as Record<string, unknown>,
             providerHeaders: buildProviderHeaders(),
             codexExplicitSessionId: codexSessionId || null,
+            preserveResponsesPreviousResponseId: !!(
+              isCodexSite
+              && endpoint === 'responses'
+              && isRecord(responsesOriginalBody)
+              && typeof responsesOriginalBody.previous_response_id === 'string'
+              && responsesOriginalBody.previous_response_id.trim()
+              && !(typeof body.previous_response_id === 'string' && body.previous_response_id.trim().length > 0)
+            ),
           });
           const upstreamPath = (
             isCompactRequest && endpoint === 'responses'
@@ -898,18 +1039,27 @@ export async function handleOpenAiResponsesSurfaceRequest(
               })
               : endpointRequest.body as Record<string, unknown>
           );
-          const requestBody = (
-            endpoint === 'responses' && normalizedSitePlatform === 'codex' && isRecord(baseRequestBody)
-              ? (() => {
-                const nextBody: Record<string, unknown> = { ...baseRequestBody };
-                delete nextBody.temperature;
-                delete nextBody.top_p;
-                delete nextBody.frequency_penalty;
-                delete nextBody.presence_penalty;
-                return nextBody;
-              })()
-              : baseRequestBody
-          );
+          const requestBody = baseRequestBody;
+          const sentInputTokensEstimate = isRecord(requestBody)
+            ? estimateResponsesInputTokens(requestBody.input)
+            : null;
+          const strategy: CodexContextTelemetry['contextStrategy'] = isCompactRequest
+            ? 'compact'
+            : incrementalOptimization
+              ? 'incremental'
+              : layer1TrimmedInput
+                ? 'trim'
+                : layer1ContextOverride?.skipPreviousResponseId
+                  ? 'fallback_no_previous_response'
+                  : 'full';
+          updateContextTelemetry({
+            contextStrategy: strategy,
+            upstreamSentInputTokensEstimate: sentInputTokensEstimate,
+            previousResponseIdUsed: isRecord(requestBody) && typeof requestBody.previous_response_id === 'string' && requestBody.previous_response_id.trim().length > 0,
+            compactTriggered: isCompactRequest || contextTelemetry.compactTriggered,
+            compactAttempted: isCompactRequest || contextTelemetry.compactAttempted,
+            compactReason: isCompactRequest ? 'explicit_compact_request' : contextTelemetry.compactReason ?? null,
+          });
           const requestHeaders = (
             isCompactRequest && endpoint === 'responses'
               ? ensureCompactResponsesJsonAcceptHeader(endpointRequest.headers, {
@@ -931,14 +1081,128 @@ export async function handleOpenAiResponsesSurfaceRequest(
           accountExtraConfig: selected.account.extraConfig,
         });
         const codexWsProxyUrl = resolveChannelProxyUrl(selected.site, selected.account.extraConfig);
-        const dispatchRequest = (
+        const dispatchRequest = async (
           endpointRequest: BuiltEndpointRequest,
           targetUrl?: string,
         ) => {
+          const resolveSiblingTargetUrl = (requestPath: string) => {
+            if (!targetUrl) return buildUpstreamUrl(siteApiBaseUrl, requestPath);
+            if (targetUrl.endsWith(endpointRequest.path)) {
+              return `${targetUrl.slice(0, -endpointRequest.path.length)}${requestPath}`;
+            }
+            return buildUpstreamUrl(siteApiBaseUrl, requestPath);
+          };
+          const dispatchCodexHttpRequest = (requestToDispatch: BuiltEndpointRequest, requestTargetUrl = targetUrl) => {
+            const sessionId = getCodexSessionHeaderValue(requestToDispatch.headers);
+            return runCodexHttpSessionTask(
+              codexSessionStoreKey || sessionId,
+              () => baseDispatchRequest(requestToDispatch, requestTargetUrl),
+            );
+          };
           if (!isCodexSite || !endpointRequest.path.startsWith('/responses')) {
             return baseDispatchRequest(endpointRequest, targetUrl);
           }
-          if (config.codexUpstreamWebsocketEnabled && !websocketHttpFallbackRequest) {
+          const softCompactDecision = shouldAttemptSoftContextCompact({
+            clientInputTokensEstimate: clientFullInputTokensEstimate,
+            sessionUsage: sessionContextUsage,
+            softTokens: config.codexContextCompactionSoftTokens,
+          });
+          if (
+            !autoCompactAttemptedThisRequest
+            && !isCompactRequest
+            && endpointRequest.endpoint === 'responses'
+            && endpointRequest.path.endsWith('/responses')
+            && config.codexContextCompactionAutoEnabled
+            && autoCompactSessionState
+            && autoCompactSessionState.attempts < config.codexContextCompactionMaxAttemptsPerSession
+            && autoCompactSessionState.turn >= autoCompactSessionState.nextEligibleTurn
+            && autoCompactSessionState.unsupportedUntilMs <= Date.now()
+            && softCompactDecision.shouldAttempt
+            && isRecord(endpointRequest.body)
+            && Array.isArray(endpointRequest.body.input)
+          ) {
+            autoCompactAttemptedThisRequest = true;
+            autoCompactSessionState.attempts += 1;
+            autoCompactSessionState.nextEligibleTurn = autoCompactSessionState.turn + config.codexContextCompactionCooldownTurns;
+            updateContextTelemetry({
+              contextStrategy: 'compact',
+              compactTriggered: true,
+              compactAttempted: true,
+              compactReason: softCompactDecision.reason,
+            });
+            const compactRequest: BuiltEndpointRequest = {
+              ...endpointRequest,
+              path: `${endpointRequest.path}/compact`,
+              headers: ensureCompactResponsesJsonAcceptHeader(endpointRequest.headers, {
+                sitePlatform: selected.site.platform,
+              }),
+              body: sanitizeCompactResponsesRequestBody(endpointRequest.body, {
+                sitePlatform: selected.site.platform,
+              }),
+            };
+            try {
+              const compactResponse = await dispatchCodexHttpRequest(
+                compactRequest,
+                resolveSiblingTargetUrl(compactRequest.path),
+              );
+              const compactText = await readRuntimeResponseText(compactResponse).catch(() => '');
+              if (compactResponse.ok) {
+                let compactPayload: unknown = compactText;
+                try {
+                  compactPayload = JSON.parse(compactText);
+                } catch {
+                  compactPayload = compactText;
+                }
+                const compactItems = extractCompactOutputItems(compactPayload);
+                if (compactItems.length > 0) {
+                  const compactedBody = {
+                    ...endpointRequest.body,
+                    previous_response_id: undefined,
+                    input: buildCompactedMainInput(
+                      endpointRequest.body.input,
+                      compactItems,
+                      config.codexContextCompactionTargetTokens,
+                    ),
+                  };
+                  delete compactedBody.previous_response_id;
+                  const compactedRequest: BuiltEndpointRequest = {
+                    ...endpointRequest,
+                    body: compactedBody,
+                  };
+                  updateContextTelemetry({
+                    compactSucceeded: true,
+                    upstreamSentInputTokensEstimate: estimateResponsesInputTokens(compactedBody.input),
+                    previousResponseIdUsed: false,
+                  });
+                  clearSessionBaseline(codexSessionStoreKey);
+                  clearCodexSessionResponseId(codexSessionStoreKey);
+                  return dispatchCodexHttpRequest(compactedRequest);
+                }
+                updateContextTelemetry({
+                  compactSucceeded: false,
+                  fallbackReason: 'compact response did not contain reusable output items',
+                });
+              } else {
+                if (shouldFallbackCompactResponsesToResponses({
+                  status: compactResponse.status,
+                  rawErrText: compactText,
+                  requestPath: compactRequest.path,
+                })) {
+                  autoCompactSessionState.unsupportedUntilMs = Date.now() + config.codexContextCompactionUnsupportedTtlMs;
+                }
+                updateContextTelemetry({
+                  compactSucceeded: false,
+                  fallbackReason: `compact preflight failed with HTTP ${compactResponse.status}`,
+                });
+              }
+            } catch (error: any) {
+              updateContextTelemetry({
+                compactSucceeded: false,
+                fallbackReason: error?.message || 'compact preflight failed',
+              });
+            }
+          }
+          if (config.codexUpstreamWebsocketEnabled && !websocketHttpFallbackRequest && !isCompactRequest) {
             return dispatchCodexWebsocketRequest(
               endpointRequest,
               targetUrl,
@@ -948,11 +1212,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
               codexWsProxyUrl,
             ) as unknown as ReturnType<typeof baseDispatchRequest>;
           }
-          const sessionId = getCodexSessionHeaderValue(endpointRequest.headers);
-          return runCodexHttpSessionTask(
-            codexSessionStoreKey || sessionId,
-            () => baseDispatchRequest(endpointRequest, targetUrl),
-          );
+          return dispatchCodexHttpRequest(endpointRequest);
         };
         const endpointStrategy = openAiResponsesTransformer.compatibility.createEndpointStrategy({
           isStream: isStream || forceResponsesUpstreamStream,
@@ -1331,6 +1591,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
               latencyMs: Date.now() - startTime,
               errorMessage: ctx.errText,
               retryCount,
+              contextTelemetry,
             });
           },
         });
@@ -1355,6 +1616,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
         latencyMs: leaseResult.waitMs,
         errorMessage: busyMessage,
         retryCount,
+        contextTelemetry,
       });
       if (retryCount < maxRetries && canRetryChannelSelection(retryCount, forcedChannelId)) {
         retryCount += 1;
@@ -1397,8 +1659,13 @@ export async function handleOpenAiResponsesSurfaceRequest(
           latency: number,
           streamDebugBody: unknown,
           upstreamUsagePresent: boolean,
+          terminalPayload: unknown | null = null,
         ) => {
           try {
+            updateContextTelemetry({
+              upstreamPromptTokens: parsedUsage.promptTokens,
+              compactSucceeded: isCompactRequest ? true : contextTelemetry.compactSucceeded ?? false,
+            });
             await recordSurfaceSuccess({
               selected,
               requestedModel,
@@ -1412,6 +1679,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
               latencyMs: latency,
               retryCount,
               upstreamPath: successfulUpstreamPath,
+              contextTelemetry,
               logSuccess: failureToolkit.log,
               recordDownstreamCost: (estimatedCost) => {
                 recordDownstreamCostUsage(request, estimatedCost);
@@ -1430,10 +1698,14 @@ export async function handleOpenAiResponsesSurfaceRequest(
                 responseId: null, // Stream: response ID is captured by safeRememberCodexSessionResponseId
                 succeeded: true,
               });
-              // Note: baseline recording for stream is done inside the stream
-              // session's onParsedPayload callback where individual output items
-              // are captured. For now we skip baseline recording in the stream
-              // finalize path since the payload is already consumed.
+              recordCodexSessionBaselineFromPayload({
+                sessionId: codexSessionStoreKey,
+                requestInput: Array.isArray(normalizedResponsesBody.input)
+                  ? normalizedResponsesBody.input as Record<string, unknown>[]
+                  : null,
+                payload: terminalPayload,
+                model: modelName,
+              });
             }
           } catch (error) {
             console.error('[responses] post-stream success logging failed:', error);
@@ -1516,6 +1788,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
                     completionTokens: parsedUsage.completionTokens,
                     totalTokens: parsedUsage.totalTokens,
                     upstreamPath: successfulUpstreamPath,
+                    contextTelemetry,
                   });
                   await finalizeDebugFailure(502, {
                     error: { message: streamErrorMessage, type: 'stream_error' },
@@ -1537,6 +1810,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
                   completionTokens: parsedUsage.completionTokens,
                   totalTokens: parsedUsage.totalTokens,
                   upstreamPath: successfulUpstreamPath,
+                  contextTelemetry,
                 });
                 await finalizeDebugFailure(502, {
                   error: {
@@ -1547,11 +1821,12 @@ export async function handleOpenAiResponsesSurfaceRequest(
                 return;
 	              }
 
-	              await finalizeStreamSuccess(
+                await finalizeStreamSuccess(
                   parsedUsage,
                   latency,
                   debugTrace?.options.captureStreamChunks ? rawText : { stream: true, usage: parsedUsage },
                   upstreamUsagePresent,
+                  streamResult.terminalPayload,
                 );
 	              bindSurfaceStickyChannel({
 	                stickySessionKey,
@@ -1594,6 +1869,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
                   completionTokens: parsedUsage.completionTokens,
                   totalTokens: parsedUsage.totalTokens,
                   upstreamPath: successfulUpstreamPath,
+                  contextTelemetry,
                 });
                 await finalizeDebugFailure(
                   failure.status,
@@ -1656,6 +1932,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
                   completionTokens: parsedUsage.completionTokens,
                   totalTokens: parsedUsage.totalTokens,
                   upstreamPath: successfulUpstreamPath,
+                  contextTelemetry,
                 });
                 await finalizeDebugFailure(502, {
                   error: { message: streamErrorMessage, type: 'stream_error' },
@@ -1688,11 +1965,12 @@ export async function handleOpenAiResponsesSurfaceRequest(
               return;
 	            }
 
-	            await finalizeStreamSuccess(
+            await finalizeStreamSuccess(
                 parsedUsage,
                 latency,
                 debugTrace?.options.captureStreamChunks ? rawText : upstreamData,
                 upstreamUsagePresent,
+                streamResult.terminalPayload,
               );
 	            bindSurfaceStickyChannel({
 	              stickySessionKey,
@@ -1735,6 +2013,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
                   latency,
                   debugTrace?.options.captureStreamChunks ? rawText : collectedPayload,
                   upstreamUsagePresent,
+                  collectedPayload,
                 );
                 bindSurfaceStickyChannel({
                   stickySessionKey,
@@ -1767,6 +2046,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
                     completionTokens: parsedUsage.completionTokens,
                     totalTokens: parsedUsage.totalTokens,
                     upstreamPath: successfulUpstreamPath,
+                    contextTelemetry,
                   });
                   await finalizeDebugFailure(502, {
                     error: { message: streamErrorMessage, type: 'stream_error' },
@@ -1800,6 +2080,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
                 latency,
                 debugTrace?.options.captureStreamChunks ? rawText : { stream: true, usage: parsedUsage },
                 upstreamUsagePresent,
+                streamResult.terminalPayload,
               );
               return;
             }
@@ -1851,6 +2132,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
                 completionTokens: parsedUsage.completionTokens,
                 totalTokens: parsedUsage.totalTokens,
                 upstreamPath: successfulUpstreamPath,
+                contextTelemetry,
               });
               await finalizeDebugFailure(502, {
                 error: { message: streamErrorMessage, type: 'stream_error' },
@@ -1873,6 +2155,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
               totalTokens: parsedUsage.totalTokens,
               upstreamPath: successfulUpstreamPath,
               runtimeFailureStatus: 502,
+              contextTelemetry,
             });
             await finalizeDebugFailure(502, {
               error: {
@@ -1888,11 +2171,12 @@ export async function handleOpenAiResponsesSurfaceRequest(
           // response or retry on another channel. Responses stream failures are
 	          // handled in-band by the proxy stream session.
 
-	          await finalizeStreamSuccess(
+          await finalizeStreamSuccess(
               parsedUsage,
               latency,
               debugTrace?.options.captureStreamChunks ? rawText : { stream: true, usage: parsedUsage },
               upstreamUsagePresent,
+              streamResult.terminalPayload,
             );
 	          bindSurfaceStickyChannel({
 	            stickySessionKey,
@@ -2009,6 +2293,10 @@ export async function handleOpenAiResponsesSurfaceRequest(
           serializationMode: isCompactRequest ? 'compact' : 'response',
         });
         try {
+          updateContextTelemetry({
+            upstreamPromptTokens: parsedUsage.promptTokens,
+            compactSucceeded: isCompactRequest ? true : contextTelemetry.compactSucceeded ?? false,
+          });
           await recordSurfaceSuccess({
             selected,
             requestedModel,
@@ -2022,6 +2310,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
             latencyMs: latency,
             retryCount,
             upstreamPath: successfulUpstreamPath,
+            contextTelemetry,
             logSuccess: failureToolkit.log,
             recordDownstreamCost: (estimatedCost) => {
               recordDownstreamCostUsage(request, estimatedCost);
@@ -2032,6 +2321,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
           });
           // Track token usage for context window guard (Layer 1 & 2)
           if (codexSessionStoreKey) {
+            safeRememberCodexSessionResponseId(codexSessionStoreKey, upstreamData);
             recordSessionTokenUsage({
               sessionId: codexSessionStoreKey,
               promptTokens: parsedUsage.promptTokens,
@@ -2043,9 +2333,9 @@ export async function handleOpenAiResponsesSurfaceRequest(
             // Record baseline for incremental input optimization
             const responseOutputItems = extractResponseOutputItems(upstreamData);
             const responseId = extractResponsesTerminalResponseId(upstreamData);
-            const requestInput = (lastIncrementalOptimization != null)
-              ? (lastIncrementalOptimization as { incrementalInput: unknown[] }).incrementalInput as Record<string, unknown>[]
-              : (Array.isArray(normalizedResponsesBody.input) ? normalizedResponsesBody.input as Record<string, unknown>[] : []);
+            const requestInput = Array.isArray(normalizedResponsesBody.input)
+              ? normalizedResponsesBody.input as Record<string, unknown>[]
+              : [];
             if (responseId) {
               recordSessionBaseline({
                 sessionId: codexSessionStoreKey,
@@ -2084,6 +2374,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
               latencyMs: Date.now() - startTime,
               errorMessage: err.message,
               retryCount,
+              contextTelemetry,
             });
             await finalizeDebugFailure(
               err.status,
@@ -2113,6 +2404,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
                 latencyMs: Date.now() - startTime,
                 errorMessage: err?.message || 'unknown error',
                 retryCount,
+                contextTelemetry,
               });
               await finalizeDebugFailure(
                 endpointFailureStatus || 502,
@@ -2133,6 +2425,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
           isStream,
           latencyMs: Date.now() - startTime,
           retryCount,
+          contextTelemetry,
         });
             const terminalFailureOutcome = failureOutcome.action === 'retry'
               ? (canRetryChannelSelection(retryCount, forcedChannelId)
@@ -2158,6 +2451,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
             isStream,
             latencyMs: Date.now() - startTime,
             retryCount,
+            contextTelemetry,
           });
           const terminalFailureOutcome = failureOutcome.action === 'retry'
             ? (isClientContinuationFailure(err?.message || 'network failure')

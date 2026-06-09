@@ -34,6 +34,10 @@ const originalProxyStickySessionEnabled = config.proxyStickySessionEnabled;
 const originalProxySessionChannelConcurrencyLimit = config.proxySessionChannelConcurrencyLimit;
 const originalProxySessionChannelQueueWaitMs = config.proxySessionChannelQueueWaitMs;
 const originalCodexUpstreamWebsocketEnabled = config.codexUpstreamWebsocketEnabled;
+const originalCodexContextCompactionAutoEnabled = config.codexContextCompactionAutoEnabled;
+const originalCodexContextCompactionSoftTokens = config.codexContextCompactionSoftTokens;
+const originalCodexContextCompactionTargetTokens = config.codexContextCompactionTargetTokens;
+const originalCodexContextCompactionCooldownTurns = config.codexContextCompactionCooldownTurns;
 const dbInsertMock = vi.fn((_arg?: any) => ({
   values: (values: Record<string, unknown>) => {
     insertedProxyLogs.push(values);
@@ -92,6 +96,10 @@ vi.mock('../../services/proxyRetryPolicy.js', () => ({
       || t.includes('tool-output-only continuation cannot be safely replayed')
       || t.includes('unable to safely recover continuation');
   },
+  isContextWindowExceededRetryPolicy: (text: string | null | undefined) => {
+    const t = (text || '').trim().toLowerCase();
+    return /context\s*window/i.test(t) || t.includes('exceeds the context');
+  },
   shouldRetryProxyRequest: () => false,
   shouldAbortSameSiteEndpointFallback: () => false,
   RETRYABLE_TIMEOUT_PATTERNS: [/(request timed out|connection timed out|read timeout|\btimed out\b)/i],
@@ -134,6 +142,7 @@ vi.mock('../../db/index.js', () => ({
   hasProxyLogClientColumns: async () => false,
   hasProxyLogDownstreamApiKeyIdColumn: async () => false,
   hasProxyLogStreamTimingColumns: async () => false,
+  hasProxyLogTransportColumns: async () => false,
   schema: {
     proxyLogs: {},
     siteApiEndpoints: {
@@ -207,6 +216,10 @@ describe('responses proxy codex oauth refresh', () => {
     config.proxyStickySessionEnabled = originalProxyStickySessionEnabled;
     config.proxySessionChannelConcurrencyLimit = originalProxySessionChannelConcurrencyLimit;
     config.proxySessionChannelQueueWaitMs = originalProxySessionChannelQueueWaitMs;
+    config.codexContextCompactionAutoEnabled = false;
+    config.codexContextCompactionSoftTokens = 50_000;
+    config.codexContextCompactionTargetTokens = 30_000;
+    config.codexContextCompactionCooldownTurns = 3;
     (config as any).openAiServiceTierRules = undefined;
     fetchMock.mockReset();
     selectChannelMock.mockReset();
@@ -260,6 +273,10 @@ describe('responses proxy codex oauth refresh', () => {
     config.proxyStickySessionEnabled = originalProxyStickySessionEnabled;
     config.proxySessionChannelConcurrencyLimit = originalProxySessionChannelConcurrencyLimit;
     config.proxySessionChannelQueueWaitMs = originalProxySessionChannelQueueWaitMs;
+    config.codexContextCompactionAutoEnabled = originalCodexContextCompactionAutoEnabled;
+    config.codexContextCompactionSoftTokens = originalCodexContextCompactionSoftTokens;
+    config.codexContextCompactionTargetTokens = originalCodexContextCompactionTargetTokens;
+    config.codexContextCompactionCooldownTurns = originalCodexContextCompactionCooldownTurns;
     if (app) {
       await app.close();
     }
@@ -317,6 +334,163 @@ describe('responses proxy codex oauth refresh', () => {
     expect(secondOptions.headers.Accept || secondOptions.headers.accept).toBe('text/event-stream');
     expect(secondOptions.headers.Connection || secondOptions.headers.connection).toBe('Keep-Alive');
     expect(response.json()?.output_text).toContain('ok after codex token refresh');
+  });
+
+  it('auto compact preflight uses the codex compact URL and minimal request body', async () => {
+    config.codexContextCompactionAutoEnabled = true;
+    config.codexContextCompactionSoftTokens = 1_000;
+    config.codexContextCompactionTargetTokens = 30_000;
+    config.codexContextCompactionCooldownTurns = 0;
+    const input = Array.from({ length: 8 }, (_, index) => ({
+      role: 'user',
+      content: `turn ${index} ${'x'.repeat(500)}`,
+    }));
+
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        id: 'cmp_auto_1',
+        object: 'response.compaction',
+        input_tokens: 900,
+        output_tokens: 20,
+        total_tokens: 920,
+        output: [
+          {
+            id: 'rs_auto_1',
+            type: 'compaction',
+            encrypted_content: 'enc-auto-compact',
+          },
+        ],
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        id: 'resp_auto_compacted',
+        object: 'response',
+        model: 'gpt-5.2-codex',
+        status: 'completed',
+        output_text: 'ok after auto compact',
+        usage: { input_tokens: 1200, output_tokens: 20, total_tokens: 1220 },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      headers: {
+        session_id: 'session-auto-compact-url-1',
+        'user-agent': 'CodexClient/1.0',
+      },
+      payload: {
+        model: 'gpt-5.2-codex',
+        input,
+        stream_options: { include_obfuscation: true },
+        store: true,
+        temperature: 0.2,
+        service_tier: 'priority',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    const [compactUrl, compactOptions] = fetchMock.mock.calls[0] as [string, any];
+    const [responsesUrl, responsesOptions] = fetchMock.mock.calls[1] as [string, any];
+    expect(compactUrl).toBe('https://chatgpt.com/backend-api/codex/responses/compact');
+    expect(responsesUrl).toBe('https://chatgpt.com/backend-api/codex/responses');
+
+    const compactBody = JSON.parse(String(compactOptions.body));
+    expect(Object.keys(compactBody).sort()).toEqual(['input', 'instructions', 'model']);
+    expect(compactBody.model).toBe('gpt-5.2-codex');
+    expect(compactBody.instructions).toBe(CODEX_DEFAULT_INSTRUCTIONS);
+    expect(compactBody.input).toHaveLength(8);
+    expect(compactBody.input[0]).toMatchObject({
+      type: 'message',
+      role: 'user',
+      content: [
+        {
+          type: 'input_text',
+          text: expect.stringContaining('turn 0'),
+        },
+      ],
+    });
+    expect(compactOptions.headers.Accept || compactOptions.headers.accept).toBe('application/json');
+
+    const responsesBody = JSON.parse(String(responsesOptions.body));
+    expect(responsesBody.previous_response_id).toBeUndefined();
+    expect(responsesBody.input).toEqual([
+      {
+        id: 'rs_auto_1',
+        type: 'compaction',
+        encrypted_content: 'enc-auto-compact',
+      },
+      ...compactBody.input.slice(-6),
+    ]);
+  });
+
+  it('auto compact uses target tokens to limit the replayed tail', async () => {
+    config.codexContextCompactionAutoEnabled = true;
+    config.codexContextCompactionSoftTokens = 1_000;
+    config.codexContextCompactionTargetTokens = 1_000;
+    config.codexContextCompactionCooldownTurns = 0;
+    const input = Array.from({ length: 8 }, (_, index) => ({
+      role: 'user',
+      content: `turn ${index} ${'x'.repeat(900)}`,
+    }));
+
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        id: 'cmp_auto_target_1',
+        object: 'response.compaction',
+        output: [
+          {
+            id: 'rs_auto_target_1',
+            type: 'compaction',
+            encrypted_content: 'enc-auto-target-compact',
+          },
+        ],
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        id: 'resp_auto_target_compacted',
+        object: 'response',
+        model: 'gpt-5.2-codex',
+        status: 'completed',
+        output_text: 'ok after target compact',
+        usage: { input_tokens: 900, output_tokens: 20, total_tokens: 920 },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      headers: {
+        session_id: 'session-auto-compact-target-1',
+        'user-agent': 'CodexClient/1.0',
+      },
+      payload: {
+        model: 'gpt-5.2-codex',
+        input,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    const [, responsesOptions] = fetchMock.mock.calls[1] as [string, any];
+    const responsesBody = JSON.parse(String(responsesOptions.body));
+    expect(responsesBody.input[0]).toMatchObject({
+      id: 'rs_auto_target_1',
+      type: 'compaction',
+    });
+    expect(responsesBody.input.length).toBeLessThan(7);
+    expect(JSON.stringify(responsesBody.input)).toContain('turn 7');
   });
 
   it('refreshes codex oauth token and retries the same responses request on 403', async () => {
@@ -1452,6 +1626,83 @@ describe('responses proxy codex oauth refresh', () => {
         total_tokens: 4,
       },
     });
+  });
+
+  it('records streaming codex baselines so full-history follow-up turns send only incremental input', async () => {
+    const firstUserMessage = {
+      id: 'msg_user_1',
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: 'first question' }],
+    };
+    const firstAssistantMessage = {
+      id: 'msg_assistant_1',
+      type: 'message',
+      role: 'assistant',
+      status: 'completed',
+      content: [{ type: 'output_text', text: 'first answer' }],
+    };
+    const secondUserMessage = {
+      id: 'msg_user_2',
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: 'second question' }],
+    };
+
+    fetchMock
+      .mockResolvedValueOnce(createSseResponse([
+        'event: response.created\n',
+        'data: {"type":"response.created","response":{"id":"resp_stream_incremental_1","model":"gpt-5.2-codex","created_at":1706000000,"status":"in_progress","output":[]}}\n\n',
+        'event: response.output_item.added\n',
+        'data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_assistant_1","type":"message","role":"assistant","status":"in_progress","content":[]}}\n\n',
+        'event: response.output_text.delta\n',
+        'data: {"type":"response.output_text.delta","output_index":0,"item_id":"msg_assistant_1","delta":"first answer"}\n\n',
+        'event: response.completed\n',
+        'data: {"type":"response.completed","response":{"id":"resp_stream_incremental_1","model":"gpt-5.2-codex","status":"completed","usage":{"input_tokens":1000,"output_tokens":10,"total_tokens":1010}}}\n\n',
+        'data: [DONE]\n\n',
+      ]))
+      .mockResolvedValueOnce(createSseResponse([
+        'event: response.created\n',
+        'data: {"type":"response.created","response":{"id":"resp_stream_incremental_2","model":"gpt-5.2-codex","created_at":1706000001,"status":"in_progress","output":[]}}\n\n',
+        'event: response.completed\n',
+        'data: {"type":"response.completed","response":{"id":"resp_stream_incremental_2","model":"gpt-5.2-codex","status":"completed","output":[{"id":"msg_assistant_2","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"second answer"}]}],"usage":{"input_tokens":20,"output_tokens":8,"total_tokens":28}}}\n\n',
+        'data: [DONE]\n\n',
+      ]));
+
+    const headers = { session_id: 'stream-incremental-session-1' };
+    const firstResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      headers,
+      payload: {
+        model: 'gpt-5.2-codex',
+        stream: true,
+        input: [firstUserMessage],
+      },
+    });
+    const secondResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      headers,
+      payload: {
+        model: 'gpt-5.2-codex',
+        stream: true,
+        input: [firstUserMessage, firstAssistantMessage, secondUserMessage],
+      },
+    });
+
+    expect(firstResponse.statusCode).toBe(200);
+    expect(secondResponse.statusCode).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    const [, firstOptions] = fetchMock.mock.calls[0] as [string, any];
+    const [, secondOptions] = fetchMock.mock.calls[1] as [string, any];
+    const firstForwardedBody = JSON.parse(firstOptions.body);
+    const secondForwardedBody = JSON.parse(secondOptions.body);
+
+    expect(firstForwardedBody.input).toEqual([firstUserMessage]);
+    expect(secondForwardedBody.previous_response_id).toBe('resp_stream_incremental_1');
+    expect(secondForwardedBody.input).toEqual([secondUserMessage]);
   });
 
   it('rebinds sticky channels after websocket transport fast-path successes', async () => {

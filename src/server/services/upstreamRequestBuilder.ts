@@ -419,6 +419,7 @@ export function buildUpstreamEndpointRequest(input: {
   providerHeaders?: Record<string, string>;
   codexSessionCacheKey?: string | null;
   codexExplicitSessionId?: string | null;
+  preserveResponsesPreviousResponseId?: boolean;
 }): {
   path: string;
   headers: Record<string, string>;
@@ -649,6 +650,8 @@ export function buildUpstreamEndpointRequest(input: {
     ) === '1';
     const websocketMode = Object.entries(input.downstreamHeaders || {}).find(([rawKey]) => rawKey.trim().toLowerCase() === 'x-metapi-responses-websocket-mode');
     const preserveWebsocketIncrementalMode = asTrimmedString(websocketMode?.[1]).toLowerCase() === 'incremental';
+    const preserveResponsesPreviousResponseId = input.preserveResponsesPreviousResponseId === true
+      || preserveWebsocketIncrementalMode;
     const responsesHeaders = input.downstreamFormat === 'responses'
       ? extractResponsesPassthroughHeaders(input.downstreamHeaders)
       : {};
@@ -669,7 +672,7 @@ export function buildUpstreamEndpointRequest(input: {
       sanitizedResponsesBody,
       sitePlatform,
       {
-        preservePreviousResponseId: preserveWebsocketIncrementalMode,
+        preservePreviousResponseId: preserveResponsesPreviousResponseId,
         preserveInputStatusFields: responsesWebsocketTransport,
       },
     );
@@ -680,7 +683,7 @@ export function buildUpstreamEndpointRequest(input: {
       ),
       sitePlatform,
       {
-        preservePreviousResponseId: preserveWebsocketIncrementalMode,
+        preservePreviousResponseId: preserveResponsesPreviousResponseId,
         preserveInputStatusFields: responsesWebsocketTransport,
       },
     );

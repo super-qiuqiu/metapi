@@ -211,4 +211,33 @@ describe('upstreamRequestBuilder', () => {
     });
     expect(incrementalRequest.body.previous_response_id).toBe('resp_prev_ws_1');
   });
+
+  it('preserves codex previous_response_id when explicitly marked as proxy-inferred', () => {
+    const sourceBody = {
+      model: 'gpt-5.4',
+      input: [
+        {
+          type: 'function_call_output',
+          call_id: 'call_1',
+          output: '{}',
+        },
+      ],
+      previous_response_id: 'resp_proxy_inferred_1',
+    };
+
+    const request = buildUpstreamEndpointRequest({
+      endpoint: 'responses',
+      modelName: 'gpt-5.4',
+      stream: false,
+      tokenValue: 'oauth-access-token',
+      sitePlatform: 'codex',
+      siteUrl: 'https://chatgpt.com/backend-api/codex',
+      openaiBody: sourceBody,
+      downstreamFormat: 'responses',
+      responsesOriginalBody: sourceBody,
+      preserveResponsesPreviousResponseId: true,
+    });
+
+    expect(request.body.previous_response_id).toBe('resp_proxy_inferred_1');
+  });
 });

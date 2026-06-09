@@ -11,6 +11,10 @@ function shouldForceCompactResponsesJsonAccept(sitePlatform?: string): boolean {
   return shouldStripCompactResponsesStore(sitePlatform);
 }
 
+function shouldUseMinimalCompactResponsesBody(sitePlatform?: string): boolean {
+  return shouldStripCompactResponsesStore(sitePlatform);
+}
+
 export function shouldForceResponsesUpstreamStream(input: {
   sitePlatform?: string;
   isCompactRequest?: boolean;
@@ -26,6 +30,16 @@ export function sanitizeCompactResponsesRequestBody(
     sitePlatform?: string;
   },
 ): Record<string, unknown> {
+  if (shouldUseMinimalCompactResponsesBody(options?.sitePlatform)) {
+    const next: Record<string, unknown> = {};
+    for (const key of ['model', 'input', 'instructions', 'previous_response_id']) {
+      if (body[key] !== undefined) {
+        next[key] = body[key];
+      }
+    }
+    return next;
+  }
+
   const next = { ...body };
   delete next.stream;
   delete next.stream_options;

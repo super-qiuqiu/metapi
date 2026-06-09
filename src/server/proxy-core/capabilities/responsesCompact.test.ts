@@ -7,28 +7,39 @@ import {
 } from './responsesCompact.js';
 
 describe('sanitizeCompactResponsesRequestBody', () => {
-  it('removes stream fields and store from codex compact requests', () => {
+  it('keeps only the official compact DTO fields for codex compact requests', () => {
     expect(sanitizeCompactResponsesRequestBody({
+      model: 'gpt-5.2',
       stream: true,
       stream_options: { include_obfuscation: true },
       store: false,
+      temperature: 0.2,
+      service_tier: 'priority',
       input: 'hello',
+      instructions: 'compact this conversation',
+      previous_response_id: 'resp_123',
     }, {
       sitePlatform: 'codex',
     })).toEqual({
+      model: 'gpt-5.2',
       input: 'hello',
+      instructions: 'compact this conversation',
+      previous_response_id: 'resp_123',
     });
   });
 
-  it('removes store from sub2api compact requests', () => {
+  it('keeps only the official compact DTO fields for sub2api compact requests', () => {
     expect(sanitizeCompactResponsesRequestBody({
+      model: 'gpt-5.2',
       stream: true,
       stream_options: { include_obfuscation: true },
       store: false,
+      metadata: { ignored: true },
       input: 'hello',
     }, {
       sitePlatform: 'sub2api',
     })).toEqual({
+      model: 'gpt-5.2',
       input: 'hello',
     });
   });

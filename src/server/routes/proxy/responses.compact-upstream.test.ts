@@ -11,6 +11,8 @@ const recordFailureMock = vi.fn();
 const refreshModelsAndRebuildRoutesMock = vi.fn();
 const reportProxyAllFailedMock = vi.fn();
 const reportTokenExpiredMock = vi.fn();
+const recordOauthQuotaHeadersSnapshotMock = vi.fn<(input: unknown) => Promise<void>>(async (_input) => undefined);
+const recordOauthQuotaResetHintMock = vi.fn<(input: unknown) => Promise<void>>(async (_input) => undefined);
 const estimateProxyCostMock = vi.fn(async (_arg?: any) => 0);
 const buildProxyBillingDetailsMock = vi.fn(async (_arg?: any) => null);
 const fetchModelPricingCatalogMock = vi.fn(async (_arg?: any): Promise<any> => null);
@@ -64,6 +66,8 @@ vi.mock('../../services/modelPricingService.js', () => ({
 }));
 
 vi.mock('../../services/proxyRetryPolicy.js', () => ({
+  isClientContinuationFailure: () => false,
+  isContextWindowExceededRetryPolicy: () => false,
   shouldRetryProxyRequest: () => false,
   shouldAbortSameSiteEndpointFallback: () => false,
   RETRYABLE_TIMEOUT_PATTERNS: [/(request timed out|connection timed out|read timeout|\btimed out\b)/i],
@@ -71,6 +75,11 @@ vi.mock('../../services/proxyRetryPolicy.js', () => ({
 
 vi.mock('../../services/proxyUsageFallbackService.js', () => ({
   resolveProxyUsageWithSelfLogFallback: (arg: any) => resolveProxyUsageWithSelfLogFallbackMock(arg),
+}));
+
+vi.mock('../../services/oauth/quota.js', () => ({
+  recordOauthQuotaHeadersSnapshot: async (input: unknown) => recordOauthQuotaHeadersSnapshotMock(input),
+  recordOauthQuotaResetHint: async (input: unknown) => recordOauthQuotaResetHintMock(input),
 }));
 
 vi.mock('../../db/index.js', () => ({
@@ -97,6 +106,7 @@ vi.mock('../../db/index.js', () => ({
   hasProxyLogClientColumns: async () => false,
   hasProxyLogDownstreamApiKeyIdColumn: async () => false,
   hasProxyLogStreamTimingColumns: async () => false,
+  hasProxyLogTransportColumns: async () => false,
   schema: {
     proxyLogs: {},
     siteApiEndpoints: {
@@ -110,6 +120,7 @@ vi.mock('../../db/index.js', () => ({
 describe('responses proxy compact upstream routing', () => {
   let app: FastifyInstance;
   const originalResponsesCompactFallbackToResponsesEnabled = config.responsesCompactFallbackToResponsesEnabled;
+  const originalProxyMaxChannelAttempts = config.proxyMaxChannelAttempts;
 
   beforeAll(async () => {
     const { responsesProxyRoute } = await import('./responses.js');
@@ -120,6 +131,7 @@ describe('responses proxy compact upstream routing', () => {
   beforeEach(() => {
     resetUpstreamEndpointRuntimeState();
     config.responsesCompactFallbackToResponsesEnabled = false;
+    config.proxyMaxChannelAttempts = 1;
     fetchMock.mockReset();
     selectChannelMock.mockReset();
     selectNextChannelMock.mockReset();
@@ -128,6 +140,8 @@ describe('responses proxy compact upstream routing', () => {
     refreshModelsAndRebuildRoutesMock.mockReset();
     reportProxyAllFailedMock.mockReset();
     reportTokenExpiredMock.mockReset();
+    recordOauthQuotaHeadersSnapshotMock.mockClear();
+    recordOauthQuotaResetHintMock.mockClear();
     estimateProxyCostMock.mockClear();
     buildProxyBillingDetailsMock.mockClear();
     fetchModelPricingCatalogMock.mockReset();
@@ -148,6 +162,7 @@ describe('responses proxy compact upstream routing', () => {
 
   afterAll(async () => {
     config.responsesCompactFallbackToResponsesEnabled = originalResponsesCompactFallbackToResponsesEnabled;
+    config.proxyMaxChannelAttempts = originalProxyMaxChannelAttempts;
     if (app) {
       await app.close();
     }
@@ -482,10 +497,8 @@ describe('responses proxy compact upstream routing', () => {
     const [targetUrl, options] = fetchMock.mock.calls[0] as [string, any];
     expect(targetUrl).toContain('/responses/compact');
     const forwardedBody = JSON.parse(String(options.body));
-    expect(forwardedBody.stream).toBeUndefined();
-    expect(forwardedBody.stream_options).toBeUndefined();
+    expect(Object.keys(forwardedBody).sort()).toEqual(['input', 'instructions', 'model']);
     expect(forwardedBody.instructions).toBe(CODEX_DEFAULT_INSTRUCTIONS);
-    expect(forwardedBody.store).toBeUndefined();
     expect(options.headers.Accept || options.headers.accept).toBe('application/json');
   });
 

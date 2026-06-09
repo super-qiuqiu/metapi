@@ -1,6 +1,12 @@
 import { createProxyStreamLifecycle } from '../../shared/protocolLifecycle.js';
 import { type ParsedSseEvent } from '../../shared/normalized.js';
-import { completeResponsesStream, createOpenAiResponsesAggregateState, failResponsesStream, serializeConvertedResponsesEvents } from './aggregator.js';
+import {
+  completeResponsesStream,
+  createOpenAiResponsesAggregateState,
+  failResponsesStream,
+  materializeResponsesStreamPayload,
+  serializeConvertedResponsesEvents,
+} from './aggregator.js';
 import {
   hasMeaningfulResponsesOutputItem,
   hasMeaningfulResponsesPayloadOutput,
@@ -23,6 +29,7 @@ type ResponseSink = {
 type ResponsesProxyStreamResult = {
   status: 'completed' | 'failed';
   errorMessage: string | null;
+  terminalPayload: unknown | null;
 };
 
 type ResponsesProxyStreamSessionInput = {
@@ -98,7 +105,19 @@ export function createResponsesProxyStreamSession(input: ResponsesProxyStreamSes
   let terminalResult: ResponsesProxyStreamResult = {
     status: 'completed',
     errorMessage: null,
+    terminalPayload: null,
   };
+
+  const buildTerminalPayload = (
+    responseTemplate?: Record<string, unknown> | null,
+    status: 'completed' | 'failed' | 'incomplete' = 'completed',
+  ) => materializeResponsesStreamPayload({
+    state: responsesState,
+    streamContext,
+    usage: input.getUsage(),
+    responseTemplate,
+    status,
+  });
 
   const finalize = () => {
     if (finalized) return;
@@ -106,6 +125,7 @@ export function createResponsesProxyStreamSession(input: ResponsesProxyStreamSes
     terminalResult = {
       status: 'completed',
       errorMessage: null,
+      terminalPayload: terminalResult.terminalPayload ?? buildTerminalPayload(),
     };
     input.writeLines(completeResponsesStream(responsesState, streamContext, input.getUsage()));
   };
@@ -116,14 +136,19 @@ export function createResponsesProxyStreamSession(input: ResponsesProxyStreamSes
     terminalResult = {
       status: 'failed',
       errorMessage: getResponsesStreamFailureMessage(payload, fallbackMessage),
+      terminalPayload: payload,
     };
     input.writeLines(failResponsesStream(responsesState, streamContext, input.getUsage(), payload));
   };
 
-  const complete = () => {
+  const complete = (
+    responseTemplate?: Record<string, unknown> | null,
+    status: 'completed' | 'incomplete' = 'completed',
+  ) => {
     terminalResult = {
       status: 'completed',
       errorMessage: null,
+      terminalPayload: buildTerminalPayload(responseTemplate, status),
     };
   };
 
@@ -209,7 +234,10 @@ export function createResponsesProxyStreamSession(input: ResponsesProxyStreamSes
       input.writeLines(convertedLines);
       if (eventBlock.event === 'response.completed' || payloadType === 'response.completed' || isIncompleteEvent) {
         terminalEventSeen = true;
-        complete();
+        complete(
+          isRecord(parsedPayload) && isRecord(parsedPayload.response) ? parsedPayload.response : null,
+          isIncompleteEvent ? 'incomplete' : 'completed',
+        );
       }
       return false;
     }
@@ -267,6 +295,7 @@ export function createResponsesProxyStreamSession(input: ResponsesProxyStreamSes
       terminalResult = {
         status: 'completed',
         errorMessage: null,
+        terminalPayload: streamPayload,
       };
       input.writeLines(lines);
       response?.end();

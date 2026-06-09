@@ -28,6 +28,7 @@ export type ProxyLogInsertInput = {
   totalTokens?: number | null;
   estimatedCost?: number | null;
   billingDetails?: unknown;
+  contextTelemetry?: unknown;
   clientFamily?: string | null;
   clientAppId?: string | null;
   clientAppName?: string | null;
@@ -234,6 +235,26 @@ export function parseProxyLogBillingDetails(value: unknown): Record<string, unkn
   }
 }
 
+function mergeProxyLogBillingDetails(input: {
+  billingDetails?: unknown;
+  contextTelemetry?: unknown;
+}): unknown {
+  if (input.contextTelemetry == null) return input.billingDetails ?? null;
+  if (
+    input.billingDetails
+    && typeof input.billingDetails === 'object'
+    && !Array.isArray(input.billingDetails)
+  ) {
+    return {
+      ...(input.billingDetails as Record<string, unknown>),
+      contextTelemetry: input.contextTelemetry,
+    };
+  }
+  return {
+    contextTelemetry: input.contextTelemetry,
+  };
+}
+
 function normalizeProxyLogStoreErrorMessage(error: unknown): string {
   const message = typeof error === 'object' && error && 'message' in error
     ? String((error as { message?: unknown }).message || '')
@@ -331,9 +352,13 @@ export async function insertProxyLog(input: ProxyLogInsertInput): Promise<void> 
     retryCount: input.retryCount ?? 0,
     createdAt: input.createdAt ?? formatBeijingSqlDateTime(new Date()),
   };
-  const serializedBillingDetails = input.billingDetails == null
+  const mergedBillingDetails = mergeProxyLogBillingDetails({
+    billingDetails: input.billingDetails,
+    contextTelemetry: input.contextTelemetry,
+  });
+  const serializedBillingDetails = mergedBillingDetails == null
     ? null
-    : JSON.stringify(input.billingDetails);
+    : JSON.stringify(mergedBillingDetails);
   const includeBillingDetails = serializedBillingDetails !== null
     && await hasProxyLogBillingDetailsColumn();
   const includeDownstreamApiKeyId = input.downstreamApiKeyId != null
